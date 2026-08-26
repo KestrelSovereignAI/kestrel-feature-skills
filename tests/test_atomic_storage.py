@@ -4,11 +4,17 @@ import os
 import shutil
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
-from kestrel_feature_skills.errors import SkillConflictError, SkillPathError
+from kestrel_feature_skills.errors import (
+    SkillConflictError,
+    SkillFormatError,
+    SkillPathError,
+)
 from kestrel_feature_skills.format import (
+    MAX_FOLDER_FILES,
     serialize_skill_markdown,
     validate_skill_folder,
 )
@@ -145,6 +151,101 @@ def test_two_edits_serialize_on_same_claim(tmp_path):
     assert validate_skill_folder(folder, source_root=tmp_path).description.startswith(
         "writer"
     )
+
+
+def test_reclaimed_claim_fences_the_expired_writer(tmp_path, monkeypatch):
+    folder = tmp_path / "atomic"
+    folder.mkdir()
+    atomic_write_primary(folder, payload(), overwrite=False)
+    first_claimed = threading.Event()
+    second_claimed = threading.Event()
+    allow_second_finalize = threading.Event()
+    real_link = os.link
+    real_replace = os.replace
+    results = {}
+
+    def coordinated_link(source, destination):
+        result = real_link(source, destination)
+        if Path(destination).name != ".SKILL.md.claim":
+            return result
+        if threading.current_thread().name == "expired-writer":
+            stale = time.time() - CLAIM_STALENESS_SECONDS - 5
+            os.utime(destination, (stale, stale))
+            first_claimed.set()
+            assert second_claimed.wait(timeout=5)
+        else:
+            second_claimed.set()
+        return result
+
+    def coordinated_replace(source, destination):
+        if threading.current_thread().name == "replacement-writer":
+            assert allow_second_finalize.wait(timeout=5)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "link", coordinated_link)
+    monkeypatch.setattr(os, "replace", coordinated_replace)
+
+    def write(label, description):
+        try:
+            atomic_write_primary(
+                folder,
+                serialize_skill_markdown(
+                    SkillDocument("atomic", description, "body")
+                ).encode(),
+                overwrite=True,
+            )
+            results[label] = "won"
+        except (SkillConflictError, FileNotFoundError):
+            results[label] = "lost"
+        finally:
+            if label == "expired":
+                allow_second_finalize.set()
+
+    first = threading.Thread(
+        target=write,
+        args=("expired", "expired payload"),
+        name="expired-writer",
+    )
+    second = threading.Thread(
+        target=write,
+        args=("replacement", "replacement payload"),
+        name="replacement-writer",
+    )
+    first.start()
+    assert first_claimed.wait(timeout=5)
+    second.start()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert results == {"expired": "lost", "replacement": "won"}
+    assert (
+        validate_skill_folder(folder, source_root=tmp_path).description
+        == "replacement payload"
+    )
+
+
+def test_limit_crossing_resource_edit_is_not_published(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("bounded", "Bounded", "Procedure."))
+    record = SkillRecord(
+        document=SkillDocument("bounded", "Bounded", "Procedure."),
+        folder=folder,
+        source_id="agent-local",
+        source_kind="agent-local",
+        precedence=0,
+        provenance=SkillProvenance("agent-local", "agent-local", "bounded"),
+    )
+    resources = folder / "resources"
+    resources.mkdir()
+    for index in range(MAX_FOLDER_FILES - 1):
+        (resources / f"{index:03}.md").write_text("x", encoding="utf-8")
+    rejected = resources / "overflow.md"
+
+    with pytest.raises(SkillFormatError, match="exceeds"):
+        store.write_file(record, "resources/overflow.md", "overflow")
+
+    assert not rejected.exists()
+    assert validate_skill_folder(folder, source_root=store.local_root).name == "bounded"
 
 
 def test_install_copies_resources_then_publishes_primary(tmp_path):

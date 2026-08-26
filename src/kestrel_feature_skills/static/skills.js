@@ -4,7 +4,21 @@ import bus from '/js/ui-ext/bus.js';
 
 const PANEL_ID = 'procedural-skills';
 const ROOT = '/api/procedural-skills';
-const state = { active: false, catalog: null, selected: null, path: null, ui: null };
+const state = {
+  active: false,
+  catalog: null,
+  selected: null,
+  path: null,
+  editorOwner: null,
+  selectionEpoch: 0,
+  fileEpoch: 0,
+  catalogEpoch: 0,
+  ui: null,
+};
+
+function currentAgent() {
+  return typeof API.getHostAgent === 'function' ? API.getHostAgent() : null;
+}
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -85,6 +99,8 @@ function mount(container) {
   );
   container.classList.add('skills-panel');
   state.ui = { list, errors, title, meta, controls, tree, warning, editor, save, status, createDialog, deleteDialog };
+  state.catalog = null;
+  clearSelection();
   loadCatalog();
 }
 
@@ -117,6 +133,7 @@ function buildCreateDialog() {
   form.append(el('h3', '', 'Add procedural skill'), name, description, body, actions);
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
+    const agent = currentAgent();
     try {
       const createdName = name.value;
       await request('', {
@@ -124,11 +141,16 @@ function buildCreateDialog() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: name.value, description: description.value, body: body.value, enabled: false }),
       });
+      if (currentAgent() !== agent) return;
       dialog.close();
       form.reset();
       await loadCatalog();
-      setStatus(`Created ${createdName}; it remains disabled.`);
-    } catch (error) { setStatus(detail(error), true); }
+      if (currentAgent() === agent) {
+        setStatus(`Created ${createdName}; it remains disabled.`);
+      }
+    } catch (error) {
+      if (currentAgent() === agent) setStatus(detail(error), true);
+    }
   });
   dialog.append(form);
   return dialog;
@@ -142,13 +164,17 @@ function buildDeleteDialog() {
   const approve = button('Delete permanently', async () => {
     const name = dialog.dataset.skill;
     if (!name) return;
+    const agent = currentAgent();
     try {
       await request(`/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      if (currentAgent() !== agent) return;
       dialog.close('approved');
-      state.selected = null;
+      clearSelection();
       await loadCatalog();
-      setStatus(`Deleted ${name}.`);
-    } catch (error) { setStatus(detail(error), true); }
+      if (currentAgent() === agent) setStatus(`Deleted ${name}.`);
+    } catch (error) {
+      if (currentAgent() === agent) setStatus(detail(error), true);
+    }
   }, 'skills-button skills-danger');
   approve.dataset.testid = 'skills-delete-confirm';
   const actions = el('div', 'skills-editor-actions');
@@ -163,19 +189,40 @@ function showCreateDialog() {
 
 async function loadCatalog() {
   if (!state.ui) return;
+  const agent = currentAgent();
+  const epoch = ++state.catalogEpoch;
   try {
-    state.catalog = await request('');
+    const catalog = await request('');
+    if (epoch !== state.catalogEpoch || currentAgent() !== agent) return;
+    state.catalog = catalog;
     renderCatalog();
-    setStatus(state.catalog.errors?.length ? 'Some skill folders were rejected; see catalog errors.' : 'Catalog loaded.');
-  } catch (error) { setStatus(detail(error), true); }
+    setStatus(
+      state.catalog.errors?.length || state.catalog.enablement_error
+        ? 'Some skill state could not be loaded; see catalog errors.'
+        : 'Catalog loaded.',
+      Boolean(state.catalog.enablement_error),
+    );
+  } catch (error) {
+    if (epoch === state.catalogEpoch && currentAgent() === agent) {
+      setStatus(detail(error), true);
+    }
+  }
 }
 
 async function reloadCatalog() {
+  const agent = currentAgent();
+  const epoch = ++state.catalogEpoch;
   try {
-    state.catalog = await request('/reload', { method: 'POST' });
+    const catalog = await request('/reload', { method: 'POST' });
+    if (epoch !== state.catalogEpoch || currentAgent() !== agent) return;
+    state.catalog = catalog;
     renderCatalog();
     setStatus('Discovered skill folders without restarting.');
-  } catch (error) { setStatus(detail(error), true); }
+  } catch (error) {
+    if (epoch === state.catalogEpoch && currentAgent() === agent) {
+      setStatus(detail(error), true);
+    }
+  }
 }
 
 function renderCatalog() {
@@ -193,13 +240,19 @@ function renderCatalog() {
   for (const error of state.catalog?.errors || []) {
     ui.errors.append(el('li', 'skills-risk', `${error.source_id}/${error.locator}: ${error.error}`));
   }
+  if (state.catalog?.enablement_error) {
+    ui.errors.append(el('li', 'skills-risk', `Enablement database: ${state.catalog.enablement_error}`));
+  }
   if (!state.catalog?.skills?.length) ui.list.append(el('li', 'skills-muted', 'No valid skill folders discovered.'));
   if (state.selected && !(state.catalog?.skills || []).some((item) => item.name === state.selected)) clearSelection();
 }
 
 function clearSelection() {
+  state.selectionEpoch += 1;
+  state.fileEpoch += 1;
   state.selected = null;
   state.path = null;
+  state.editorOwner = null;
   const ui = state.ui;
   if (!ui) return;
   ui.title.textContent = 'Select a skill';
@@ -213,8 +266,18 @@ function clearSelection() {
 }
 
 async function selectSkill(name) {
+  const agent = currentAgent();
+  const epoch = ++state.selectionEpoch;
+  state.fileEpoch += 1;
   state.selected = name;
   state.path = null;
+  state.editorOwner = null;
+  if (state.ui) {
+    state.ui.editor.value = '';
+    state.ui.editor.disabled = true;
+    state.ui.save.disabled = true;
+    state.ui.warning.hidden = true;
+  }
   renderCatalog();
   const skill = (state.catalog?.skills || []).find((item) => item.name === name);
   if (!skill || !state.ui) return;
@@ -231,8 +294,19 @@ async function selectSkill(name) {
   state.ui.controls.replaceChildren(toggle, priority, savePriority, remove);
   try {
     const data = await request(`/${encodeURIComponent(name)}/tree`);
+    if (
+      epoch !== state.selectionEpoch
+      || state.selected !== name
+      || currentAgent() !== agent
+    ) return;
     renderTree(data.entries || []);
-  } catch (error) { setStatus(detail(error), true); }
+  } catch (error) {
+    if (
+      epoch === state.selectionEpoch
+      && state.selected === name
+      && currentAgent() === agent
+    ) setStatus(detail(error), true);
+  }
 }
 
 function renderTree(entries) {
@@ -291,43 +365,93 @@ function renderTree(entries) {
 
 async function openFile(path) {
   if (!state.selected || !state.ui) return;
+  const owner = { agent: currentAgent(), name: state.selected, path };
+  const epoch = ++state.fileEpoch;
+  state.path = null;
+  state.editorOwner = null;
+  state.ui.editor.value = '';
+  state.ui.editor.disabled = true;
+  state.ui.save.disabled = true;
+  state.ui.warning.hidden = true;
   try {
-    const file = await request(`/${encodeURIComponent(state.selected)}/file?path=${encodeURIComponent(path)}`);
+    const file = await request(`/${encodeURIComponent(owner.name)}/file?path=${encodeURIComponent(path)}`);
+    if (
+      epoch !== state.fileEpoch
+      || state.selected !== owner.name
+      || currentAgent() !== owner.agent
+    ) return;
     state.path = path;
+    state.editorOwner = owner;
     state.ui.editor.value = file.content;
     state.ui.editor.disabled = !file.editable;
     state.ui.save.disabled = !file.editable;
     state.ui.warning.hidden = !file.execution_risk;
-    setStatus(`Opened ${state.selected}/${path}.`);
-  } catch (error) { setStatus(detail(error), true); }
+    setStatus(`Opened ${owner.name}/${path}.`);
+  } catch (error) {
+    if (
+      epoch === state.fileEpoch
+      && state.selected === owner.name
+      && currentAgent() === owner.agent
+    ) setStatus(detail(error), true);
+  }
 }
 
 async function saveFile() {
-  if (!state.selected || !state.path || !state.ui) return;
+  if (!state.ui || !state.editorOwner) return;
+  const owner = state.editorOwner;
+  if (
+    state.selected !== owner.name
+    || state.path !== owner.path
+    || currentAgent() !== owner.agent
+  ) {
+    clearSelection();
+    setStatus('Selection changed; reopen the file before saving.', true);
+    return;
+  }
+  const content = state.ui.editor.value;
+  state.ui.save.disabled = true;
   try {
-    await request(`/${encodeURIComponent(state.selected)}/file`, {
+    await request(`/${encodeURIComponent(owner.name)}/file`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: state.path, content: state.ui.editor.value }),
+      body: JSON.stringify({ path: owner.path, content }),
     });
+    if (
+      state.editorOwner !== owner
+      || state.selected !== owner.name
+      || currentAgent() !== owner.agent
+    ) return;
     await loadCatalog();
-    setStatus(`Saved ${state.selected}/${state.path}. No code was executed.`);
-  } catch (error) { setStatus(`Save rejected: ${detail(error)}`, true); }
+    if (state.editorOwner === owner && currentAgent() === owner.agent) {
+      state.ui.save.disabled = false;
+      setStatus(`Saved ${owner.name}/${owner.path}. No code was executed.`);
+    }
+  } catch (error) {
+    if (state.editorOwner === owner && currentAgent() === owner.agent) {
+      state.ui.save.disabled = false;
+      setStatus(`Save rejected: ${detail(error)}`, true);
+    }
+  }
 }
 
 async function setEnabled(skill, enabled, priority = null) {
+  const agent = currentAgent();
   try {
     await request(`/${encodeURIComponent(skill.name)}/state`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled, priority }),
     });
+    if (currentAgent() !== agent) return;
     await loadCatalog();
+    if (currentAgent() !== agent) return;
     await selectSkill(skill.name);
     setStatus(priority === null
       ? `${enabled ? 'Enabled' : 'Disabled'} ${skill.name}.`
       : `Updated ${skill.name} priority to ${priority}.`);
-  } catch (error) { setStatus(detail(error), true); }
+  } catch (error) {
+    if (currentAgent() === agent) setStatus(detail(error), true);
+  }
 }
 
 function confirmDelete(skill) {
@@ -354,6 +478,17 @@ bus.on('panel:shown', (payload) => {
 
 bus.on('panel:hidden', (payload) => {
   if (payload?.panelId === PANEL_ID) state.active = false;
+});
+
+bus.on('agent:switch', () => {
+  state.catalogEpoch += 1;
+  state.catalog = null;
+  if (state.ui?.createDialog.open) state.ui.createDialog.close('agent-switch');
+  if (state.ui?.deleteDialog.open) state.ui.deleteDialog.close('agent-switch');
+  if (state.ui?.deleteDialog) delete state.ui.deleteDialog.dataset.skill;
+  clearSelection();
+  renderCatalog();
+  if (state.active) loadCatalog();
 });
 
 export { loadCatalog, reloadCatalog };

@@ -192,3 +192,30 @@ def test_git_source_detects_when_recorded_commit_changes(monkeypatch):
         ref="main",
         installed_revision="a" * 40,
     )
+
+
+def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch):
+    commands = []
+    target = tmp_path / "checkout"
+
+    def fake_git(argv, *, timeout=120):
+        commands.append(argv)
+        if argv[0] == "clone":
+            make_skill(target / "skills", "remote", "Remote default branch")
+            return ""
+        return "a" * 40
+
+    monkeypatch.setattr(git_source_module, "_run_git", fake_git)
+
+    checkout = GitSkillSource().checkout(
+        url="https://example.com/skills.git",
+        ref="HEAD",
+        skill_name="remote",
+        target=target,
+    )
+
+    clone = commands[0]
+    assert clone[:3] == ["clone", "--depth", "1"]
+    assert "--branch" not in clone
+    assert "--single-branch" not in clone
+    assert checkout.ref == "HEAD"

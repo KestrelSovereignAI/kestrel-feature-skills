@@ -93,6 +93,28 @@ def test_local_resource_reference_must_exist_and_stay_inside(tmp_path):
     assert validate_skill_folder(folder, source_root=tmp_path) == value
 
 
+def test_reference_style_markdown_escape_is_rejected(tmp_path):
+    value = SkillDocument(
+        "reference-link",
+        "Reference link",
+        "Read [outside][secret].\n\n[secret]: ../secret.md",
+    )
+    folder = write_skill(tmp_path, value)
+    with pytest.raises(SkillPathError):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_reference_style_markdown_local_resource_is_accepted(tmp_path):
+    value = SkillDocument(
+        "reference-local",
+        "Reference link",
+        'Read [notes][local].\n\n[local]: <notes.md> "Operator notes"',
+    )
+    folder = write_skill(tmp_path, value)
+    (folder / "notes.md").write_text("notes", encoding="utf-8")
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
 def test_symlink_file_escape_rejected(tmp_path):
     outside = tmp_path / "outside.md"
     outside.write_text("secret", encoding="utf-8")

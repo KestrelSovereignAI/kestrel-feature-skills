@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 from kestrel_sdk.features.contributions import PermissionLevel
+from kestrel_sdk.storage.database import DatabaseError
 from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_feature_skills.context import render_context_clause
@@ -102,6 +103,61 @@ async def test_refresh_indexes_valid_folder_discovered_outside_the_tools(feature
     node = feature.agent.storage.added[-1]
     assert node.node_type == PROCEDURAL_SKILL_NODE_TYPE
     assert node.properties["name"] == "discovered-index"
+
+
+@pytest.mark.asyncio
+async def test_refresh_removes_index_for_authoritative_folder_removed_outside_tools(
+    feature,
+):
+    await feature.skill_create("vanished-index", "Vanishing graph index", "body")
+    node_id = feature._node_id("vanished-index")
+    assert node_id in feature.agent.storage.nodes
+    folder = feature.agent.procedural_skills_root / "vanished-index"
+    for path in folder.iterdir():
+        path.unlink()
+    folder.rmdir()
+
+    await feature.refresh()
+
+    assert node_id not in feature.agent.storage.nodes
+    assert node_id in feature.agent.storage.deleted
+
+
+@pytest.mark.asyncio
+async def test_create_survives_enablement_write_and_reload_failure(
+    feature, monkeypatch
+):
+    async def fail(*_args, **_kwargs):
+        raise DatabaseError("database offline")
+
+    monkeypatch.setattr(feature._enablement, "set", fail)
+    monkeypatch.setattr(feature._enablement, "load", fail)
+
+    result = await feature.skill_create("db-outage", "DB outage", "body")
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert (feature.agent.procedural_skills_root / "db-outage" / "SKILL.md").is_file()
+    assert "db-outage" in feature.snapshot.by_name()
+    assert "database offline" in feature.catalog_payload()["enablement_error"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_retains_last_known_enablement_during_database_outage(
+    feature, monkeypatch
+):
+    await feature.skill_create("last-known", "Retain enabled state", "body")
+    await feature.skill_enable("last-known", priority=9)
+
+    async def fail():
+        raise DatabaseError("database offline")
+
+    monkeypatch.setattr(feature._enablement, "load", fail)
+    await feature.refresh()
+
+    record = feature.snapshot.by_name()["last-known"]
+    assert record.state.enabled is True
+    assert record.state.priority == 9
+    assert "Retain enabled state" in feature.context_clause_text
 
 
 @pytest.mark.asyncio

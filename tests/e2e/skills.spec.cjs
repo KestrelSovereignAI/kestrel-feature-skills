@@ -130,6 +130,75 @@ test.describe.serial('procedural skills contributed console', () => {
     await expect(page.getByLabel('Skill file editor')).toHaveValue(/Round trip changed and persisted\./);
   });
 
+  test('stale file reads cannot overwrite the newly selected skill', async ({ page, request }) => {
+    const first = 'e2e-race-first';
+    const second = 'e2e-race-second';
+    for (const [name, description] of [[first, 'First race sentinel'], [second, 'Second race sentinel']]) {
+      await request.delete(`${API_ROOT}/${name}`, { headers: headers() });
+      const created = await request.post(API_ROOT, {
+        headers: headers(),
+        data: { name, description, body: `# Procedure\n\n${description}`, enabled: false },
+      });
+      expect(created.ok(), await created.text()).toBeTruthy();
+    }
+    let releaseRead;
+    let markReadStarted;
+    const readStarted = new Promise((resolve) => { markReadStarted = resolve; });
+    const readRelease = new Promise((resolve) => { releaseRead = resolve; });
+    await page.route(new RegExp(`${first}/file\\?path=SKILL.md$`), async (route) => {
+      markReadStarted();
+      await readRelease;
+      await route.continue();
+    });
+    try {
+      await openPanel(page);
+      await page.getByRole('button', { name: first }).click();
+      await page.getByRole('button', { name: 'SKILL.md' }).click();
+      await readStarted;
+      await page.getByRole('button', { name: second }).click();
+      await page.getByRole('button', { name: 'SKILL.md' }).click();
+      await expect(page.getByLabel('Skill file editor')).toHaveValue(/Second race sentinel/);
+      releaseRead();
+      await page.waitForTimeout(250);
+      await expect(page.getByLabel('Skill file editor')).toHaveValue(/Second race sentinel/);
+      await page.getByLabel('Skill file editor').fill(
+        (await page.getByLabel('Skill file editor').inputValue()).replace(
+          'Second race sentinel',
+          'Second race edited safely',
+        ),
+      );
+      await page.getByTestId('skills-save').click();
+      await expect(page.locator('[role="status"]')).toContainText(`Saved ${second}/SKILL.md`);
+      const firstFile = await request.get(`${API_ROOT}/${first}/file?path=SKILL.md`, { headers: headers() });
+      const secondFile = await request.get(`${API_ROOT}/${second}/file?path=SKILL.md`, { headers: headers() });
+      expect((await firstFile.json()).content).toContain('First race sentinel');
+      expect((await secondFile.json()).content).toContain('Second race edited safely');
+    } finally {
+      releaseRead?.();
+      await page.unrouteAll({ behavior: 'ignoreErrors' });
+      await request.delete(`${API_ROOT}/${first}`, { headers: headers() });
+      await request.delete(`${API_ROOT}/${second}`, { headers: headers() });
+    }
+  });
+
+  test('agent switch invalidates unsaved editor ownership', async ({ page }) => {
+    await openPanel(page);
+    await page.getByRole('button', { name: SKILL_NAME }).click();
+    await page.getByRole('button', { name: 'SKILL.md' }).click();
+    const editor = page.getByLabel('Skill file editor');
+    await expect(editor).toBeEnabled();
+    await editor.fill(`${await editor.inputValue()}\nUNSAVED-CROSS-AGENT-SENTINEL\n`);
+
+    await page.evaluate(async () => {
+      const bus = (await import('/js/ui-ext/bus.js')).default;
+      bus.emit('agent:switch', { prev: 'kite', next: 'other-agent' });
+    });
+
+    await expect(editor).toBeDisabled();
+    await expect(editor).toHaveValue('');
+    await expect(page.getByTestId('skills-save')).toBeDisabled();
+  });
+
   test('Python editor exposes execution risk and has no run surface', async ({ page }) => {
     await openPanel(page);
     await page.getByRole('button', { name: SKILL_NAME }).click();

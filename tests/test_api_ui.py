@@ -176,6 +176,8 @@ def test_ui_bundle_contains_required_rails_and_no_run_control(feature):
     assert "Discover / reload" in source
     assert "Save rejected:" in source
     assert "showModal" in source
+    assert "agent:switch" in source
+    assert "editorOwner" in source
     assert "skill_run_script" not in source
     assert "/run" not in source
     assert ".execute(" not in source

@@ -31,7 +31,13 @@ from .enablement import DEFAULT_PRIORITY, SkillEnablementStore, validate_priorit
 from .errors import SkillConflictError, SkillError
 from .format import SKILL_FILENAME, validate_skill_name
 from .git_source import GitSkillSource
-from .models import CatalogSnapshot, SkillDocument, SkillProvenance, SkillRecord
+from .models import (
+    CatalogSnapshot,
+    SkillDocument,
+    SkillProvenance,
+    SkillRecord,
+    SkillState,
+)
 from .sources import (
     AGENT_LOCAL_PRECEDENCE,
     HOST_SHARED_PRECEDENCE,
@@ -90,6 +96,8 @@ class ProceduralSkillsFeature(Feature):
         self._catalog: SkillCatalog | None = None
         self._snapshot = CatalogSnapshot()
         self._context_render = render_context_clause(self._snapshot)
+        self._states: dict[str, SkillState] = {}
+        self._enablement_error: str | None = None
         self._indexed_names: frozenset[str] = frozenset()
         self._router = None
 
@@ -186,13 +194,28 @@ class ProceduralSkillsFeature(Feature):
     async def refresh(self) -> CatalogSnapshot:
         if self._catalog is None or self._enablement is None:
             raise RuntimeError("ProceduralSkillsFeature is not initialized")
-        states = await self._enablement.load()
+        try:
+            states = await self._enablement.load()
+        except DatabaseError as exc:
+            self._enablement_error = str(exc)
+            states = self._states
+            logger.warning(
+                "Could not reload procedural skill enablement; retaining the last known state: %s",
+                exc,
+            )
+        else:
+            self._states = dict(states)
+            self._enablement_error = None
         self._snapshot = self._catalog.refresh(states)
         self._context_render = render_context_clause(
             self._snapshot,
             max_bytes=DEFAULT_CONTEXT_BUDGET_BYTES,
         )
-        indexed: set[str] = set()
+        current_names = {record.name for record in self._snapshot.records}
+        indexed = set(self._indexed_names)
+        for stale_name in sorted(indexed - current_names):
+            if await self._delete_index_node(stale_name):
+                indexed.discard(stale_name)
         for record in self._snapshot.records:
             if await self._index_record(record):
                 indexed.add(record.name)
@@ -209,6 +232,7 @@ class ProceduralSkillsFeature(Feature):
             "count": len(records),
             "errors": [error.to_dict() for error in self._snapshot.errors],
             "enablement_available": self.enablement_available,
+            "enablement_error": self._enablement_error,
             "context": {
                 "text": self._context_render.text,
                 "included": list(self._context_render.included),
@@ -258,9 +282,10 @@ class ProceduralSkillsFeature(Feature):
         state_error: str | None = None
         if enablement.available:
             try:
-                await enablement.set(
+                state = await enablement.set(
                     name, enabled=enabled, priority=validate_priority(priority)
                 )
+                self._states[name] = state
             except DatabaseError as exc:
                 state_error = str(exc)
         elif enabled:
@@ -302,7 +327,8 @@ class ProceduralSkillsFeature(Feature):
         resolved_priority = (
             record.state.priority if priority is None else validate_priority(priority)
         )
-        await enablement.set(name, enabled=enabled, priority=resolved_priority)
+        state = await enablement.set(name, enabled=enabled, priority=resolved_priority)
+        self._states[name] = state
         await self.refresh()
         refreshed = SkillStore.get(self._snapshot, name)
         return {
@@ -324,6 +350,7 @@ class ProceduralSkillsFeature(Feature):
         if enablement.available:
             try:
                 await enablement.delete(name)
+                self._states.pop(name, None)
             except DatabaseError as exc:
                 config_deleted = False
                 errors.append(f"enablement row cleanup failed: {exc}")
@@ -388,9 +415,10 @@ class ProceduralSkillsFeature(Feature):
         state_error: str | None = None
         if enablement.available:
             try:
-                await enablement.set(
+                state = await enablement.set(
                     skill_name, enabled=False, priority=DEFAULT_PRIORITY
                 )
+                self._states[skill_name] = state
             except DatabaseError as exc:
                 state_error = str(exc)
         await self.refresh()
@@ -457,6 +485,35 @@ class ProceduralSkillsFeature(Feature):
         except Exception as exc:  # noqa: BLE001 - graph is a recoverable index
             logger.warning(
                 "Could not update procedural_skill index for %s: %s", record.name, exc
+            )
+            return False
+        return True
+
+    async def _delete_index_node(self, name: str) -> bool:
+        """Best-effort removal for a catalog entry no longer on disk."""
+
+        storage = getattr(self.agent, "storage", None)
+        if (
+            storage is None
+            or not hasattr(storage, "get_node")
+            or not hasattr(storage, "delete_node")
+        ):
+            return False
+        node_id = self._node_id(name)
+        try:
+            node = await storage.get_node(node_id)
+            if node is None:
+                return True
+            if getattr(node, "node_type", None) != PROCEDURAL_SKILL_NODE_TYPE:
+                logger.warning(
+                    "Refusing to delete non-procedural node at expected skill index id %s",
+                    node_id,
+                )
+                return True
+            await storage.delete_node(node_id)
+        except Exception as exc:  # noqa: BLE001 - graph is a recoverable index
+            logger.warning(
+                "Could not remove stale procedural_skill index for %s: %s", name, exc
             )
             return False
         return True

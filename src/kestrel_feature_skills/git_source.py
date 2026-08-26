@@ -80,19 +80,11 @@ class GitSkillSource:
         skill_name = validate_skill_name(skill_name)
         if target.exists():
             raise GitSourceError("git checkout target already exists")
-        _run_git(
-            [
-                "clone",
-                "--depth",
-                "1",
-                "--branch",
-                ref,
-                "--single-branch",
-                "--",
-                url,
-                str(target),
-            ]
-        )
+        clone = ["clone", "--depth", "1"]
+        if ref != "HEAD":
+            clone.extend(["--branch", ref, "--single-branch"])
+        clone.extend(["--", url, str(target)])
+        _run_git(clone)
         revision = _run_git(["-C", str(target), "rev-parse", "HEAD"])
         if not _COMMIT_RE.fullmatch(revision):
             raise GitSourceError("git checkout returned an invalid commit identity")

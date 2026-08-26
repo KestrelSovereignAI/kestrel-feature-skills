@@ -22,6 +22,9 @@ SKILL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
 _FRONTMATTER_KEYS = frozenset({"name", "description"})
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _MARKDOWN_DESTINATION = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+_MARKDOWN_REFERENCE_DEFINITION = re.compile(
+    r"(?m)^[ \t]{0,3}\[[^\]\r\n]+\]:[ \t]*(?:<([^>\r\n]+)>|(\S+))"
+)
 _REMOTE_SCHEMES = frozenset({"http", "https", "mailto"})
 
 
@@ -156,8 +159,15 @@ def serialize_skill_markdown(document: SkillDocument) -> str:
 
 def _local_markdown_destinations(body: str) -> tuple[str, ...]:
     destinations: list[str] = []
-    for match in _MARKDOWN_DESTINATION.finditer(body):
-        raw = match.group(1).strip()
+    raw_destinations = [
+        match.group(1) for match in _MARKDOWN_DESTINATION.finditer(body)
+    ]
+    raw_destinations.extend(
+        match.group(1) or match.group(2)
+        for match in _MARKDOWN_REFERENCE_DEFINITION.finditer(body)
+    )
+    for candidate in raw_destinations:
+        raw = candidate.strip()
         if raw.startswith("<") and ">" in raw:
             raw = raw[1 : raw.index(">")]
         else:

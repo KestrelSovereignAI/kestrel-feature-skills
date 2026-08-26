@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -41,6 +42,14 @@ def _claim_is_stale(path: Path) -> bool:
     return age > CLAIM_STALENESS_SECONDS
 
 
+def _claim_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        value = path.stat()
+    except OSError:
+        return None
+    return value.st_dev, value.st_ino
+
+
 def _write_tmp(path: Path, payload: bytes) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -69,12 +78,16 @@ def atomic_write_primary(folder: Path, payload: bytes, *, overwrite: bool) -> No
         raise SkillConflictError(f"skill already exists: {folder.name}")
     tmp = folder / f".SKILL.md.tmp.{uuid.uuid4().hex}"
     claim = folder / ".SKILL.md.claim"
-    owns_claim = False
+    owned_claim: tuple[int, int] | None = None
     _write_tmp(tmp, payload)
+    tmp_identity = _claim_identity(tmp)
+    if tmp_identity is None:  # pragma: no cover - fsync'd file vanished externally
+        tmp.unlink(missing_ok=True)
+        raise OSError("skill writer temporary file vanished before claiming")
     try:
         try:
             os.link(tmp, claim)
-            owns_claim = True
+            owned_claim = tmp_identity
         except FileExistsError:
             if not _claim_is_stale(claim):
                 raise SkillConflictError(
@@ -86,25 +99,27 @@ def atomic_write_primary(folder: Path, payload: bytes, *, overwrite: bool) -> No
                 pass
             try:
                 os.link(tmp, claim)
-                owns_claim = True
+                owned_claim = tmp_identity
             except FileExistsError as exc:
                 raise SkillConflictError(
                     f"concurrent skill write won stale-claim recovery for {folder.name}"
                 ) from exc
-        tmp.unlink(missing_ok=True)
+        if owned_claim is None or _claim_identity(claim) != owned_claim:
+            raise SkillConflictError(
+                f"skill write lost its reclaimed claim for {folder.name}"
+            )
         if overwrite:
-            os.replace(claim, target)
-            owns_claim = False
+            os.replace(tmp, target)
         else:
             try:
-                os.link(claim, target)
+                os.link(tmp, target)
             except FileExistsError as exc:
                 raise SkillConflictError(
                     f"skill already exists: {folder.name}"
                 ) from exc
     finally:
         tmp.unlink(missing_ok=True)
-        if owns_claim:
+        if owned_claim is not None and _claim_identity(claim) == owned_claim:
             claim.unlink(missing_ok=True)
 
 
@@ -201,10 +216,31 @@ class SkillStore:
             raise SkillPathError(
                 "the editor writes only .md resources and scripts/*.py"
             )
+        payload = content.encode("utf-8")
+        with tempfile.TemporaryDirectory(
+            prefix=".kestrel-skill-edit-", dir=self.local_root
+        ) as temporary:
+            staged_root = Path(temporary)
+            staged_folder = staged_root / record.name
+            shutil.copytree(folder, staged_folder, symlinks=True)
+            staged_path = contained_path(
+                staged_folder, relative.as_posix(), must_exist=False
+            )
+            reject_symlink_chain(staged_folder, staged_path)
+            staged_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            reject_symlink_chain(staged_folder, staged_path)
+            atomic_replace_file(staged_path, payload)
+            validate_skill_folder(staged_folder, source_root=staged_root)
+
+        # The complete candidate was valid. Re-resolve the real folder and path
+        # immediately before the single-file atomic publication so a folder or
+        # ancestor swapped for a symlink cannot redirect the write.
+        folder = self._require_local(record)
+        path = contained_path(folder, relative.as_posix(), must_exist=False)
+        reject_symlink_chain(folder, path)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         reject_symlink_chain(folder, path)
-        atomic_replace_file(path, content.encode("utf-8"))
-        validate_skill_folder(folder, source_root=self.local_root)
+        atomic_replace_file(path, payload)
 
     def tree(self, record: SkillRecord) -> tuple[dict[str, object], ...]:
         folder = self._require_real_folder(record)
