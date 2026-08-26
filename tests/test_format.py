@@ -61,6 +61,20 @@ def test_oversized_document_and_description_rejected():
         serialize_skill_markdown(document(description=too_long))
 
 
+def test_json_escaped_lone_surrogate_is_a_visible_format_error():
+    content = '---\nname: "surrogate"\ndescription: "\\ud800"\n---\n\nProcedure.\n'
+
+    with pytest.raises(SkillFormatError, match="UTF-8"):
+        parse_skill_markdown(content)
+
+
+def test_serializer_rejects_lone_surrogate_body_as_a_format_error():
+    with pytest.raises(SkillFormatError, match="UTF-8"):
+        serialize_skill_markdown(
+            SkillDocument("safe-skill", "Safe description", "bad\ud800")
+        )
+
+
 def test_folder_name_must_match_frontmatter(tmp_path):
     folder = tmp_path / "other-name"
     folder.mkdir()

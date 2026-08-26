@@ -29,6 +29,13 @@ _MARKDOWN_REFERENCE_DEFINITION = re.compile(
 _REMOTE_SCHEMES = frozenset({"http", "https", "mailto"})
 
 
+def _utf8_bytes(value: str, *, label: str) -> bytes:
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SkillFormatError(f"{label} must be valid UTF-8 text") from exc
+
+
 def validate_skill_name(name: object) -> str:
     if not isinstance(name, str) or not SKILL_NAME_RE.fullmatch(name):
         raise SkillFormatError(
@@ -76,7 +83,7 @@ def parse_skill_markdown(
             raise SkillFormatError(f"{source} must be UTF-8") from exc
     elif isinstance(content, str):
         text = content
-        if len(text.encode("utf-8")) > MAX_SKILL_FILE_BYTES:
+        if len(_utf8_bytes(text, label=source)) > MAX_SKILL_FILE_BYTES:
             raise SkillFormatError(f"{source} exceeds {MAX_SKILL_FILE_BYTES} bytes")
     else:
         raise SkillFormatError(f"{source} must be text")
@@ -126,7 +133,7 @@ def parse_skill_markdown(
         raise SkillFormatError("description must not be empty")
     if "\n" in description or "\r" in description or _CONTROL.search(description):
         raise SkillFormatError("description must be one printable line")
-    if len(description.encode("utf-8")) > MAX_DESCRIPTION_BYTES:
+    if len(_utf8_bytes(description, label="description")) > MAX_DESCRIPTION_BYTES:
         raise SkillFormatError(
             f"description exceeds {MAX_DESCRIPTION_BYTES} UTF-8 bytes"
         )

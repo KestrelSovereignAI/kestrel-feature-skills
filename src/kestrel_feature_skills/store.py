@@ -5,9 +5,12 @@ from __future__ import annotations
 import fcntl
 import os
 import shutil
+import stat
 import tempfile
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from .errors import (
@@ -38,6 +41,34 @@ from .sources import PROVENANCE_FILENAME, serialize_provenance
 CLAIM_STALENESS_SECONDS = 60
 MAX_EDITOR_FILE_BYTES = 262_144
 _INTERNAL_PREFIXES = (".SKILL.md.tmp.", ".SKILL.md.claim")
+_MUTATION_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+_MUTATION_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _serialized_skill_mutation(root: Path, name: str):
+    """Serialize validation and publication across threads and processes."""
+
+    key = (str(root), validate_skill_name(name))
+    with _MUTATION_LOCKS_GUARD:
+        thread_lock = _MUTATION_LOCKS.setdefault(key, threading.RLock())
+    with thread_lock:
+        lock_path = root / f".{name}.mutation.lock"
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise SkillPathError("could not open the skill mutation lock") from exc
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise SkillPathError("skill mutation lock must be a regular file")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def _claim_is_stale(path: Path) -> bool:
@@ -242,26 +273,32 @@ class SkillStore:
         return folder
 
     def edit_primary(self, record: SkillRecord, content: str) -> SkillDocument:
-        folder = self._require_local(record)
         document = parse_skill_markdown(
             content, source=f"{record.name}/{SKILL_FILENAME}"
         )
         if document.name != record.name:
             raise SkillFormatError("frontmatter name cannot rename a skill folder")
-        payload = content.encode("utf-8")
-        with tempfile.TemporaryDirectory(
-            prefix=".kestrel-skill-edit-", dir=self.local_root
-        ) as temporary:
-            staged_root = Path(temporary)
-            staged_folder = staged_root / record.name
-            shutil.copytree(folder, staged_folder, symlinks=True)
-            atomic_write_primary(staged_folder, payload, overwrite=True)
-            candidate = validate_skill_folder(staged_folder, source_root=staged_root)
+        try:
+            payload = content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise SkillFormatError("editor content must be valid UTF-8 text") from exc
+        with _serialized_skill_mutation(self.local_root, record.name):
+            folder = self._require_local(record)
+            with tempfile.TemporaryDirectory(
+                prefix=".kestrel-skill-edit-", dir=self.local_root
+            ) as temporary:
+                staged_root = Path(temporary)
+                staged_folder = staged_root / record.name
+                shutil.copytree(folder, staged_folder, symlinks=True)
+                atomic_write_primary(staged_folder, payload, overwrite=True)
+                candidate = validate_skill_folder(
+                    staged_folder, source_root=staged_root
+                )
 
-        # The complete candidate, including every resource, is valid. Publish
-        # only after re-resolving the authoritative local folder.
-        folder = self._require_local(record)
-        atomic_write_primary(folder, payload, overwrite=True)
+            # Validation and publication share the per-skill lock, so every
+            # candidate includes the preceding resource/primary mutation.
+            folder = self._require_local(record)
+            atomic_write_primary(folder, payload, overwrite=True)
         return candidate
 
     def rollback_created(self, folder: Path, *, identity: tuple[int, int]) -> None:
@@ -312,31 +349,37 @@ class SkillStore:
             raise SkillPathError(
                 "the editor writes only .md resources and scripts/*.py"
             )
-        payload = content.encode("utf-8")
-        with tempfile.TemporaryDirectory(
-            prefix=".kestrel-skill-edit-", dir=self.local_root
-        ) as temporary:
-            staged_root = Path(temporary)
-            staged_folder = staged_root / record.name
-            shutil.copytree(folder, staged_folder, symlinks=True)
-            staged_path = lexical_contained_path(
-                staged_folder, relative.as_posix(), must_exist=False
-            )
-            reject_symlink_chain(staged_folder, staged_path)
-            staged_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            reject_symlink_chain(staged_folder, staged_path)
-            atomic_replace_file(staged_path, payload)
-            validate_skill_folder(staged_folder, source_root=staged_root)
+        try:
+            payload = content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise SkillFormatError("editor content must be valid UTF-8 text") from exc
+        with _serialized_skill_mutation(self.local_root, record.name):
+            folder = self._require_local(record)
+            path = lexical_contained_path(folder, relative.as_posix(), must_exist=False)
+            reject_symlink_chain(folder, path)
+            with tempfile.TemporaryDirectory(
+                prefix=".kestrel-skill-edit-", dir=self.local_root
+            ) as temporary:
+                staged_root = Path(temporary)
+                staged_folder = staged_root / record.name
+                shutil.copytree(folder, staged_folder, symlinks=True)
+                staged_path = lexical_contained_path(
+                    staged_folder, relative.as_posix(), must_exist=False
+                )
+                reject_symlink_chain(staged_folder, staged_path)
+                staged_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                reject_symlink_chain(staged_folder, staged_path)
+                atomic_replace_file(staged_path, payload)
+                validate_skill_folder(staged_folder, source_root=staged_root)
 
-        # The complete candidate was valid. Re-resolve the real folder and path
-        # immediately before the single-file atomic publication so a folder or
-        # ancestor swapped for a symlink cannot redirect the write.
-        folder = self._require_local(record)
-        path = lexical_contained_path(folder, relative.as_posix(), must_exist=False)
-        reject_symlink_chain(folder, path)
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        reject_symlink_chain(folder, path)
-        atomic_replace_file(path, payload)
+            # The complete candidate was valid. The held lock makes publication
+            # part of the same serial transaction as complete-folder validation.
+            folder = self._require_local(record)
+            path = lexical_contained_path(folder, relative.as_posix(), must_exist=False)
+            reject_symlink_chain(folder, path)
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            reject_symlink_chain(folder, path)
+            atomic_replace_file(path, payload)
 
     def tree(self, record: SkillRecord) -> tuple[dict[str, object], ...]:
         folder = self._require_real_folder(record)
@@ -418,8 +461,9 @@ class SkillStore:
         return target
 
     def delete(self, record: SkillRecord) -> None:
-        expected = self._require_local(record)
-        shutil.rmtree(expected)
+        with _serialized_skill_mutation(self.local_root, record.name):
+            expected = self._require_local(record)
+            shutil.rmtree(expected)
 
     @staticmethod
     def search(snapshot: CatalogSnapshot, query: str) -> tuple[SkillRecord, ...]:
@@ -435,7 +479,21 @@ class SkillStore:
 
     @staticmethod
     def _require_real_folder(record: SkillRecord) -> Path:
-        if record.folder.is_symlink() or not record.folder.is_dir():
+        try:
+            current = record.folder.lstat()
+        except OSError as exc:
+            raise SkillPathError(
+                "skill folder changed after discovery; reload before accessing it"
+            ) from exc
+        identity = (current.st_dev, current.st_ino)
+        if (
+            record.folder.is_symlink()
+            or not record.folder.is_dir()
+            or (
+                record.folder_identity is not None
+                and identity != record.folder_identity
+            )
+        ):
             raise SkillPathError(
                 "skill folder changed after discovery; reload before accessing it"
             )
@@ -447,7 +505,22 @@ class SkillStore:
                 f"skill {record.name!r} comes from {record.source_id!r}; create a local override to edit it"
             )
         expected = self.local_root / record.name
-        if record.folder != expected or expected.is_symlink() or not expected.is_dir():
+        try:
+            current = expected.lstat()
+        except OSError as exc:
+            raise SkillPathError(
+                "local skill folder changed after discovery; reload before mutating it"
+            ) from exc
+        identity = (current.st_dev, current.st_ino)
+        if (
+            record.folder != expected
+            or expected.is_symlink()
+            or not expected.is_dir()
+            or (
+                record.folder_identity is not None
+                and identity != record.folder_identity
+            )
+        ):
             raise SkillPathError(
                 "local skill folder changed after discovery; reload before mutating it"
             )

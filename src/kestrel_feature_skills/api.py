@@ -17,6 +17,7 @@ from .errors import (
     SkillFormatError,
     SkillNotFoundError,
     SkillPathError,
+    SkillPrivacyError,
     SkillReadOnlyError,
 )
 
@@ -57,7 +58,7 @@ def _http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, SkillConflictError):
         return HTTPException(status_code=409, detail=str(exc))
-    if isinstance(exc, SkillReadOnlyError):
+    if isinstance(exc, (SkillReadOnlyError, SkillPrivacyError)):
         return HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, EnablementUnavailableError):
         return HTTPException(status_code=503, detail=str(exc))
@@ -106,6 +107,7 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
         except (
             SkillFormatError,
             SkillPathError,
+            SkillPrivacyError,
             SkillConflictError,
             DatabaseError,
             OSError,
@@ -126,6 +128,7 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
             GitSourceError,
             SkillFormatError,
             SkillPathError,
+            SkillPrivacyError,
             SkillConflictError,
             SkillNotFoundError,
             DatabaseError,
@@ -139,7 +142,13 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
     async def tree(name: str) -> dict[str, object]:
         try:
             return {"name": name, "entries": list(feature.tree(name=name))}
-        except (SkillNotFoundError, SkillFormatError, SkillPathError, OSError) as exc:
+        except (
+            SkillNotFoundError,
+            SkillFormatError,
+            SkillPathError,
+            SkillPrivacyError,
+            OSError,
+        ) as exc:
             raise _http_error(exc) from exc
 
     @router.get("/{name}/file")
@@ -153,6 +162,7 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
             SkillNotFoundError,
             SkillFormatError,
             SkillPathError,
+            SkillPrivacyError,
             OSError,
         ) as exc:
             raise _http_error(exc) from exc
@@ -170,6 +180,7 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
             SkillReadOnlyError,
             SkillFormatError,
             SkillPathError,
+            SkillPrivacyError,
             DatabaseError,
             OSError,
             RuntimeError,
@@ -187,6 +198,7 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
         except (
             SkillNotFoundError,
             EnablementUnavailableError,
+            SkillPrivacyError,
             DatabaseError,
             RuntimeError,
             ValueError,
@@ -203,7 +215,9 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
         except (
             SkillNotFoundError,
             SkillReadOnlyError,
+            SkillFormatError,
             SkillPathError,
+            SkillPrivacyError,
             DatabaseError,
             OSError,
             RuntimeError,

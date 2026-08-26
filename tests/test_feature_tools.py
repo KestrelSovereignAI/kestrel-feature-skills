@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 from kestrel_sdk.features.contributions import PermissionLevel
 from kestrel_sdk.storage.database import DatabaseError
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.privacy import PrivacyConfig
 
+from kestrel_feature_skills import ProceduralSkillsFeature
 from kestrel_feature_skills.context import render_context_clause
 from kestrel_feature_skills.enablement import MAX_PRIORITY
 from kestrel_feature_skills.feature import PROCEDURAL_SKILL_NODE_TYPE
@@ -27,6 +32,143 @@ EXPECTED_TOOLS = {
 
 class UnexpectedGraphError(Exception):
     """A non-database graph failure used to prove best-effort containment."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage", ("none", "temp", "deidentified"))
+async def test_volatile_privacy_initialization_never_opens_persistent_skills(
+    tmp_path, monkeypatch, storage
+):
+    import kestrel_feature_skills.feature as module
+
+    root = tmp_path / "persistent-skills"
+    touched = []
+
+    def fail_store(_root):
+        touched.append("store")
+        raise AssertionError("persistent skill root opened")
+
+    def fail_database(_agent):
+        touched.append("database")
+        raise AssertionError("raw database opened")
+
+    monkeypatch.setattr(module, "SkillStore", fail_store)
+    monkeypatch.setattr(module, "resolve_feature_database", fail_database)
+    agent = SimpleNamespace(
+        did="did:test:private-skills",
+        procedural_skills_root=root,
+        privacy_config=PrivacyConfig(storage=storage),
+        _privacy_transition_lock=asyncio.Lock(),
+    )
+    private = ProceduralSkillsFeature(agent)
+
+    await private.initialize()
+    try:
+        assert touched == []
+        assert not root.exists()
+        assert private.catalog_payload()["skills"] == []
+        assert private.context_clause_text == ""
+        created = await private.skill_create("private", "Private", "body")
+        assert created.status is ToolResultStatus.ERROR
+        assert "privacy mode" in created.error
+        assert not root.exists()
+    finally:
+        await private.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_transition_to_volatile_mode_blocks_every_persistent_mutation(
+    feature, monkeypatch
+):
+    await feature.skill_create("private-guard", "Private guard", "Original body")
+    await feature.skill_enable("private-guard", priority=7)
+    folder = feature.agent.procedural_skills_root / "private-guard"
+    original = (folder / "SKILL.md").read_bytes()
+    feature.agent._privacy_transition_lock = asyncio.Lock()
+    feature.agent.privacy_config = PrivacyConfig(storage="none")
+
+    checkout_called = False
+
+    def fail_checkout(*_args, **_kwargs):
+        nonlocal checkout_called
+        checkout_called = True
+        raise AssertionError("git checkout started in volatile privacy mode")
+
+    monkeypatch.setattr(
+        "kestrel_feature_skills.git_source.GitSkillSource.checkout", fail_checkout
+    )
+    operations = (
+        feature.skill_edit(
+            "private-guard",
+            serialize_skill_markdown(
+                SkillDocument("private-guard", "Changed", "Changed body")
+            ),
+        ),
+        feature.skill_disable("private-guard"),
+        feature.skill_delete("private-guard"),
+        feature.skill_create("new-private", "New private", "body"),
+        feature.skill_install(
+            "https://example.com/skills.git", "remote-private", "main"
+        ),
+    )
+    results = [await operation for operation in operations]
+
+    assert all(result.status is ToolResultStatus.ERROR for result in results)
+    assert all("privacy mode" in result.error for result in results)
+    assert checkout_called is False
+    assert folder.is_dir()
+    assert (folder / "SKILL.md").read_bytes() == original
+    assert not (feature.agent.procedural_skills_root / "new-private").exists()
+    assert not (feature.agent.procedural_skills_root / "remote-private").exists()
+    assert feature.catalog_payload()["skills"] == []
+    assert feature.context_clause_text == ""
+
+    await feature.refresh()
+    assert feature._store is None
+    assert feature._db is None
+    feature.agent.privacy_config = PrivacyConfig(storage="full")
+    await feature.refresh()
+    assert feature.snapshot.by_name()["private-guard"].state.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_privacy_transition_waits_for_in_flight_persistent_mutation(
+    feature, monkeypatch
+):
+    await feature.skill_create("transition-lock", "Transition lock", "body")
+    feature.agent._privacy_transition_lock = asyncio.Lock()
+    feature.agent.privacy_config = PrivacyConfig(storage="full")
+    entered_write = asyncio.Event()
+    release_write = asyncio.Event()
+    transition_entered = asyncio.Event()
+    original_set = feature._enablement.set
+
+    async def paused_set(*args, **kwargs):
+        entered_write.set()
+        await release_write.wait()
+        return await original_set(*args, **kwargs)
+
+    monkeypatch.setattr(feature._enablement, "set", paused_set)
+    mutation = asyncio.create_task(
+        feature.set_skill_state(name="transition-lock", enabled=True)
+    )
+    await asyncio.wait_for(entered_write.wait(), timeout=5)
+
+    async def transition():
+        async with feature.agent._privacy_transition_lock:
+            transition_entered.set()
+            feature.agent.privacy_config = PrivacyConfig(storage="none")
+
+    privacy_change = asyncio.create_task(transition())
+    await asyncio.sleep(0)
+    assert not transition_entered.is_set()
+    release_write.set()
+    result = await mutation
+    await privacy_change
+
+    assert result["enabled"] is True
+    assert transition_entered.is_set()
+    assert feature.catalog_payload()["skills"] == []
 
 
 def test_feature_exposes_exact_tool_and_permission_contract(feature):

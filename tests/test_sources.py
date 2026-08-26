@@ -160,6 +160,39 @@ def test_unknown_provenance_metadata_is_visible_error(tmp_path):
     assert "unsupported field" in snapshot.errors[0].error
 
 
+def test_json_escaped_surrogates_are_rejected_in_documents_and_provenance(tmp_path):
+    local = tmp_path / "local"
+    shared = tmp_path / "shared"
+    local.mkdir()
+    shared.mkdir()
+    broken = local / "broken-text"
+    broken.mkdir()
+    (broken / "SKILL.md").write_text(
+        '---\nname: "broken-text"\ndescription: "\\ud800"\n---\n\nbody\n',
+        encoding="ascii",
+    )
+    folder = make_skill(local, "bad-origin", "bad origin")
+    (folder / PROVENANCE_FILENAME).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "kind": "git",
+                "source_id": "\ud800",
+                "locator": "main:bad-origin",
+                "revision": None,
+                "remote_url": None,
+            }
+        ),
+        encoding="ascii",
+    )
+
+    snapshot = catalog(local, shared).refresh()
+
+    assert snapshot.records == ()
+    assert len(snapshot.errors) == 2
+    assert all("UTF-8" in error.error for error in snapshot.errors)
+
+
 @pytest.mark.parametrize(
     "url",
     (
@@ -172,6 +205,19 @@ def test_unknown_provenance_metadata_is_visible_error(tmp_path):
 )
 def test_git_source_rejects_non_https_or_credential_bearing_urls(url):
     with pytest.raises(GitSourceError):
+        validate_remote_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "https://example.com/skills.git\x00",
+        "https://example.com/skills.git\n--upload-pack=evil",
+        "https://example.com/skills-\ud800.git",
+    ),
+)
+def test_git_source_rejects_control_or_unencodable_url_text(url):
+    with pytest.raises(GitSourceError, match="URL"):
         validate_remote_url(url)
 
 

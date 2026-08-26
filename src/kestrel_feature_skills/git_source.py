@@ -18,6 +18,7 @@ from .format import validate_skill_folder, validate_skill_name
 
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_URL_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 MAX_GIT_TRANSFER_BYTES = 32 * 1024 * 1024
 MAX_GIT_OUTPUT_BYTES = 1024 * 1024
 _TRANSFER_POLL_SECONDS = 0.05
@@ -32,8 +33,16 @@ _GIT_CONFIG_PREFIX = (
 
 
 def validate_remote_url(url: object) -> str:
-    if not isinstance(url, str) or len(url) > 2048:
+    if not isinstance(url, str):
         raise GitSourceError("git source URL must be a bounded HTTPS URL")
+    try:
+        encoded = url.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise GitSourceError("git source URL must be valid UTF-8 text") from exc
+    if len(encoded) > 2048 or _URL_CONTROL_RE.search(url):
+        raise GitSourceError(
+            "git source URL must be bounded text without control characters"
+        )
     try:
         parsed = urlsplit(url)
     except ValueError as exc:

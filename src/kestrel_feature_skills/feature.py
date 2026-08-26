@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +20,12 @@ from kestrel_sdk.features.ui import UIContributions
 from kestrel_sdk.storage.database import DatabaseError
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    hides_persisted_user_content,
+    resolve_feature_database,
+)
 from kestrel_sovereign.storage.async_graph_store import GraphNode
+from kestrel_sovereign.storage.privacy_wrapper import optional_transition_lock
 
 from .context import (
     DEFAULT_CONTEXT_BUDGET_BYTES,
@@ -28,7 +33,7 @@ from .context import (
     render_context_clause,
 )
 from .enablement import DEFAULT_PRIORITY, SkillEnablementStore, validate_priority
-from .errors import SkillConflictError, SkillError
+from .errors import SkillConflictError, SkillError, SkillPrivacyError
 from .format import SKILL_FILENAME, validate_skill_name
 from .git_source import GitSkillSource
 from .models import (
@@ -85,6 +90,19 @@ def _host_shared_root() -> Path | None:
     return Path(kestrel_home) / "skills" if kestrel_home else None
 
 
+def _privacy_transition_lock(agent: object):
+    getter = getattr(agent, "_get_privacy_transition_lock", None)
+    if callable(getter):
+        try:
+            candidate = getter()
+        except Exception:  # noqa: BLE001 - missing lock must not break a feature
+            candidate = None
+        if hasattr(candidate, "__aenter__"):
+            return candidate
+    candidate = getattr(agent, "_privacy_transition_lock", None)
+    return candidate if hasattr(candidate, "__aenter__") else None
+
+
 class ProceduralSkillsFeature(Feature):
     """Author, discover, enable, and progressively disclose procedural skills."""
 
@@ -109,40 +127,18 @@ class ProceduralSkillsFeature(Feature):
         )
 
     async def initialize(self) -> None:
-        local_root = _agent_local_root(self.agent)
-        self._store = SkillStore(local_root)
-        sources = [
-            DirectorySkillSource(
-                root=local_root,
-                source_id="agent-local",
-                kind="agent-local",
-                precedence=AGENT_LOCAL_PRECEDENCE,
-            )
-        ]
-        shared_root = _host_shared_root()
-        if (
-            shared_root is not None
-            and shared_root.resolve(strict=False) != local_root.resolve()
-        ):
-            sources.append(
-                DirectorySkillSource(
-                    root=shared_root,
-                    source_id="host-shared",
-                    kind="host-shared",
-                    precedence=HOST_SHARED_PRECEDENCE,
-                )
-            )
-        self._catalog = SkillCatalog(tuple(sources))
-        self._db = resolve_feature_database(self.agent)
-        self._enablement = SkillEnablementStore(self._db, _agent_id(self.agent))
-        await self.refresh()
         from .api import build_router
 
         self._router = build_router(self)
+        async with optional_transition_lock(_privacy_transition_lock(self.agent)):
+            if self._privacy_hidden():
+                self._hide_persistent_state()
+            else:
+                self._ensure_persistent_services()
+                await self._refresh_locked()
         logger.info(
-            "ProceduralSkillsFeature initialized (local=%s, shared=%s, skills=%d, errors=%d)",
-            local_root,
-            shared_root,
+            "ProceduralSkillsFeature initialized (persistent_access=%s, skills=%d, errors=%d)",
+            not self._privacy_hidden(),
             len(self._snapshot.records),
             len(self._snapshot.errors),
         )
@@ -179,19 +175,31 @@ class ProceduralSkillsFeature(Feature):
 
     @property
     def snapshot(self) -> CatalogSnapshot:
-        return self._snapshot
+        return CatalogSnapshot() if self._privacy_hidden() else self._snapshot
 
     @property
     def context_clause_text(self) -> str:
         """The memoized, byte-stable text awaiting the SDK contribution seam."""
 
-        return self._context_render.text
+        return "" if self._privacy_hidden() else self._context_render.text
 
     @property
     def enablement_available(self) -> bool:
-        return bool(self._enablement and self._enablement.available)
+        return bool(
+            not self._privacy_hidden()
+            and self._enablement
+            and self._enablement.available
+        )
 
     async def refresh(self) -> CatalogSnapshot:
+        async with optional_transition_lock(_privacy_transition_lock(self.agent)):
+            if self._privacy_hidden():
+                self._hide_persistent_state()
+                return self._snapshot
+            self._ensure_persistent_services()
+            return await self._refresh_locked()
+
+    async def _refresh_locked(self) -> CatalogSnapshot:
         if self._catalog is None or self._enablement is None:
             raise RuntimeError("ProceduralSkillsFeature is not initialized")
         try:
@@ -224,6 +232,8 @@ class ProceduralSkillsFeature(Feature):
         return self._snapshot
 
     def catalog_payload(self) -> dict[str, object]:
+        if self._privacy_hidden():
+            return self._empty_catalog_payload()
         included = set(self._context_render.included)
         records = [
             self._record_payload(record, included) for record in self._snapshot.records
@@ -241,6 +251,88 @@ class ProceduralSkillsFeature(Feature):
                 "bytes": len(self._context_render.text.encode("utf-8")),
             },
         }
+
+    def _empty_catalog_payload(self) -> dict[str, object]:
+        return {
+            "skills": [],
+            "count": 0,
+            "errors": [],
+            "enablement_available": False,
+            "enablement_error": (
+                "persistent procedural skills are unavailable in the current "
+                "privacy mode"
+            ),
+            "context": {
+                "text": "",
+                "included": [],
+                "dropped": [],
+                "bytes": 0,
+            },
+        }
+
+    def _privacy_hidden(self) -> bool:
+        return hides_persisted_user_content(self.agent)
+
+    def _require_persistent_access(self) -> None:
+        if self._privacy_hidden():
+            raise SkillPrivacyError(
+                "persistent procedural skills are unavailable in the current privacy mode"
+            )
+
+    def _hide_persistent_state(self) -> None:
+        self._db = None
+        self._enablement = None
+        self._store = None
+        self._catalog = None
+        self._snapshot = CatalogSnapshot()
+        self._context_render = render_context_clause(self._snapshot)
+        self._states = {}
+        self._enablement_error = (
+            "persistent procedural skills are unavailable in the current privacy mode"
+        )
+        self._indexed_names = frozenset()
+
+    def _ensure_persistent_services(self) -> None:
+        if all(
+            service is not None
+            for service in (self._store, self._catalog, self._enablement)
+        ):
+            return
+        local_root = _agent_local_root(self.agent)
+        store = SkillStore(local_root)
+        sources = [
+            DirectorySkillSource(
+                root=local_root,
+                source_id="agent-local",
+                kind="agent-local",
+                precedence=AGENT_LOCAL_PRECEDENCE,
+            )
+        ]
+        shared_root = _host_shared_root()
+        if (
+            shared_root is not None
+            and shared_root.resolve(strict=False) != local_root.resolve()
+        ):
+            sources.append(
+                DirectorySkillSource(
+                    root=shared_root,
+                    source_id="host-shared",
+                    kind="host-shared",
+                    precedence=HOST_SHARED_PRECEDENCE,
+                )
+            )
+        database = resolve_feature_database(self.agent)
+        self._store = store
+        self._catalog = SkillCatalog(tuple(sources))
+        self._db = database
+        self._enablement = SkillEnablementStore(database, _agent_id(self.agent))
+
+    @asynccontextmanager
+    async def _persistent_mutation(self):
+        async with optional_transition_lock(_privacy_transition_lock(self.agent)):
+            self._require_persistent_access()
+            self._ensure_persistent_services()
+            yield
 
     def _record_payload(
         self, record: SkillRecord, included: set[str]
@@ -265,6 +357,24 @@ class ProceduralSkillsFeature(Feature):
         }
 
     async def create_skill(
+        self,
+        *,
+        name: str,
+        description: str,
+        body: str,
+        enabled: bool = False,
+        priority: int = DEFAULT_PRIORITY,
+    ) -> dict[str, object]:
+        async with self._persistent_mutation():
+            return await self._create_skill_locked(
+                name=name,
+                description=description,
+                body=body,
+                enabled=enabled,
+                priority=priority,
+            )
+
+    async def _create_skill_locked(
         self,
         *,
         name: str,
@@ -300,13 +410,13 @@ class ProceduralSkillsFeature(Feature):
                         self._states.pop(name, None)
                     else:
                         self._states[name] = previous_state
-                    await self.refresh()
+                    await self._refresh_locked()
                     raise
                 observed_state = persisted_states.get(name)
                 if observed_state and observed_state.enabled:
                     store.rollback_created(folder, identity=created_identity)
                     self._states = dict(persisted_states)
-                    await self.refresh()
+                    await self._refresh_locked()
                     raise
                 self._states = dict(persisted_states)
                 self._states[name] = observed_state or SkillState(
@@ -315,7 +425,7 @@ class ProceduralSkillsFeature(Feature):
                 state_error = str(exc)
         elif enabled:
             state_error = "agent database unavailable; the new skill remains disabled"
-        await self.refresh()
+        await self._refresh_locked()
         record = SkillStore.get(self._snapshot, name)
         return {
             "name": name,
@@ -329,10 +439,18 @@ class ProceduralSkillsFeature(Feature):
     async def edit_skill(
         self, *, name: str, relative_path: str, content: str
     ) -> dict[str, object]:
+        async with self._persistent_mutation():
+            return await self._edit_skill_locked(
+                name=name, relative_path=relative_path, content=content
+            )
+
+    async def _edit_skill_locked(
+        self, *, name: str, relative_path: str, content: str
+    ) -> dict[str, object]:
         store, _ = self._require_services()
         record = SkillStore.get(self._snapshot, name)
         store.write_file(record, relative_path, content)
-        await self.refresh()
+        await self._refresh_locked()
         SkillStore.get(self._snapshot, name)
         return {
             "name": name,
@@ -347,6 +465,18 @@ class ProceduralSkillsFeature(Feature):
         enabled: bool,
         priority: int | None = None,
     ) -> dict[str, object]:
+        async with self._persistent_mutation():
+            return await self._set_skill_state_locked(
+                name=name, enabled=enabled, priority=priority
+            )
+
+    async def _set_skill_state_locked(
+        self,
+        *,
+        name: str,
+        enabled: bool,
+        priority: int | None = None,
+    ) -> dict[str, object]:
         _, enablement = self._require_services()
         record = SkillStore.get(self._snapshot, name)
         resolved_priority = (
@@ -354,7 +484,7 @@ class ProceduralSkillsFeature(Feature):
         )
         state = await enablement.set(name, enabled=enabled, priority=resolved_priority)
         self._states[name] = state
-        await self.refresh()
+        await self._refresh_locked()
         refreshed = SkillStore.get(self._snapshot, name)
         return {
             "name": name,
@@ -365,6 +495,10 @@ class ProceduralSkillsFeature(Feature):
         }
 
     async def delete_skill(self, *, name: str) -> dict[str, object]:
+        async with self._persistent_mutation():
+            return await self._delete_skill_locked(name=name)
+
+    async def _delete_skill_locked(self, *, name: str) -> dict[str, object]:
         store, enablement = self._require_services()
         record = SkillStore.get(self._snapshot, name)
         node_id = self._node_id(name)
@@ -395,7 +529,7 @@ class ProceduralSkillsFeature(Feature):
             except Exception as exc:  # noqa: BLE001 - graph is a recoverable index
                 graph_deleted = False
                 errors.append(f"graph index cleanup failed: {exc}")
-        await self.refresh()
+        await self._refresh_locked()
         return {
             "name": name,
             "removed_file": True,
@@ -405,6 +539,18 @@ class ProceduralSkillsFeature(Feature):
         }
 
     async def install_skill(
+        self,
+        *,
+        source_url: str,
+        skill_name: str,
+        ref: str = "HEAD",
+    ) -> dict[str, object]:
+        async with self._persistent_mutation():
+            return await self._install_skill_locked(
+                source_url=source_url, skill_name=skill_name, ref=ref
+            )
+
+    async def _install_skill_locked(
         self,
         *,
         source_url: str,
@@ -442,7 +588,7 @@ class ProceduralSkillsFeature(Feature):
                 )
                 self._states[skill_name] = state
             folder = store.install_folder(checkout.skill_folder, provenance=provenance)
-        await self.refresh()
+        await self._refresh_locked()
         record = SkillStore.get(self._snapshot, skill_name)
         return {
             "name": skill_name,
@@ -567,6 +713,7 @@ class ProceduralSkillsFeature(Feature):
         return f"procedural-skill:{hashlib.sha256(material).hexdigest()[:32]}"
 
     def _require_services(self) -> tuple[SkillStore, SkillEnablementStore]:
+        self._require_persistent_access()
         if self._store is None or self._enablement is None:
             raise RuntimeError("ProceduralSkillsFeature is not initialized")
         return self._store, self._enablement
@@ -611,7 +758,7 @@ class ProceduralSkillsFeature(Feature):
     )
     async def skill_search(self, query: str) -> ToolResult:
         try:
-            matches = SkillStore.search(self._snapshot, query)
+            matches = SkillStore.search(self.snapshot, query)
         except SkillError as exc:
             return ToolResult.failed(str(exc))
         rows = [

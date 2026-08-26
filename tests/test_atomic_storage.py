@@ -20,6 +20,7 @@ from kestrel_feature_skills.format import (
     validate_skill_folder,
 )
 from kestrel_feature_skills.models import SkillDocument, SkillProvenance, SkillRecord
+from kestrel_feature_skills.sources import DirectorySkillSource
 from kestrel_feature_skills.store import (
     CLAIM_STALENESS_SECONDS,
     SkillStore,
@@ -314,6 +315,74 @@ def test_limit_crossing_resource_edit_is_not_published(tmp_path):
     assert validate_skill_folder(folder, source_root=store.local_root).name == "bounded"
 
 
+def test_concurrent_resource_edits_revalidate_the_serialized_folder(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("concurrent", "Concurrent", "Procedure."))
+    record = SkillRecord(
+        document=SkillDocument("concurrent", "Concurrent", "Procedure."),
+        folder=folder,
+        source_id="agent-local",
+        source_kind="agent-local",
+        precedence=0,
+        provenance=SkillProvenance("agent-local", "agent-local", "concurrent"),
+    )
+    resources = folder / "resources"
+    resources.mkdir()
+    for index in range(MAX_FOLDER_FILES - 2):
+        (resources / f"{index:03}.md").write_text("x", encoding="utf-8")
+
+    import kestrel_feature_skills.store as module
+
+    real_validate = module.validate_skill_folder
+    first_validated = threading.Event()
+    second_validated = threading.Event()
+    release_first = threading.Event()
+    validation_count = 0
+    validation_guard = threading.Lock()
+
+    def pause_first_staged_validation(candidate, *, source_root):
+        nonlocal validation_count
+        result = real_validate(candidate, source_root=source_root)
+        if candidate != folder and candidate.name == record.name:
+            with validation_guard:
+                validation_count += 1
+                position = validation_count
+            if position == 1:
+                first_validated.set()
+                assert release_first.wait(timeout=5)
+            else:
+                second_validated.set()
+        return result
+
+    monkeypatch.setattr(module, "validate_skill_folder", pause_first_staged_validation)
+    results = []
+
+    def write(path):
+        try:
+            store.write_file(record, path, "new")
+            results.append("published")
+        except SkillFormatError:
+            results.append("rejected")
+
+    first = threading.Thread(target=write, args=("resources/first.md",))
+    second = threading.Thread(target=write, args=("resources/second.md",))
+    first.start()
+    assert first_validated.wait(timeout=5)
+    second.start()
+    second_validated.wait(timeout=0.5)
+    release_first.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert sorted(results) == ["published", "rejected"]
+    assert (
+        validate_skill_folder(folder, source_root=store.local_root).name == "concurrent"
+    )
+
+
 def test_resource_edit_rejects_symlink_swap_to_primary_after_staging(
     tmp_path, monkeypatch
 ):
@@ -458,6 +527,10 @@ def test_python_edit_is_scoped_to_scripts_and_never_runs(tmp_path):
     with pytest.raises(SkillPathError, match="only below scripts"):
         store.write_file(record, "danger.py", source)
 
+    with pytest.raises(SkillFormatError, match="UTF-8"):
+        store.write_file(record, "notes.md", "bad\ud800")
+    assert not (folder / "notes.md").exists()
+
 
 def test_mutation_rejects_folder_replaced_by_symlink_after_discovery(tmp_path):
     store = SkillStore(tmp_path / "skills")
@@ -482,3 +555,35 @@ def test_mutation_rejects_folder_replaced_by_symlink_after_discovery(tmp_path):
     with pytest.raises(SkillPathError, match="changed after discovery"):
         store.delete(record)
     assert marker.read_text(encoding="utf-8") == "must survive"
+
+
+@pytest.mark.parametrize("operation", ("edit", "delete"))
+def test_mutation_rejects_real_folder_replacement_after_discovery(tmp_path, operation):
+    store = SkillStore(tmp_path / "skills")
+    original = store.create(SkillDocument("replaced", "Original", "Procedure."))
+    source = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    )
+    record = source.discover()[0][0]
+    original.rename(tmp_path / "old-replaced")
+    replacement = store.local_root / "replaced"
+    replacement.mkdir()
+    marker = replacement / "marker.md"
+    marker.write_text("replacement must survive", encoding="utf-8")
+    (replacement / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("replaced", "Replacement", "Different procedure.")
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillPathError, match="changed after discovery"):
+        if operation == "edit":
+            store.write_file(record, "notes.md", "must not publish")
+        else:
+            store.delete(record)
+
+    assert marker.read_text(encoding="utf-8") == "replacement must survive"

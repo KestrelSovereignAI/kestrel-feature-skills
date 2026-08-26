@@ -25,6 +25,10 @@ class SkillReadOnlyError(SkillError):
     """A mutation targeted a non-local source."""
 
 
+class SkillPrivacyError(SkillError):
+    """The active privacy mode hides persistent procedural skills."""
+
+
 class EnablementUnavailableError(SkillError):
     """The agent database required for enablement is unavailable."""
 
@@ -41,5 +45,6 @@ __all__ = [
     "SkillFormatError",
     "SkillNotFoundError",
     "SkillPathError",
+    "SkillPrivacyError",
     "SkillReadOnlyError",
 ]

@@ -193,6 +193,17 @@ async def test_delete_api_removes_only_resolved_local_skill(client, feature):
     assert second.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_delete_api_maps_invalid_skill_name_to_422(client):
+    response = await client.delete(
+        "/api/procedural-skills/INVALID!",
+        headers={"X-Kestrel-Allow-Destructive": "operator-confirmed-ui"},
+    )
+
+    assert response.status_code == 422
+    assert "skill name" in response.json()["detail"]
+
+
 def test_ui_bundle_contains_required_rails_and_no_run_control(feature):
     ui = feature.get_ui_contributions()
     static = Path(ui.static_dir)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import replace
@@ -24,6 +25,14 @@ PROVENANCE_VERSION = 1
 AGENT_LOCAL_PRECEDENCE = 0
 HOST_SHARED_PRECEDENCE = 100
 REMOTE_PRECEDENCE = 200
+_PROVENANCE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_PROVENANCE_BOUNDS = {
+    "kind": 64,
+    "source_id": 2048,
+    "locator": 1024,
+    "revision": 200,
+    "remote_url": 2048,
+}
 
 
 class SkillSource(ABC):
@@ -43,6 +52,46 @@ def _default_provenance(source: DirectorySkillSource, folder: Path) -> SkillProv
         kind=source.kind,
         source_id=source.source_id,
         locator=folder.name,
+    )
+
+
+def _provenance_text(
+    value: object, *, field: str, optional: bool = False
+) -> str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or not value:
+        suffix = " or null" if optional else ""
+        raise SkillFormatError(
+            f"{PROVENANCE_FILENAME}.{field} must be a non-empty string{suffix}"
+        )
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SkillFormatError(
+            f"{PROVENANCE_FILENAME}.{field} must be valid UTF-8 text"
+        ) from exc
+    if len(encoded) > _PROVENANCE_BOUNDS[field]:
+        raise SkillFormatError(
+            f"{PROVENANCE_FILENAME}.{field} exceeds "
+            f"{_PROVENANCE_BOUNDS[field]} UTF-8 bytes"
+        )
+    if _PROVENANCE_CONTROL_RE.search(value):
+        raise SkillFormatError(
+            f"{PROVENANCE_FILENAME}.{field} contains control characters"
+        )
+    return value
+
+
+def _validated_provenance(provenance: SkillProvenance) -> SkillProvenance:
+    return SkillProvenance(
+        kind=_provenance_text(provenance.kind, field="kind"),
+        source_id=_provenance_text(provenance.source_id, field="source_id"),
+        locator=_provenance_text(provenance.locator, field="locator"),
+        revision=_provenance_text(provenance.revision, field="revision", optional=True),
+        remote_url=_provenance_text(
+            provenance.remote_url, field="remote_url", optional=True
+        ),
     )
 
 
@@ -66,28 +115,19 @@ def _load_provenance(source: DirectorySkillSource, folder: Path) -> SkillProvena
         raise SkillFormatError(
             f"{PROVENANCE_FILENAME} has unsupported field(s): {', '.join(sorted(unknown))}"
         )
-    required = ("kind", "source_id", "locator")
-    if any(
-        not isinstance(payload.get(key), str) or not payload[key] for key in required
-    ):
-        raise SkillFormatError(
-            f"{PROVENANCE_FILENAME} requires non-empty origin strings"
+    return _validated_provenance(
+        SkillProvenance(
+            kind=payload.get("kind"),
+            source_id=payload.get("source_id"),
+            locator=payload.get("locator"),
+            revision=payload.get("revision"),
+            remote_url=payload.get("remote_url"),
         )
-    for optional in ("revision", "remote_url"):
-        if payload.get(optional) is not None and not isinstance(payload[optional], str):
-            raise SkillFormatError(
-                f"{PROVENANCE_FILENAME}.{optional} must be a string or null"
-            )
-    return SkillProvenance(
-        kind=payload["kind"],
-        source_id=payload["source_id"],
-        locator=payload["locator"],
-        revision=payload.get("revision"),
-        remote_url=payload.get("remote_url"),
     )
 
 
 def serialize_provenance(provenance: SkillProvenance) -> bytes:
+    provenance = _validated_provenance(provenance)
     payload = {"version": PROVENANCE_VERSION, **provenance.to_dict()}
     return (
         json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
@@ -131,8 +171,17 @@ class DirectorySkillSource(SkillSource):
             if not folder.is_dir() and not folder.is_symlink():
                 continue
             try:
+                before = folder.lstat()
+                before_identity = (before.st_dev, before.st_ino)
                 document = validate_skill_folder(folder, source_root=self.root)
                 provenance = _load_provenance(self, folder)
+                resolved_folder = folder.resolve(strict=True)
+                after = resolved_folder.lstat()
+                folder_identity = (after.st_dev, after.st_ino)
+                if folder_identity != before_identity:
+                    raise SkillFormatError(
+                        "skill folder changed identity during discovery"
+                    )
             except (SkillError, OSError) as exc:
                 errors.append(
                     DiscoveryError(
@@ -145,7 +194,7 @@ class DirectorySkillSource(SkillSource):
             records.append(
                 SkillRecord(
                     document=document,
-                    folder=folder.resolve(),
+                    folder=resolved_folder,
                     source_id=(
                         provenance.source_id
                         if provenance.kind == "git"
@@ -158,6 +207,7 @@ class DirectorySkillSource(SkillSource):
                         else self.precedence
                     ),
                     provenance=provenance,
+                    folder_identity=folder_identity,
                 )
             )
         return tuple(records), tuple(errors)
