@@ -47,7 +47,7 @@ async def test_postgres_enablement_matches_sqlite_without_feature_tables():
     finally:
         await db.execute(
             "DELETE FROM bootstrap_config WHERE agent_id IN (?, ?)",
-            (agent_id, f"{agent_id}:other"),
+            (first.storage_agent_id, second.storage_agent_id),
         )
         await db.close()
 
@@ -90,6 +90,6 @@ async def test_postgres_feature_writes_and_removes_procedural_skill_node(tmp_pat
         )
         await db.execute(
             "DELETE FROM bootstrap_config WHERE agent_id = ?",
-            (agent_id,),
+            (SkillEnablementStore(db, agent_id).storage_agent_id,),
         )
         await db.close()

@@ -20,7 +20,7 @@ MAX_FOLDER_FILES = 256
 MAX_FOLDER_BYTES = 2_097_152
 SKILL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
 _FRONTMATTER_KEYS = frozenset({"name", "description"})
-_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _UNICODE_LINE_SEPARATOR = re.compile(r"[\x85\u2028\u2029]")
 _MARKDOWN_DESTINATION = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 _MARKDOWN_REFERENCE_DEFINITION = re.compile(
@@ -218,7 +218,15 @@ def validate_skill_folder(folder: Path, *, source_root: Path) -> SkillDocument:
 
     file_count = 0
     byte_count = 0
-    for current, directories, files in os.walk(folder, followlinks=False):
+
+    def reject_walk_error(error: OSError) -> None:
+        raise SkillFormatError("could not scan the complete skill folder") from error
+
+    for current, directories, files in os.walk(
+        folder,
+        followlinks=False,
+        onerror=reject_walk_error,
+    ):
         current_path = Path(current)
         for entry in (*directories, *files):
             path = current_path / entry

@@ -282,11 +282,23 @@ class GitSkillSource:
     def remote_revision(self, *, url: str, ref: str) -> str:
         url = validate_remote_url(url)
         ref = validate_ref(ref)
-        output = _run_git(["ls-remote", "--exit-code", "--", url, ref], timeout=60)
-        first = output.splitlines()[0].split()[0] if output else ""
-        if not _COMMIT_RE.fullmatch(first):
+        output = _run_git(
+            ["ls-remote", "--exit-code", "--", url, ref, f"{ref}^{{}}"],
+            timeout=60,
+        )
+        direct: list[str] = []
+        peeled: list[str] = []
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) != 2 or not _COMMIT_RE.fullmatch(fields[0]):
+                raise GitSourceError(
+                    f"remote ref {ref!r} returned an invalid commit identity"
+                )
+            (peeled if fields[1].endswith("^{}") else direct).append(fields[0])
+        revisions = peeled or direct
+        if len(set(revisions)) != 1:
             raise GitSourceError(f"remote ref {ref!r} did not resolve to one commit")
-        return first
+        return revisions[0]
 
     def has_changed(self, *, url: str, ref: str, installed_revision: str) -> bool:
         if not _COMMIT_RE.fullmatch(installed_revision):

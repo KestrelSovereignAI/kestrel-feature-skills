@@ -62,10 +62,13 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
 
         with sqlite3.connect(database) as connection:
             row = connection.execute(
-                "SELECT enabled, priority, file_path FROM bootstrap_config WHERE file_name = ?",
+                "SELECT agent_id, enabled, priority, file_path "
+                "FROM bootstrap_config WHERE file_name = ?",
                 (f"skill:{name}",),
             ).fetchone()
-        assert row == (0, 100, f"skill://{name}")
+        assert row is not None
+        assert row[0].startswith("procedural-skill-state:did:")
+        assert row[1:] == (0, 100, f"skill://{name}")
 
         enabled = client.patch(
             f"{base}/{name}/state",

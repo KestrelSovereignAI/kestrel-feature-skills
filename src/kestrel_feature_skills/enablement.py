@@ -10,6 +10,7 @@ from .format import validate_skill_name
 from .models import SkillState
 
 CONFIG_PREFIX = "skill:"
+STATE_AGENT_PREFIX = "procedural-skill-state:"
 DEFAULT_PRIORITY = 100
 MIN_PRIORITY = -100_000
 MAX_PRIORITY = 100_000
@@ -25,11 +26,22 @@ def validate_priority(value: object) -> int:
 
 
 class SkillEnablementStore:
-    """Read and write namespaced rows without creating a feature-owned table."""
+    """Read and write isolated rows without creating a feature-owned table.
+
+    Core's bootstrap loader treats every enabled row for the literal agent DID
+    as a filename to inject in full.  Skill state therefore uses a disjoint
+    logical-agent namespace on the same ``bootstrap_config`` substrate.  This
+    keeps full procedure bodies behind ``skill_read`` even on core versions
+    that do not yet understand the ``skill:`` filename namespace.
+    """
 
     def __init__(self, db: Any | None, agent_id: str):
         self.db = db
         self.agent_id = agent_id
+
+    @property
+    def storage_agent_id(self) -> str:
+        return f"{STATE_AGENT_PREFIX}{self.agent_id}"
 
     @property
     def available(self) -> bool:
@@ -52,7 +64,7 @@ class SkillEnablementStore:
             WHERE agent_id = ? AND file_name LIKE ?
             ORDER BY priority ASC, file_name ASC
             """,
-            (self.agent_id, f"{CONFIG_PREFIX}%"),
+            (self.storage_agent_id, f"{CONFIG_PREFIX}%"),
         )
         states: dict[str, SkillState] = {}
         for file_name, enabled, priority in rows:
@@ -75,7 +87,10 @@ class SkillEnablementStore:
         priority = validate_priority(priority)
         file_name = f"{CONFIG_PREFIX}{name}"
         row_id = str(
-            uuid.uuid5(uuid.NAMESPACE_URL, f"kestrel-skills:{self.agent_id}:{name}")
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"kestrel-skills:{self.storage_agent_id}:{name}",
+            )
         )
         await db.execute(
             """
@@ -90,7 +105,7 @@ class SkillEnablementStore:
             """,
             (
                 row_id,
-                self.agent_id,
+                self.storage_agent_id,
                 file_name,
                 f"skill://{name}",
                 int(bool(enabled)),
@@ -105,7 +120,7 @@ class SkillEnablementStore:
         name = validate_skill_name(name)
         await db.execute(
             "DELETE FROM bootstrap_config WHERE agent_id = ? AND file_name = ?",
-            (self.agent_id, f"{CONFIG_PREFIX}{name}"),
+            (self.storage_agent_id, f"{CONFIG_PREFIX}{name}"),
         )
 
 
@@ -114,6 +129,7 @@ __all__ = [
     "DEFAULT_PRIORITY",
     "MAX_PRIORITY",
     "MIN_PRIORITY",
+    "STATE_AGENT_PREFIX",
     "SkillEnablementStore",
     "validate_priority",
 ]

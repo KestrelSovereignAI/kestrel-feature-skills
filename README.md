@@ -61,9 +61,11 @@ confirmation before its authenticated operator delete route is called.
 ## Storage authority
 
 The folder is authoritative. `procedural_skill` graph nodes are a recoverable,
-best-effort index. Per-agent enablement and priority use namespaced
-`skill:<name>` rows in the existing `bootstrap_config` table; this package does
-not create a competing configuration table.
+best-effort index. Per-agent enablement and priority use `skill:<name>` rows in
+the existing `bootstrap_config` table under an isolated
+`procedural-skill-state:<agent DID>` logical-agent namespace. The isolation
+prevents older core bootstrap loaders from treating a procedure as a full-text
+bootstrap file; this package does not create a competing configuration table.
 
 ## Context-seam status
 

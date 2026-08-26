@@ -59,6 +59,13 @@ async function openPanel(page) {
   await expect(tab).toHaveClass(/active/);
   await expect(page.locator('#panel-procedural-skills')).toBeVisible();
   await expect(page.locator('#panel-procedural-skills')).toContainText('Procedural skills');
+  await expect.poll(
+    () => page.evaluate(async () => {
+      const module = await import('/js/api.js');
+      return module.default.getHostAgent();
+    }),
+    { timeout: 20_000 },
+  ).toBe(AGENT);
   await expect(page.locator('[role="status"]')).toContainText('Catalog loaded');
 }
 

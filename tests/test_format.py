@@ -80,6 +80,19 @@ def test_json_escaped_unicode_line_separators_are_rejected(separator):
         parse_skill_markdown(content)
 
 
+@pytest.mark.parametrize("codepoint", (0x80, 0x9B, 0x9F))
+@pytest.mark.parametrize("field", ("description", "body"))
+def test_json_escaped_c1_controls_are_rejected(codepoint, field):
+    control = f"\\u{codepoint:04x}"
+    description = f'"safe{control}unsafe"' if field == "description" else '"safe"'
+    decoded_control = chr(codepoint)
+    body = f"safe{decoded_control}unsafe" if field == "body" else "Procedure."
+    content = f'---\nname: "c1-control"\ndescription: {description}\n---\n\n{body}\n'
+
+    with pytest.raises(SkillFormatError, match="control|printable"):
+        parse_skill_markdown(content)
+
+
 def test_serializer_rejects_lone_surrogate_body_as_a_format_error():
     with pytest.raises(SkillFormatError, match="UTF-8"):
         serialize_skill_markdown(
@@ -94,6 +107,22 @@ def test_folder_name_must_match_frontmatter(tmp_path):
         serialize_skill_markdown(document()), encoding="utf-8"
     )
     with pytest.raises(SkillFormatError, match="must match"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_folder_scan_error_rejects_candidate(tmp_path, monkeypatch):
+    folder = write_skill(tmp_path)
+
+    def failing_walk(root, *, followlinks, onerror=None):
+        assert root == folder
+        assert followlinks is False
+        if onerror is not None:
+            onerror(PermissionError("subdirectory became unreadable"))
+        return iter(())
+
+    monkeypatch.setattr("kestrel_feature_skills.format.os.walk", failing_walk)
+
+    with pytest.raises(SkillFormatError, match="scan"):
         validate_skill_folder(folder, source_root=tmp_path)
 
 

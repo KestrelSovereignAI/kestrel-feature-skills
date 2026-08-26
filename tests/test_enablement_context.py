@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+from kestrel_sovereign.features.bootstrap.loader import BootstrapLoader
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 from kestrel_feature_skills.context import render_context_clause
@@ -36,11 +37,18 @@ async def test_enablement_uses_namespaced_bootstrap_rows(tmp_path):
         await store.set("alpha", enabled=True, priority=7)
         await store.set("beta", enabled=False, priority=2)
         rows = await db.fetchall(
-            "SELECT file_name, enabled, priority, file_path FROM bootstrap_config ORDER BY file_name"
+            "SELECT agent_id, file_name, enabled, priority, file_path "
+            "FROM bootstrap_config ORDER BY file_name"
         )
         assert rows == [
-            ("skill:alpha", 1, 7, "skill://alpha"),
-            ("skill:beta", 0, 2, "skill://beta"),
+            (
+                "procedural-skill-state:did:test:one",
+                "skill:alpha",
+                1,
+                7,
+                "skill://alpha",
+            ),
+            ("procedural-skill-state:did:test:one", "skill:beta", 0, 2, "skill://beta"),
         ]
         assert await store.load() == {
             "beta": SkillState(False, 2),
@@ -50,6 +58,31 @@ async def test_enablement_uses_namespaced_bootstrap_rows(tmp_path):
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
         assert not any(name.startswith("skill_") for (name,) in tables)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_enabled_skill_row_cannot_enter_core_bootstrap_file_discovery(tmp_path):
+    db = await AsyncDatabase.sqlite(str(tmp_path / "enablement.db"))
+    agent_id = "did:test:bootstrap-isolation"
+    bootstrap_root = tmp_path / "agent-data"
+    bootstrap_root.mkdir()
+    leaked_file = bootstrap_root / "skill:private"
+    leaked_file.write_text("FULL PRIVATE PROCEDURE", encoding="utf-8")
+    try:
+        store = SkillEnablementStore(db, agent_id)
+        await store.set("private", enabled=True, priority=1)
+
+        loader = BootstrapLoader(
+            agent_data_path=str(bootstrap_root),
+            db=db,
+            agent_id=agent_id,
+        )
+        await loader.load_db_config()
+
+        assert "skill:private" not in loader.file_order
+        assert "FULL PRIVATE PROCEDURE" not in loader.get_bootstrap_content().values()
     finally:
         await db.close()
 

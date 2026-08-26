@@ -306,6 +306,24 @@ def test_git_source_detects_when_recorded_commit_changes(monkeypatch):
     )
 
 
+def test_git_source_compares_annotated_tag_peeled_commit(monkeypatch):
+    tag_object = "a" * 40
+    peeled_commit = "b" * 40
+
+    def fake_git(argv, *, timeout=120):
+        assert argv[:2] == ["ls-remote", "--exit-code"]
+        assert timeout == 60
+        return f"{tag_object}\trefs/tags/v1.0.0\n{peeled_commit}\trefs/tags/v1.0.0^{{}}"
+
+    monkeypatch.setattr(git_source_module, "_run_git", fake_git)
+
+    assert not GitSkillSource().has_changed(
+        url="https://example.com/skills.git",
+        ref="v1.0.0",
+        installed_revision=peeled_commit,
+    )
+
+
 def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch):
     commands = []
     target = tmp_path / "checkout"
