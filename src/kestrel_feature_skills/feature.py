@@ -213,6 +213,7 @@ class ProceduralSkillsFeature(Feature):
         )
         current_names = {record.name for record in self._snapshot.records}
         indexed = set(self._indexed_names)
+        indexed.update(await self._persisted_index_names())
         for stale_name in sorted(indexed - current_names):
             if await self._delete_index_node(stale_name):
                 indexed.discard(stale_name)
@@ -411,26 +412,22 @@ class ProceduralSkillsFeature(Feature):
                 revision=checkout.revision,
                 remote_url=checkout.remote_url,
             )
-            folder = store.install_folder(checkout.skill_folder, provenance=provenance)
-        state_error: str | None = None
-        if enablement.available:
-            try:
+            if enablement.available:
                 state = await enablement.set(
                     skill_name, enabled=False, priority=DEFAULT_PRIORITY
                 )
                 self._states[skill_name] = state
-            except DatabaseError as exc:
-                state_error = str(exc)
+            folder = store.install_folder(checkout.skill_folder, provenance=provenance)
         await self.refresh()
-        SkillStore.get(self._snapshot, skill_name)
+        record = SkillStore.get(self._snapshot, skill_name)
         return {
             "name": skill_name,
             "folder": str(folder),
             "revision": checkout.revision,
             "remote_url": checkout.remote_url,
-            "enabled": False,
+            "enabled": record.state.enabled,
             "indexed": skill_name in self._indexed_names,
-            "state_error": state_error,
+            "state_error": None,
         }
 
     def read_skill(self, *, name: str) -> dict[str, object]:
@@ -517,6 +514,29 @@ class ProceduralSkillsFeature(Feature):
             )
             return False
         return True
+
+    async def _persisted_index_names(self) -> set[str]:
+        """Discover this agent's prior index nodes so restart can reconcile them."""
+
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "get_nodes_by_type"):
+            return set()
+        try:
+            nodes = await storage.get_nodes_by_type(PROCEDURAL_SKILL_NODE_TYPE)
+        except Exception as exc:  # noqa: BLE001 - graph is a recoverable index
+            logger.warning("Could not enumerate procedural_skill index nodes: %s", exc)
+            return set()
+        names: set[str] = set()
+        for node in nodes:
+            properties = getattr(node, "properties", None)
+            name = properties.get("name") if isinstance(properties, dict) else None
+            try:
+                name = validate_skill_name(name)
+            except SkillError:
+                continue
+            if getattr(node, "node_id", None) == self._node_id(name):
+                names.add(name)
+        return names
 
     def _node_id(self, name: str) -> str:
         material = f"{_agent_id(self.agent)}\x00{name}".encode()

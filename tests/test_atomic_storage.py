@@ -248,6 +248,33 @@ def test_limit_crossing_resource_edit_is_not_published(tmp_path):
     assert validate_skill_folder(folder, source_root=store.local_root).name == "bounded"
 
 
+def test_primary_path_alias_uses_the_serialized_primary_writer(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("aliased", "Original", "Procedure."))
+    record = SkillRecord(
+        document=SkillDocument("aliased", "Original", "Procedure."),
+        folder=folder,
+        source_id="agent-local",
+        source_kind="agent-local",
+        precedence=0,
+        provenance=SkillProvenance("agent-local", "agent-local", "aliased"),
+    )
+    replacement = serialize_skill_markdown(
+        SkillDocument("aliased", "Replacement", "Changed procedure.")
+    )
+    calls = []
+
+    def serialized_edit(selected, content):
+        calls.append((selected, content))
+        return selected.document
+
+    monkeypatch.setattr(store, "edit_primary", serialized_edit)
+
+    store.write_file(record, "./SKILL.md", replacement)
+
+    assert calls == [(record, replacement)]
+
+
 def test_install_copies_resources_then_publishes_primary(tmp_path):
     source_root = tmp_path / "source"
     source_root.mkdir()

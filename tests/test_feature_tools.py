@@ -124,6 +124,26 @@ async def test_refresh_removes_index_for_authoritative_folder_removed_outside_to
 
 
 @pytest.mark.asyncio
+async def test_initialize_removes_persisted_stale_index_from_previous_process(feature):
+    await feature.skill_create("restart-stale", "Stale across restart", "body")
+    node_id = feature._node_id("restart-stale")
+    folder = feature.agent.procedural_skills_root / "restart-stale"
+    for path in folder.iterdir():
+        path.unlink()
+    folder.rmdir()
+
+    from kestrel_feature_skills import ProceduralSkillsFeature
+
+    replacement = ProceduralSkillsFeature(feature.agent)
+    await replacement.initialize()
+    try:
+        assert node_id not in feature.agent.storage.nodes
+        assert node_id in feature.agent.storage.deleted
+    finally:
+        await replacement.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_create_survives_enablement_write_and_reload_failure(
     feature, monkeypatch
 ):
@@ -267,6 +287,55 @@ async def test_git_install_records_revision_and_leaves_skill_disabled(
     assert record.provenance.revision == "b" * 40
     assert record.provenance.remote_url == "https://example.com/repo.git"
     assert record.state.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_git_install_is_not_published_when_disabled_state_cannot_persist(
+    feature, tmp_path, monkeypatch
+):
+    await feature.skill_create("remote-fail", "Previously local", "body")
+    await feature.skill_enable("remote-fail")
+    folder = feature.agent.procedural_skills_root / "remote-fail"
+    for path in folder.iterdir():
+        path.unlink()
+    folder.rmdir()
+    await feature.refresh()
+
+    checkout_root = tmp_path / "checkout-fail"
+    source = checkout_root / "skills" / "remote-fail"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("remote-fail", "Untrusted remote description", "body")
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_checkout(self, *, url, ref, skill_name, target):
+        return GitCheckout(
+            root=checkout_root,
+            skill_folder=source,
+            revision="c" * 40,
+            remote_url=url,
+            ref=ref,
+        )
+
+    async def fail_state(*_args, **_kwargs):
+        raise DatabaseError("database offline")
+
+    monkeypatch.setattr(
+        "kestrel_feature_skills.git_source.GitSkillSource.checkout", fake_checkout
+    )
+    monkeypatch.setattr(feature._enablement, "set", fail_state)
+
+    result = await feature.skill_install(
+        "https://example.com/repo.git", "remote-fail", "main"
+    )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert not folder.exists()
+    assert "remote-fail" not in feature.snapshot.by_name()
+    assert "Untrusted remote description" not in feature.context_clause_text
 
 
 @pytest.mark.asyncio

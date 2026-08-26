@@ -23,7 +23,8 @@ _FRONTMATTER_KEYS = frozenset({"name", "description"})
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _MARKDOWN_DESTINATION = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 _MARKDOWN_REFERENCE_DEFINITION = re.compile(
-    r"(?m)^[ \t]{0,3}\[[^\]\r\n]+\]:[ \t]*(?:<([^>\r\n]+)>|(\S+))"
+    r"(?m)^[ \t]{0,3}\[[^\]\r\n]+\]:[ \t]*"
+    r"(?:\r?\n[ \t]{0,3})?(?:<([^>\r\n]+)>|(\S+))"
 )
 _REMOTE_SCHEMES = frozenset({"http", "https", "mailto"})
 

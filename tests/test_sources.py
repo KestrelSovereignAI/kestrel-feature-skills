@@ -198,8 +198,8 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
     commands = []
     target = tmp_path / "checkout"
 
-    def fake_git(argv, *, timeout=120):
-        commands.append(argv)
+    def fake_git(argv, *, timeout=120, size_limit_root=None, max_bytes=None):
+        commands.append((argv, size_limit_root, max_bytes))
         if argv[0] == "clone":
             make_skill(target / "skills", "remote", "Remote default branch")
             return ""
@@ -214,8 +214,86 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
         target=target,
     )
 
-    clone = commands[0]
+    clone, size_limit_root, max_bytes = commands[0]
     assert clone[:3] == ["clone", "--depth", "1"]
+    assert "--filter=blob:none" in clone
+    assert "--sparse" in clone
+    assert "--no-checkout" in clone
     assert "--branch" not in clone
     assert "--single-branch" not in clone
+    assert size_limit_root == target
+    assert max_bytes is not None and 0 < max_bytes <= 64 * 1024 * 1024
+    sparse, sparse_root, sparse_max = commands[1]
+    assert sparse[:5] == [
+        "-C",
+        str(target),
+        "sparse-checkout",
+        "set",
+        "--no-cone",
+    ]
+    assert sparse[-2:] == ["/remote/", "/skills/remote/"]
+    assert (sparse_root, sparse_max) == (size_limit_root, max_bytes)
+    checkout_command, checkout_root, checkout_max = commands[2]
+    assert checkout_command == [
+        "-C",
+        str(target),
+        "checkout",
+        "--detach",
+        "HEAD",
+    ]
+    assert (checkout_root, checkout_max) == (size_limit_root, max_bytes)
     assert checkout.ref == "HEAD"
+
+
+def test_git_runner_rejects_a_checkout_that_crosses_its_disk_bound(tmp_path):
+    target = tmp_path / "oversized-git-data"
+
+    with pytest.raises(GitSourceError, match="transfer limit"):
+        git_source_module._run_git(
+            ["init", str(target)],
+            size_limit_root=target,
+            max_bytes=1,
+        )
+
+
+def test_git_checkout_materializes_only_the_requested_folder(tmp_path, monkeypatch):
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git_source_module._run_git(["init", "--initial-branch=main", str(origin)])
+    git_source_module._run_git(
+        ["-C", str(origin), "config", "uploadpack.allowFilter", "true"]
+    )
+    make_skill(origin / "skills", "remote", "Sparse checkout")
+    unrelated = origin / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "large.bin").write_bytes(b"x" * (1024 * 1024))
+    git_source_module._run_git(["-C", str(origin), "add", "."])
+    git_source_module._run_git(
+        [
+            "-C",
+            str(origin),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "fixture",
+        ]
+    )
+    source_url = origin.as_uri()
+    monkeypatch.setattr(
+        git_source_module, "validate_remote_url", lambda _url: source_url
+    )
+    target = tmp_path / "checkout"
+
+    checkout = GitSkillSource().checkout(
+        url=source_url,
+        ref="HEAD",
+        skill_name="remote",
+        target=target,
+    )
+
+    assert checkout.skill_folder == target / "skills" / "remote"
+    assert (checkout.skill_folder / "SKILL.md").is_file()
+    assert not (target / "unrelated").exists()

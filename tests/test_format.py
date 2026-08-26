@@ -104,6 +104,19 @@ def test_reference_style_markdown_escape_is_rejected(tmp_path):
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+def test_multiline_reference_style_markdown_escape_is_rejected(tmp_path):
+    (tmp_path / "outside.md").write_text("outside", encoding="utf-8")
+    value = SkillDocument(
+        "multiline-reference",
+        "Multiline reference link",
+        "Read [outside][secret].\n\n[secret]:\n  ../outside.md",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_reference_style_markdown_local_resource_is_accepted(tmp_path):
     value = SkillDocument(
         "reference-local",

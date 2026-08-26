@@ -21,6 +21,9 @@ class GraphStorage:
     async def get_node(self, node_id: str):
         return self.nodes.get(node_id)
 
+    async def get_nodes_by_type(self, node_type: str):
+        return [node for node in self.nodes.values() if node.node_type == node_type]
+
     async def delete_node(self, node_id: str) -> None:
         self.nodes.pop(node_id, None)
         self.deleted.append(node_id)

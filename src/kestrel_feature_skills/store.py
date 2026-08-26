@@ -203,12 +203,12 @@ class SkillStore:
         folder = self._require_local(record)
         if not isinstance(content, str):
             raise SkillFormatError("editor content must be text")
-        if relative_path == SKILL_FILENAME:
+        path = contained_path(folder, relative_path, must_exist=False)
+        relative = path.relative_to(folder)
+        if relative.as_posix() == SKILL_FILENAME:
             self.edit_primary(record, content)
             return
-        path = contained_path(folder, relative_path, must_exist=False)
         reject_symlink_chain(folder, path)
-        relative = path.relative_to(folder)
         if path.suffix == ".py":
             if not relative.parts or relative.parts[0] != "scripts":
                 raise SkillPathError("Python files are allowed only below scripts/")
