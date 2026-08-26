@@ -145,7 +145,7 @@ async def test_initialize_removes_persisted_stale_index_from_previous_process(fe
 
 
 @pytest.mark.asyncio
-async def test_create_survives_enablement_write_and_reload_failure(
+async def test_create_rolls_back_when_disabled_state_cannot_be_verified(
     feature, monkeypatch
 ):
     async def fail(*_args, **_kwargs):
@@ -156,9 +156,9 @@ async def test_create_survives_enablement_write_and_reload_failure(
 
     result = await feature.skill_create("db-outage", "DB outage", "body")
 
-    assert result.status is ToolResultStatus.PARTIAL
-    assert (feature.agent.procedural_skills_root / "db-outage" / "SKILL.md").is_file()
-    assert "db-outage" in feature.snapshot.by_name()
+    assert result.status is ToolResultStatus.ERROR
+    assert not (feature.agent.procedural_skills_root / "db-outage").exists()
+    assert "db-outage" not in feature.snapshot.by_name()
     assert "database offline" in feature.catalog_payload()["enablement_error"]
 
 
@@ -194,7 +194,9 @@ async def test_failed_create_cannot_reenable_from_stale_persisted_state(
     async def fail_state(*_args, **_kwargs):
         raise DatabaseError("database offline")
 
+    feature._states.clear()
     monkeypatch.setattr(feature._enablement, "set", fail_state)
+    monkeypatch.setattr(feature._enablement, "load", fail_state)
 
     with pytest.raises(DatabaseError, match="database offline"):
         await feature.create_skill(

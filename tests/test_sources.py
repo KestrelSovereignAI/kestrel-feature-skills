@@ -166,6 +166,7 @@ def test_unknown_provenance_metadata_is_visible_error(tmp_path):
         "http://example.com/skills.git",
         "https://user:secret@example.com/skills.git",
         "https://example.com/skills.git?token=secret",
+        "https://[",
         "file:///tmp/skills.git",
     ),
 )

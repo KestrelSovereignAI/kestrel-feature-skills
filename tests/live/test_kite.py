@@ -43,7 +43,10 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
     (root.parent / "kite-outside.md").unlink(missing_ok=True)
 
     with httpx.Client(timeout=30, headers=headers) as client:
-        client.delete(f"{base}/{name}")
+        client.delete(
+            f"{base}/{name}",
+            headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
+        )
         response = client.post(
             base,
             json={
@@ -155,7 +158,10 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert "requires approval" in install.json()["response"]
         assert not (root / unapproved_install).exists()
 
-        deleted = client.delete(f"{base}/{name}")
+        deleted = client.delete(
+            f"{base}/{name}",
+            headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
+        )
         assert deleted.status_code == 200, deleted.text
         for rejected_name in rejected_names:
             shutil.rmtree(root / rejected_name, ignore_errors=True)

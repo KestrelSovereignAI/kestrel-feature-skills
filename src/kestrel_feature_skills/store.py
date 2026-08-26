@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import shutil
 import tempfile
@@ -26,7 +27,12 @@ from .format import (
     validate_skill_name,
 )
 from .models import CatalogSnapshot, SkillDocument, SkillProvenance, SkillRecord
-from .paths import contained_path, direct_child, reject_symlink_chain
+from .paths import (
+    contained_path,
+    direct_child,
+    lexical_contained_path,
+    reject_symlink_chain,
+)
 from .sources import PROVENANCE_FILENAME, serialize_provenance
 
 CLAIM_STALENESS_SECONDS = 60
@@ -48,6 +54,39 @@ def _claim_identity(path: Path) -> tuple[int, int] | None:
     except OSError:
         return None
     return value.st_dev, value.st_ino
+
+
+def _lock_claim(path: Path, *, expected: tuple[int, int] | None = None) -> int | None:
+    """Lock the current claim inode without following a substituted symlink."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        value = os.fstat(descriptor)
+        identity = (value.st_dev, value.st_ino)
+        if (expected is not None and identity != expected) or (
+            _claim_identity(path) != identity
+        ):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+            return None
+    except (BlockingIOError, OSError):
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
+def _unlock_claim(descriptor: int | None) -> None:
+    if descriptor is None:
+        return
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def _write_tmp(path: Path, payload: bytes) -> None:
@@ -79,6 +118,7 @@ def atomic_write_primary(folder: Path, payload: bytes, *, overwrite: bool) -> No
     tmp = folder / f".SKILL.md.tmp.{uuid.uuid4().hex}"
     claim = folder / ".SKILL.md.claim"
     owned_claim: tuple[int, int] | None = None
+    claim_lock: int | None = None
     _write_tmp(tmp, payload)
     tmp_identity = _claim_identity(tmp)
     if tmp_identity is None:  # pragma: no cover - fsync'd file vanished externally
@@ -88,22 +128,46 @@ def atomic_write_primary(folder: Path, payload: bytes, *, overwrite: bool) -> No
         try:
             os.link(tmp, claim)
             owned_claim = tmp_identity
+            claim_lock = _lock_claim(claim, expected=owned_claim)
+            if claim_lock is None:
+                raise SkillConflictError(
+                    f"skill write could not lock its claim for {folder.name}"
+                )
         except FileExistsError:
             if not _claim_is_stale(claim):
                 raise SkillConflictError(
                     f"concurrent skill write is already in progress for {folder.name}"
                 ) from None
-            try:
-                claim.unlink()
-            except FileNotFoundError:
-                pass
-            try:
-                os.link(tmp, claim)
-                owned_claim = tmp_identity
-            except FileExistsError as exc:
+            stale_identity = _claim_identity(claim)
+            stale_lock = _lock_claim(claim, expected=stale_identity)
+            if stale_lock is None:
                 raise SkillConflictError(
-                    f"concurrent skill write won stale-claim recovery for {folder.name}"
-                ) from exc
+                    f"active skill writer still owns the stale claim for {folder.name}"
+                ) from None
+            try:
+                if (
+                    stale_identity is None
+                    or _claim_identity(claim) != stale_identity
+                    or not _claim_is_stale(claim)
+                ):
+                    raise SkillConflictError(
+                        f"stale skill claim changed during recovery for {folder.name}"
+                    )
+                claim.unlink()
+                try:
+                    os.link(tmp, claim)
+                    owned_claim = tmp_identity
+                except FileExistsError as exc:
+                    raise SkillConflictError(
+                        f"concurrent skill write won stale-claim recovery for {folder.name}"
+                    ) from exc
+                claim_lock = _lock_claim(claim, expected=owned_claim)
+                if claim_lock is None:
+                    raise SkillConflictError(
+                        f"skill write could not lock its reclaimed claim for {folder.name}"
+                    )
+            finally:
+                _unlock_claim(stale_lock)
         if owned_claim is None or _claim_identity(claim) != owned_claim:
             raise SkillConflictError(
                 f"skill write lost its reclaimed claim for {folder.name}"
@@ -121,6 +185,7 @@ def atomic_write_primary(folder: Path, payload: bytes, *, overwrite: bool) -> No
         tmp.unlink(missing_ok=True)
         if owned_claim is not None and _claim_identity(claim) == owned_claim:
             claim.unlink(missing_ok=True)
+        _unlock_claim(claim_lock)
 
 
 def atomic_replace_file(path: Path, payload: bytes) -> None:
@@ -234,7 +299,7 @@ class SkillStore:
         folder = self._require_local(record)
         if not isinstance(content, str):
             raise SkillFormatError("editor content must be text")
-        path = contained_path(folder, relative_path, must_exist=False)
+        path = lexical_contained_path(folder, relative_path, must_exist=False)
         relative = path.relative_to(folder)
         if relative.as_posix() == SKILL_FILENAME:
             self.edit_primary(record, content)
@@ -254,7 +319,7 @@ class SkillStore:
             staged_root = Path(temporary)
             staged_folder = staged_root / record.name
             shutil.copytree(folder, staged_folder, symlinks=True)
-            staged_path = contained_path(
+            staged_path = lexical_contained_path(
                 staged_folder, relative.as_posix(), must_exist=False
             )
             reject_symlink_chain(staged_folder, staged_path)
@@ -267,7 +332,7 @@ class SkillStore:
         # immediately before the single-file atomic publication so a folder or
         # ancestor swapped for a symlink cannot redirect the write.
         folder = self._require_local(record)
-        path = contained_path(folder, relative.as_posix(), must_exist=False)
+        path = lexical_contained_path(folder, relative.as_posix(), must_exist=False)
         reject_symlink_chain(folder, path)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         reject_symlink_chain(folder, path)

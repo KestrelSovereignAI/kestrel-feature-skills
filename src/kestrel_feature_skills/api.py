@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from kestrel_sdk.storage.database import DatabaseError
+from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from .enablement import DEFAULT_PRIORITY
@@ -192,11 +193,11 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
         ) as exc:
             raise _http_error(exc) from exc
 
-    @router.delete("/{name}")
+    @router.delete("/{name}", dependencies=[Depends(enforce_destructive_op)])
     async def delete_skill(name: str) -> dict[str, object]:
-        # This authenticated operator route is called only after the package UI's
-        # explicit destructive confirmation. Agent-initiated deletion goes
-        # through the separately declared ALWAYS_ASK tool permission rail.
+        # Core's server-side destructive rail is load-bearing. The package UI
+        # attaches its audited opt-in header only after explicit confirmation;
+        # agent-initiated deletion separately uses the ALWAYS_ASK tool rail.
         try:
             return await feature.delete_skill(name=name)
         except (

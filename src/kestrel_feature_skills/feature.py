@@ -292,16 +292,26 @@ class ProceduralSkillsFeature(Feature):
                 )
                 self._states[name] = state
             except DatabaseError as exc:
-                observed_state = previous_state
                 try:
-                    observed_state = (await enablement.load()).get(name)
+                    persisted_states = await enablement.load()
                 except DatabaseError:
-                    pass
-                if not enabled and observed_state and observed_state.enabled:
                     store.rollback_created(folder, identity=created_identity)
+                    if previous_state is None:
+                        self._states.pop(name, None)
+                    else:
+                        self._states[name] = previous_state
                     await self.refresh()
                     raise
-                self._states[name] = SkillState(False, resolved_priority)
+                observed_state = persisted_states.get(name)
+                if observed_state and observed_state.enabled:
+                    store.rollback_created(folder, identity=created_identity)
+                    self._states = dict(persisted_states)
+                    await self.refresh()
+                    raise
+                self._states = dict(persisted_states)
+                self._states[name] = observed_state or SkillState(
+                    False, resolved_priority
+                )
                 state_error = str(exc)
         elif enabled:
             state_error = "agent database unavailable; the new skill remains disabled"

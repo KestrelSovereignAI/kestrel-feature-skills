@@ -50,6 +50,22 @@ def contained_path(root: Path, relative: str, *, must_exist: bool = True) -> Pat
     return resolved
 
 
+def lexical_contained_path(
+    root: Path, relative: str, *, must_exist: bool = True
+) -> Path:
+    """Validate containment while retaining the caller's lexical path.
+
+    Mutation code must inspect the spelling requested by the caller rather
+    than publishing to the resolved symlink target returned by
+    :func:`contained_path`. This helper performs the same containment proof,
+    then returns a normalized lexical child below the resolved root.
+    """
+
+    contained_path(root, relative, must_exist=must_exist)
+    pure = PurePosixPath(relative)
+    return root.resolve(strict=True).joinpath(*pure.parts)
+
+
 def reject_symlink_chain(root: Path, path: Path) -> None:
     """Reject any existing symlink from ``root`` through ``path``."""
 
@@ -61,7 +77,7 @@ def reject_symlink_chain(root: Path, path: Path) -> None:
     current = root
     for part in relative.parts:
         current = current / part
-        if current.exists() and current.is_symlink():
+        if current.is_symlink():
             raise SkillPathError(f"symlinks are not allowed in skill paths: {part}")
     existing_parent = path.parent
     while not existing_parent.exists() and existing_parent != root:
@@ -71,4 +87,9 @@ def reject_symlink_chain(root: Path, path: Path) -> None:
         raise SkillPathError("path parent escapes the skill folder")
 
 
-__all__ = ["contained_path", "direct_child", "reject_symlink_chain"]
+__all__ = [
+    "contained_path",
+    "direct_child",
+    "lexical_contained_path",
+    "reject_symlink_chain",
+]

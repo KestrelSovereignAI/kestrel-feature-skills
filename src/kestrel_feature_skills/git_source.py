@@ -34,7 +34,10 @@ _GIT_CONFIG_PREFIX = (
 def validate_remote_url(url: object) -> str:
     if not isinstance(url, str) or len(url) > 2048:
         raise GitSourceError("git source URL must be a bounded HTTPS URL")
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise GitSourceError("git source URL is malformed") from exc
     if (
         parsed.scheme.lower() != "https"
         or not parsed.hostname

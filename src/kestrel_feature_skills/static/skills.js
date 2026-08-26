@@ -166,7 +166,10 @@ function buildDeleteDialog() {
     if (!name) return;
     const agent = currentAgent();
     try {
-      await request(`/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      await request(`/${encodeURIComponent(name)}`, {
+        method: 'DELETE',
+        headers: { 'X-Kestrel-Allow-Destructive': 'operator-confirmed-ui' },
+      });
       if (currentAgent() !== agent) return;
       dialog.close('approved');
       clearSelection();

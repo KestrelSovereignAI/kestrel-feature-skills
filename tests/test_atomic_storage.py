@@ -225,6 +225,71 @@ def test_reclaimed_claim_fences_the_expired_writer(tmp_path, monkeypatch):
     )
 
 
+def test_active_writer_claim_cannot_be_stolen_during_final_publication(
+    tmp_path, monkeypatch
+):
+    folder = tmp_path / "atomic"
+    folder.mkdir()
+    atomic_write_primary(folder, payload(), overwrite=False)
+    first_at_publish = threading.Event()
+    allow_first_publish = threading.Event()
+    real_replace = os.replace
+    results = {}
+
+    def pause_first_publish(source, destination):
+        if (
+            threading.current_thread().name == "first-writer"
+            and Path(destination).name == "SKILL.md"
+        ):
+            stale = time.time() - CLAIM_STALENESS_SECONDS - 5
+            os.utime(folder / ".SKILL.md.claim", (stale, stale))
+            first_at_publish.set()
+            assert allow_first_publish.wait(timeout=5)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", pause_first_publish)
+
+    def write(label, description):
+        try:
+            atomic_write_primary(
+                folder,
+                serialize_skill_markdown(
+                    SkillDocument("atomic", description, "body")
+                ).encode(),
+                overwrite=True,
+            )
+            results[label] = "won"
+        except SkillConflictError:
+            results[label] = "lost"
+        finally:
+            if label == "second":
+                allow_first_publish.set()
+
+    first = threading.Thread(
+        target=write,
+        args=("first", "first payload"),
+        name="first-writer",
+    )
+    second = threading.Thread(
+        target=write,
+        args=("second", "second payload"),
+        name="second-writer",
+    )
+    first.start()
+    assert first_at_publish.wait(timeout=5)
+    second.start()
+    second.join(timeout=10)
+    first.join(timeout=10)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == {"second": "lost", "first": "won"}
+    assert (
+        validate_skill_folder(folder, source_root=tmp_path).description
+        == "first payload"
+    )
+
+
 def test_limit_crossing_resource_edit_is_not_published(tmp_path):
     store = SkillStore(tmp_path / "skills")
     folder = store.create(SkillDocument("bounded", "Bounded", "Procedure."))
@@ -247,6 +312,46 @@ def test_limit_crossing_resource_edit_is_not_published(tmp_path):
 
     assert not rejected.exists()
     assert validate_skill_folder(folder, source_root=store.local_root).name == "bounded"
+
+
+def test_resource_edit_rejects_symlink_swap_to_primary_after_staging(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("swapped", "Original", "Procedure."))
+    notes = folder / "notes.md"
+    notes.write_text("original notes", encoding="utf-8")
+    primary = folder / "SKILL.md"
+    original_primary = primary.read_bytes()
+    record = SkillRecord(
+        document=SkillDocument("swapped", "Original", "Procedure."),
+        folder=folder,
+        source_id="agent-local",
+        source_kind="agent-local",
+        precedence=0,
+        provenance=SkillProvenance("agent-local", "agent-local", "swapped"),
+    )
+    import kestrel_feature_skills.store as module
+
+    real_validate = module.validate_skill_folder
+    swapped = False
+
+    def swap_after_staged_validation(candidate, *, source_root):
+        nonlocal swapped
+        result = real_validate(candidate, source_root=source_root)
+        if candidate != folder and not swapped:
+            notes.unlink()
+            notes.symlink_to(primary.name)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(module, "validate_skill_folder", swap_after_staged_validation)
+
+    with pytest.raises(SkillPathError, match="symlinks"):
+        store.write_file(record, "notes.md", "not valid SKILL.md frontmatter")
+
+    assert primary.read_bytes() == original_primary
+    assert notes.is_symlink()
 
 
 def test_limit_crossing_primary_edit_preserves_the_original(tmp_path):

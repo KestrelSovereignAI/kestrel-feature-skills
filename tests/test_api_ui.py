@@ -10,6 +10,8 @@ from fastapi import FastAPI
 @pytest.fixture
 def app(feature):
     value = FastAPI()
+    value.state.demo_mode = False
+    value.state.agent = feature.agent
     value.include_router(feature.get_router())
     return value
 
@@ -175,10 +177,19 @@ async def test_delete_api_removes_only_resolved_local_skill(client, feature):
         "/api/procedural-skills",
         json={"name": "delete-me", "description": "Delete", "body": "body"},
     )
-    response = await client.delete("/api/procedural-skills/delete-me")
+    refused = await client.delete("/api/procedural-skills/delete-me")
+    assert refused.status_code == 403
+    assert (feature.agent.procedural_skills_root / "delete-me").exists()
+    response = await client.delete(
+        "/api/procedural-skills/delete-me",
+        headers={"X-Kestrel-Allow-Destructive": "operator-confirmed-ui"},
+    )
     assert response.status_code == 200
     assert not (feature.agent.procedural_skills_root / "delete-me").exists()
-    second = await client.delete("/api/procedural-skills/delete-me")
+    second = await client.delete(
+        "/api/procedural-skills/delete-me",
+        headers={"X-Kestrel-Allow-Destructive": "operator-confirmed-ui"},
+    )
     assert second.status_code == 404
 
 
@@ -191,6 +202,7 @@ def test_ui_bundle_contains_required_rails_and_no_run_control(feature):
     assert ui.capability == "procedural-skills"
     assert "registerPanel" in source
     assert "skills-delete-approval" in source
+    assert "X-Kestrel-Allow-Destructive" in source
     assert "python-execution-risk" in source
     assert "Discover / reload" in source
     assert "Save rejected:" in source
