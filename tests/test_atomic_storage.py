@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+import os
+import shutil
+import threading
+import time
+
+import pytest
+
+from kestrel_feature_skills.errors import SkillConflictError, SkillPathError
+from kestrel_feature_skills.format import (
+    serialize_skill_markdown,
+    validate_skill_folder,
+)
+from kestrel_feature_skills.models import SkillDocument, SkillProvenance, SkillRecord
+from kestrel_feature_skills.store import (
+    CLAIM_STALENESS_SECONDS,
+    SkillStore,
+    atomic_write_primary,
+)
+
+
+def payload(name="atomic"):
+    return serialize_skill_markdown(
+        SkillDocument(name, "Atomic write", "# Procedure\n\nWrite once.")
+    ).encode("utf-8")
+
+
+def test_atomic_create_leaves_no_temporary_or_claim_files(tmp_path):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    folder = store.create(SkillDocument("atomic", "Atomic write", "Do it."))
+    assert (folder / "SKILL.md").is_file()
+    assert not list(folder.glob(".SKILL.md.tmp.*"))
+    assert not (folder / ".SKILL.md.claim").exists()
+
+
+def test_collision_refuses_to_overwrite_existing_primary(tmp_path):
+    folder = tmp_path / "atomic"
+    folder.mkdir()
+    original = payload()
+    (folder / "SKILL.md").write_bytes(original)
+    with pytest.raises(SkillConflictError, match="already exists"):
+        atomic_write_primary(folder, payload("other"), overwrite=False)
+    assert (folder / "SKILL.md").read_bytes() == original
+
+
+def test_crash_during_non_overwriting_finalization_cleans_owned_files(
+    tmp_path, monkeypatch
+):
+    folder = tmp_path / "atomic"
+    folder.mkdir()
+    import kestrel_feature_skills.store as module
+
+    real_link = os.link
+    calls = 0
+
+    def fail_second_link(source, destination):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated finalization crash")
+        return real_link(source, destination)
+
+    monkeypatch.setattr(module.os, "link", fail_second_link)
+    with pytest.raises(OSError, match="simulated"):
+        atomic_write_primary(folder, payload(), overwrite=False)
+    assert not (folder / "SKILL.md").exists()
+    assert not list(folder.glob(".SKILL.md.tmp.*"))
+    assert not (folder / ".SKILL.md.claim").exists()
+
+
+def test_concurrent_writers_exactly_one_wins(tmp_path):
+    folder = tmp_path / "atomic"
+    folder.mkdir()
+    barrier = threading.Barrier(2, timeout=5)
+    results = []
+
+    def writer(index):
+        barrier.wait()
+        try:
+            atomic_write_primary(folder, payload(), overwrite=False)
+            results.append((index, "won"))
+        except SkillConflictError:
+            results.append((index, "lost"))
+
+    threads = [threading.Thread(target=writer, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    assert sorted(result for _, result in results) == ["lost", "won"]
+    assert validate_skill_folder(folder, source_root=tmp_path).name == "atomic"
+    assert not (folder / ".SKILL.md.claim").exists()
+    assert not list(folder.glob(".SKILL.md.tmp.*"))
+
+
+def test_fresh_claim_blocks_writer_without_deleting_claim(tmp_path):
+    folder = tmp_path / "atomic"
+    folder.mkdir()
+    claim = folder / ".SKILL.md.claim"
+    claim.write_text("winner", encoding="utf-8")
+    with pytest.raises(SkillConflictError, match="concurrent"):
+        atomic_write_primary(folder, payload(), overwrite=False)
+    assert claim.read_text(encoding="utf-8") == "winner"
+
+
+def test_stale_claim_is_reclaimed(tmp_path):
+    folder = tmp_path / "atomic"
+    folder.mkdir()
+    claim = folder / ".SKILL.md.claim"
+    claim.write_text("orphan", encoding="utf-8")
+    stale = time.time() - CLAIM_STALENESS_SECONDS - 5
+    os.utime(claim, (stale, stale))
+    atomic_write_primary(folder, payload(), overwrite=False)
+    assert (folder / "SKILL.md").is_file()
+    assert not claim.exists()
+
+
+def test_two_edits_serialize_on_same_claim(tmp_path):
+    folder = tmp_path / "atomic"
+    folder.mkdir()
+    atomic_write_primary(folder, payload(), overwrite=False)
+    barrier = threading.Barrier(2, timeout=5)
+    results = []
+
+    def writer(index):
+        barrier.wait()
+        try:
+            value = serialize_skill_markdown(
+                SkillDocument("atomic", f"writer {index}", f"body {index}")
+            ).encode()
+            atomic_write_primary(folder, value, overwrite=True)
+            results.append("won")
+        except SkillConflictError:
+            results.append("lost")
+
+    threads = [threading.Thread(target=writer, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert sorted(results) == ["lost", "won"]
+    assert validate_skill_folder(folder, source_root=tmp_path).description.startswith(
+        "writer"
+    )
+
+
+def test_install_copies_resources_then_publishes_primary(tmp_path):
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "remote"
+    source.mkdir()
+    (source / "scripts").mkdir()
+    (source / "scripts" / "helper.py").write_text(
+        "print('not executed')\n", encoding="utf-8"
+    )
+    document = SkillDocument("remote", "Remote", "See [helper](scripts/helper.py).")
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(document), encoding="utf-8"
+    )
+    store = SkillStore(tmp_path / "local")
+    folder = store.install_folder(
+        source,
+        provenance=SkillProvenance(
+            kind="git",
+            source_id="https://example.com/repo.git",
+            locator="main:remote",
+            revision="a" * 40,
+            remote_url="https://example.com/repo.git",
+        ),
+    )
+    assert (folder / "scripts" / "helper.py").read_text() == "print('not executed')\n"
+    assert validate_skill_folder(folder, source_root=store.local_root) == document
+
+
+def test_python_edit_is_scoped_to_scripts_and_never_runs(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("edit", "Edit", "Procedure."))
+    record = SkillRecord(
+        document=SkillDocument("edit", "Edit", "Procedure."),
+        folder=folder,
+        source_id="agent-local",
+        source_kind="agent-local",
+        precedence=0,
+        provenance=SkillProvenance("agent-local", "agent-local", "edit"),
+    )
+    marker = tmp_path / "executed"
+    source = f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n"
+    store.write_file(record, "scripts/danger.py", source)
+    assert not marker.exists()
+    assert (folder / "scripts" / "danger.py").read_text() == source
+    with pytest.raises(SkillPathError, match="only below scripts"):
+        store.write_file(record, "danger.py", source)
+
+
+def test_mutation_rejects_folder_replaced_by_symlink_after_discovery(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("swapped", "Swap guard", "Procedure."))
+    record = SkillRecord(
+        document=SkillDocument("swapped", "Swap guard", "Procedure."),
+        folder=folder,
+        source_id="agent-local",
+        source_kind="agent-local",
+        precedence=0,
+        provenance=SkillProvenance("agent-local", "agent-local", "swapped"),
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "keep.md"
+    marker.write_text("must survive", encoding="utf-8")
+    shutil.rmtree(folder)
+    folder.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(SkillPathError, match="changed after discovery"):
+        store.write_file(record, "scripts/danger.py", "raise RuntimeError\n")
+    with pytest.raises(SkillPathError, match="changed after discovery"):
+        store.delete(record)
+    assert marker.read_text(encoding="utf-8") == "must survive"

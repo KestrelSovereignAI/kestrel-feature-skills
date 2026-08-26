@@ -1,0 +1,111 @@
+.skills-panel {
+  display: grid;
+  gap: 1rem;
+  padding: 1rem;
+}
+
+.skills-toolbar,
+.skills-row,
+.skills-editor-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: .6rem;
+}
+
+.skills-layout {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(230px, .7fr) minmax(360px, 1.3fr);
+}
+
+.skills-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: .9rem;
+}
+
+.skills-list,
+.skills-tree,
+.skills-errors {
+  display: grid;
+  gap: .45rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.skills-list button,
+.skills-tree button,
+.skills-button {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: .45rem .7rem;
+  text-align: left;
+}
+
+.skills-list button[aria-current="true"] {
+  border-color: var(--accent-color, #5a67d8);
+}
+
+.skills-tree-nested {
+  margin-left: 1rem;
+}
+
+.skills-description,
+.skills-muted {
+  color: var(--text-secondary);
+  font-size: .85rem;
+}
+
+.skills-editor {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  min-height: 360px;
+  padding: .8rem;
+  resize: vertical;
+  width: 100%;
+}
+
+.skills-risk {
+  background: color-mix(in srgb, var(--warning-color, #c47f00) 16%, transparent);
+  border: 1px solid var(--warning-color, #c47f00);
+  border-radius: 6px;
+  color: var(--warning-color, #c47f00);
+  font-weight: 650;
+  padding: .7rem;
+}
+
+.skills-status {
+  min-height: 1.5em;
+  white-space: pre-wrap;
+}
+
+.skills-danger {
+  border-color: var(--error-color, #c0392b);
+  color: var(--error-color, #c0392b);
+}
+
+.skills-dialog {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-primary);
+  max-width: 520px;
+  padding: 1rem;
+}
+
+.skills-dialog::backdrop {
+  background: rgba(0, 0, 0, .55);
+}
+
+@media (max-width: 760px) {
+  .skills-layout { grid-template-columns: 1fr; }
+}

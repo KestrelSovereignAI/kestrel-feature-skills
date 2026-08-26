@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: kestrel_feature_skills
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kestrel_feature_skills"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      KESTREL_TEST_POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:5432/kestrel_feature_skills
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --extra test
+      - run: uv run pytest -q
+      - run: uv build
+      - name: Verify installed entry point and package data
+        run: |
+          uv run python - <<'PY'
+          import importlib.metadata as md
+          from pathlib import Path
+          from kestrel_feature_skills import ProceduralSkillsFeature
+
+          entries = {
+              entry.name: entry
+              for entry in md.entry_points(group="kestrel_sovereign.features")
+          }
+          assert entries["ProceduralSkillsFeature"].load() is ProceduralSkillsFeature
+          static = Path(md.distribution("kestrel-feature-skills").locate_file(
+              "kestrel_feature_skills/static"
+          ))
+          assert (static / "skills.js").is_file()
+          assert (static / "skills.css").is_file()
+          PY
+
+  frontend-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright test --list
