@@ -230,6 +230,8 @@ def validate_skill_folder(folder: Path, *, source_root: Path) -> SkillDocument:
         current_path = Path(current)
         for entry in (*directories, *files):
             path = current_path / entry
+            relative = path.relative_to(folder).as_posix()
+            _utf8_bytes(relative, label="skill resource path")
             if path.is_symlink():
                 raise SkillPathError(
                     f"symlinks are not allowed in skill folders: {path.name}"

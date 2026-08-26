@@ -389,15 +389,40 @@ class ProceduralSkillsFeature(Feature):
 
         serialize_skill_markdown(document)
         resolved_priority = validate_priority(priority)
-        previous_state = self._states.get(document.name)
-        folder = store.create(document)
+        previous_state: SkillState | None = None
+        state_was_persisted = False
+        if enablement.available:
+            try:
+                previous_state = (await enablement.load()).get(document.name)
+                state = await enablement.set(
+                    document.name,
+                    enabled=False,
+                    priority=resolved_priority,
+                )
+            except DatabaseError as exc:
+                self._enablement_error = str(exc)
+                raise
+            self._states[document.name] = state
+            state_was_persisted = True
+        try:
+            folder = store.create(document)
+        except Exception as publication_error:
+            if state_was_persisted:
+                await self._restore_enablement_after_publication_failure(
+                    enablement,
+                    document.name,
+                    previous_state,
+                    publication_error,
+                    operation="skill create",
+                )
+            raise
         created_stat = folder.stat()
         created_identity = (created_stat.st_dev, created_stat.st_ino)
         state_error: str | None = None
-        if enablement.available:
+        if enablement.available and enabled:
             try:
                 state = await enablement.set(
-                    name, enabled=enabled, priority=resolved_priority
+                    name, enabled=True, priority=resolved_priority
                 )
                 self._states[name] = state
             except DatabaseError as exc:
@@ -414,7 +439,13 @@ class ProceduralSkillsFeature(Feature):
                 observed_state = persisted_states.get(name)
                 if observed_state and observed_state.enabled:
                     store.rollback_created(folder, identity=created_identity)
-                    self._states = dict(persisted_states)
+                    await self._restore_enablement_after_publication_failure(
+                        enablement,
+                        name,
+                        previous_state,
+                        exc,
+                        operation="skill create state update",
+                    )
                     await self._refresh_locked()
                     raise
                 self._states = dict(persisted_states)
@@ -434,6 +465,34 @@ class ProceduralSkillsFeature(Feature):
             "indexed": name in self._indexed_names,
             "state_error": state_error,
         }
+
+    async def _restore_enablement_after_publication_failure(
+        self,
+        enablement: SkillEnablementStore,
+        name: str,
+        previous_state: SkillState | None,
+        publication_error: BaseException,
+        *,
+        operation: str,
+    ) -> None:
+        try:
+            if previous_state is None:
+                await enablement.delete(name)
+                self._states.pop(name, None)
+            else:
+                restored = await enablement.set(
+                    name,
+                    enabled=previous_state.enabled,
+                    priority=previous_state.priority,
+                )
+                self._states[name] = restored
+        except DatabaseError as rollback_error:
+            message = (
+                f"{operation} failed ({publication_error}); "
+                f"enablement rollback also failed ({rollback_error})"
+            )
+            self._enablement_error = message
+            raise DatabaseError(message) from rollback_error
 
     async def edit_skill(
         self, *, name: str, relative_path: str, content: str
@@ -596,24 +655,13 @@ class ProceduralSkillsFeature(Feature):
                 )
             except Exception as publication_error:
                 if state_was_persisted:
-                    try:
-                        if previous_state is None:
-                            await enablement.delete(skill_name)
-                            self._states.pop(skill_name, None)
-                        else:
-                            restored = await enablement.set(
-                                skill_name,
-                                enabled=previous_state.enabled,
-                                priority=previous_state.priority,
-                            )
-                            self._states[skill_name] = restored
-                    except DatabaseError as rollback_error:
-                        message = (
-                            f"skill install publication failed ({publication_error}); "
-                            f"enablement rollback also failed ({rollback_error})"
-                        )
-                        self._enablement_error = message
-                        raise DatabaseError(message) from rollback_error
+                    await self._restore_enablement_after_publication_failure(
+                        enablement,
+                        skill_name,
+                        previous_state,
+                        publication_error,
+                        operation="skill install publication",
+                    )
                 raise
         await self._refresh_locked()
         record = SkillStore.get(self._snapshot, skill_name)
@@ -648,7 +696,7 @@ class ProceduralSkillsFeature(Feature):
             "name": name,
             "path": relative_path,
             "content": content,
-            "editable": record.editable,
+            "editable": store.file_is_editable(record, relative_path),
             "language": "python" if relative_path.endswith(".py") else "markdown",
             "execution_risk": relative_path.endswith(".py"),
         }

@@ -353,6 +353,120 @@ async def test_failed_create_cannot_reenable_from_stale_persisted_state(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_create_never_publishes_against_stale_enabled_state(
+    feature, monkeypatch
+):
+    name = "cancelled-replacement"
+    await feature.skill_create(name, "Old local skill", "body")
+    await feature.skill_enable(name)
+    folder = feature.agent.procedural_skills_root / name
+    for path in folder.iterdir():
+        path.unlink()
+    folder.rmdir()
+    await feature.refresh()
+
+    entered_state_write = asyncio.Event()
+
+    async def paused_state_write(*_args, **_kwargs):
+        entered_state_write.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(feature._enablement, "set", paused_state_write)
+    creation = asyncio.create_task(
+        feature.create_skill(
+            name=name,
+            description="Untrusted replacement",
+            body="body",
+        )
+    )
+    await asyncio.wait_for(entered_state_write.wait(), timeout=5)
+    creation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await creation
+
+    assert not folder.exists()
+    await feature.refresh()
+    assert "Untrusted replacement" not in feature.context_clause_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_state", (SkillState(True, 8), None))
+async def test_ambiguous_enabled_create_failure_restores_prior_state(
+    feature, monkeypatch, prior_state
+):
+    name = "ambiguous-create"
+    if prior_state is not None:
+        await feature.skill_create(name, "Previous skill", "body")
+        await feature.skill_enable(name, priority=prior_state.priority)
+        folder = feature.agent.procedural_skills_root / name
+        for path in folder.iterdir():
+            path.unlink()
+        folder.rmdir()
+        await feature.refresh()
+    original_set = feature._enablement.set
+    failure_injected = False
+
+    async def commit_then_fail(*args, **kwargs):
+        nonlocal failure_injected
+        state = await original_set(*args, **kwargs)
+        if kwargs["enabled"] and not failure_injected:
+            failure_injected = True
+            raise DatabaseError("connection lost after commit")
+        return state
+
+    monkeypatch.setattr(feature._enablement, "set", commit_then_fail)
+
+    result = await feature.skill_create(
+        name,
+        "Ambiguous create",
+        "body",
+        enabled=True,
+    )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert not (feature.agent.procedural_skills_root / name).exists()
+    persisted = await feature._enablement.load()
+    if prior_state is None:
+        assert name not in persisted
+        assert name not in feature._states
+    else:
+        assert persisted[name] == prior_state
+        assert feature._states[name] == prior_state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_state", (SkillState(True, 8), None))
+async def test_failed_create_publication_restores_prior_enablement(
+    feature, monkeypatch, prior_state
+):
+    name = "create-publication-failure"
+    if prior_state is not None:
+        await feature.skill_create(name, "Previous skill", "body")
+        await feature.skill_enable(name, priority=prior_state.priority)
+        folder = feature.agent.procedural_skills_root / name
+        for path in folder.iterdir():
+            path.unlink()
+        folder.rmdir()
+        await feature.refresh()
+
+    def fail_publication(_document):
+        raise OSError("disk publication failed")
+
+    monkeypatch.setattr(feature._store, "create", fail_publication)
+
+    result = await feature.skill_create(name, "Replacement", "body")
+
+    assert result.status is ToolResultStatus.ERROR
+    persisted = await feature._enablement.load()
+    if prior_state is None:
+        assert name not in persisted
+        assert name not in feature._states
+    else:
+        assert persisted[name] == prior_state
+        assert feature._states[name] == prior_state
+
+
+@pytest.mark.asyncio
 async def test_refresh_retains_last_known_enablement_during_database_outage(
     feature, monkeypatch
 ):
@@ -590,6 +704,25 @@ async def test_python_editor_has_no_execution_effect(feature, tmp_path):
     tree = feature.tree(name="scripted")
     python = next(item for item in tree if item["path"] == "scripts/tool.py")
     assert python["execution_risk"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("relative_path", ("notes.txt", "tool.py"))
+async def test_read_file_editability_matches_write_policy(feature, relative_path):
+    await feature.skill_create("read-policy", "Read policy", "body")
+    folder = feature.agent.procedural_skills_root / "read-policy"
+    (folder / relative_path).write_text("resource", encoding="utf-8")
+    await feature.refresh()
+
+    tree_entry = next(
+        entry
+        for entry in feature.tree(name="read-policy")
+        if entry["path"] == relative_path
+    )
+    response = feature.read_file(name="read-policy", relative_path=relative_path)
+
+    assert tree_entry["editable"] is False
+    assert response["editable"] is False
 
 
 def test_context_renderer_is_not_registered_through_a_fake_legacy_hook(feature):

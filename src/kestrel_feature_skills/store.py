@@ -385,6 +385,24 @@ class SkillStore:
             reject_symlink_chain(folder, path)
             atomic_replace_file(path, payload)
 
+    @staticmethod
+    def file_is_editable(record: SkillRecord, relative_path: str) -> bool:
+        """Return whether ``write_file`` accepts this existing file path."""
+
+        path = Path(relative_path)
+        return bool(
+            record.editable
+            and (
+                relative_path == SKILL_FILENAME
+                or path.suffix == ".md"
+                or (
+                    path.suffix == ".py"
+                    and bool(path.parts)
+                    and path.parts[0] == "scripts"
+                )
+            )
+        )
+
     def tree(self, record: SkillRecord) -> tuple[dict[str, object], ...]:
         folder = self._require_real_folder(record)
         validate_skill_folder(folder, source_root=folder.parent)
@@ -398,15 +416,7 @@ class SkillStore:
             if path.is_symlink():
                 raise SkillPathError(f"symlink appeared during tree read: {relative}")
             is_file = path.is_file()
-            editable = bool(
-                record.editable
-                and is_file
-                and (
-                    relative == SKILL_FILENAME
-                    or path.suffix == ".md"
-                    or (path.suffix == ".py" and relative.startswith("scripts/"))
-                )
-            )
+            editable = bool(is_file and self.file_is_editable(record, relative))
             entries.append(
                 {
                     "path": relative,

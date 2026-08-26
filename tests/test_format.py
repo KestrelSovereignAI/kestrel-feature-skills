@@ -126,6 +126,20 @@ def test_folder_scan_error_rejects_candidate(tmp_path, monkeypatch):
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+def test_folder_rejects_resource_path_that_is_not_strict_utf8(tmp_path, monkeypatch):
+    folder = write_skill(tmp_path)
+
+    def walk_with_surrogate(root, *, followlinks, onerror=None):
+        assert root == folder
+        assert followlinks is False
+        return iter(((str(folder), ["resource-\udcff"], ["SKILL.md"]),))
+
+    monkeypatch.setattr("kestrel_feature_skills.format.os.walk", walk_with_surrogate)
+
+    with pytest.raises(SkillFormatError, match="UTF-8"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 @pytest.mark.parametrize(
     "destination",
     ["../secret.md", "/etc/passwd", "..%2fsecret.md", "scripts\\evil.py"],
