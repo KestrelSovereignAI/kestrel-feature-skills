@@ -279,15 +279,29 @@ class ProceduralSkillsFeature(Feature):
         from .format import serialize_skill_markdown
 
         serialize_skill_markdown(document)
+        resolved_priority = validate_priority(priority)
+        previous_state = self._states.get(document.name)
         folder = store.create(document)
+        created_stat = folder.stat()
+        created_identity = (created_stat.st_dev, created_stat.st_ino)
         state_error: str | None = None
         if enablement.available:
             try:
                 state = await enablement.set(
-                    name, enabled=enabled, priority=validate_priority(priority)
+                    name, enabled=enabled, priority=resolved_priority
                 )
                 self._states[name] = state
             except DatabaseError as exc:
+                observed_state = previous_state
+                try:
+                    observed_state = (await enablement.load()).get(name)
+                except DatabaseError:
+                    pass
+                if not enabled and observed_state and observed_state.enabled:
+                    store.rollback_created(folder, identity=created_identity)
+                    await self.refresh()
+                    raise
+                self._states[name] = SkillState(False, resolved_priority)
                 state_error = str(exc)
         elif enabled:
             state_error = "agent database unavailable; the new skill remains disabled"
@@ -621,7 +635,7 @@ class ProceduralSkillsFeature(Feature):
                 enabled=enabled,
                 priority=priority,
             )
-        except (SkillError, OSError, DatabaseError, RuntimeError) as exc:
+        except (SkillError, OSError, DatabaseError, RuntimeError, ValueError) as exc:
             return ToolResult.failed(str(exc))
         if payload["state_error"]:
             return ToolResult.partial(

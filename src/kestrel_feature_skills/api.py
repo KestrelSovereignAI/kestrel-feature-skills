@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Query
 from kestrel_sdk.storage.database import DatabaseError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from .enablement import DEFAULT_PRIORITY
 from .errors import (
@@ -32,7 +32,7 @@ class CreateSkillRequest(_StrictRequest):
     description: str
     body: str
     enabled: bool = False
-    priority: int = DEFAULT_PRIORITY
+    priority: StrictInt = DEFAULT_PRIORITY
 
 
 class EditFileRequest(_StrictRequest):
@@ -42,7 +42,7 @@ class EditFileRequest(_StrictRequest):
 
 class SkillStateRequest(_StrictRequest):
     enabled: bool
-    priority: int | None = None
+    priority: StrictInt | None = None
 
 
 class InstallSkillRequest(_StrictRequest):

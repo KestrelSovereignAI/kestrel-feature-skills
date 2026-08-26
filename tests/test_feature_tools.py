@@ -6,6 +6,7 @@ from kestrel_sdk.storage.database import DatabaseError
 from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_feature_skills.context import render_context_clause
+from kestrel_feature_skills.enablement import MAX_PRIORITY
 from kestrel_feature_skills.feature import PROCEDURAL_SKILL_NODE_TYPE
 from kestrel_feature_skills.format import serialize_skill_markdown
 from kestrel_feature_skills.git_source import GitCheckout
@@ -159,6 +160,52 @@ async def test_create_survives_enablement_write_and_reload_failure(
     assert (feature.agent.procedural_skills_root / "db-outage" / "SKILL.md").is_file()
     assert "db-outage" in feature.snapshot.by_name()
     assert "database offline" in feature.catalog_payload()["enablement_error"]
+
+
+@pytest.mark.parametrize("priority", (MAX_PRIORITY + 1, 1.5, True))
+@pytest.mark.asyncio
+async def test_create_validates_priority_before_publishing_folder(feature, priority):
+    folder = feature.agent.procedural_skills_root / "invalid-priority"
+
+    with pytest.raises(ValueError, match="priority"):
+        await feature.create_skill(
+            name="invalid-priority",
+            description="Invalid priority",
+            body="body",
+            priority=priority,
+        )
+
+    assert not folder.exists()
+    assert "invalid-priority" not in feature.snapshot.by_name()
+
+
+@pytest.mark.asyncio
+async def test_failed_create_cannot_reenable_from_stale_persisted_state(
+    feature, monkeypatch
+):
+    await feature.skill_create("stale-enabled", "Old local skill", "body")
+    await feature.skill_enable("stale-enabled")
+    folder = feature.agent.procedural_skills_root / "stale-enabled"
+    for path in folder.iterdir():
+        path.unlink()
+    folder.rmdir()
+    await feature.refresh()
+
+    async def fail_state(*_args, **_kwargs):
+        raise DatabaseError("database offline")
+
+    monkeypatch.setattr(feature._enablement, "set", fail_state)
+
+    with pytest.raises(DatabaseError, match="database offline"):
+        await feature.create_skill(
+            name="stale-enabled",
+            description="New untrusted procedure",
+            body="body",
+        )
+
+    assert not folder.exists()
+    assert "stale-enabled" not in feature.snapshot.by_name()
+    assert "New untrusted procedure" not in feature.context_clause_text
 
 
 @pytest.mark.asyncio

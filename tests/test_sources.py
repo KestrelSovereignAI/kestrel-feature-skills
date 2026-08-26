@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 
 import pytest
 
@@ -256,6 +258,76 @@ def test_git_runner_rejects_a_checkout_that_crosses_its_disk_bound(tmp_path):
         )
 
 
+def test_git_runner_rejects_host_transport_rewrites(tmp_path, monkeypatch):
+    origin = tmp_path / "repository.git"
+    git_source_module._run_git(["init", "--bare", str(origin)])
+    host_config = tmp_path / "host.gitconfig"
+    host_config.write_text(
+        '[url "file://' + origin.parent.as_posix() + '/"]\n'
+        "\tinsteadOf = https://127.0.0.1:1/\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(host_config))
+    target = tmp_path / "rewritten-checkout"
+
+    with pytest.raises(GitSourceError):
+        git_source_module._run_git(
+            ["clone", "--", "https://127.0.0.1:1/repository.git", str(target)],
+            timeout=5,
+        )
+
+
+def test_git_runner_uses_sanitized_config_and_https_only_protocols(
+    tmp_path, monkeypatch
+):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "print(json.dumps({\n"
+        "    'argv': sys.argv[1:],\n"
+        "    'global': os.environ.get('GIT_CONFIG_GLOBAL'),\n"
+        "    'nosystem': os.environ.get('GIT_CONFIG_NOSYSTEM'),\n"
+        "}))\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+
+    payload = json.loads(git_source_module._run_git(["probe"]))
+
+    assert payload["global"] == os.devnull
+    assert payload["nosystem"] == "1"
+    assert payload["argv"][:6] == [
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+        "-c",
+        "protocol.file.allow=never",
+    ]
+
+
+def test_git_runner_caps_subprocess_output(tmp_path, monkeypatch):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "sys.stderr.write('x' * 1_048_577)\n"
+        "sys.stderr.flush()\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+
+    with pytest.raises(GitSourceError, match="output limit"):
+        git_source_module._run_git(["probe"], timeout=5)
+
+
 def test_git_checkout_materializes_only_the_requested_folder(tmp_path, monkeypatch):
     origin = tmp_path / "origin"
     origin.mkdir()
@@ -284,6 +356,18 @@ def test_git_checkout_materializes_only_the_requested_folder(tmp_path, monkeypat
     source_url = origin.as_uri()
     monkeypatch.setattr(
         git_source_module, "validate_remote_url", lambda _url: source_url
+    )
+    monkeypatch.setattr(
+        git_source_module,
+        "_GIT_CONFIG_PREFIX",
+        (
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.https.allow=never",
+            "-c",
+            "protocol.file.allow=always",
+        ),
     )
     target = tmp_path / "checkout"
 

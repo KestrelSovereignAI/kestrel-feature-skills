@@ -183,9 +183,40 @@ class SkillStore:
         )
         if document.name != record.name:
             raise SkillFormatError("frontmatter name cannot rename a skill folder")
-        validate_document_references(document, folder)
-        atomic_write_primary(folder, content.encode("utf-8"), overwrite=True)
-        return validate_skill_folder(folder, source_root=self.local_root)
+        payload = content.encode("utf-8")
+        with tempfile.TemporaryDirectory(
+            prefix=".kestrel-skill-edit-", dir=self.local_root
+        ) as temporary:
+            staged_root = Path(temporary)
+            staged_folder = staged_root / record.name
+            shutil.copytree(folder, staged_folder, symlinks=True)
+            atomic_write_primary(staged_folder, payload, overwrite=True)
+            candidate = validate_skill_folder(staged_folder, source_root=staged_root)
+
+        # The complete candidate, including every resource, is valid. Publish
+        # only after re-resolving the authoritative local folder.
+        folder = self._require_local(record)
+        atomic_write_primary(folder, payload, overwrite=True)
+        return candidate
+
+    def rollback_created(self, folder: Path, *, identity: tuple[int, int]) -> None:
+        """Remove this operation's new folder without following a replacement."""
+
+        expected = direct_child(self.local_root, folder.name)
+        try:
+            current = expected.lstat()
+        except FileNotFoundError:
+            return
+        if (
+            expected != folder
+            or expected.is_symlink()
+            or not expected.is_dir()
+            or (current.st_dev, current.st_ino) != identity
+        ):
+            raise SkillPathError(
+                "created skill folder changed before persistence rollback"
+            )
+        shutil.rmtree(expected)
 
     def read_file(self, record: SkillRecord, relative_path: str) -> str:
         folder = self._require_real_folder(record)

@@ -14,6 +14,7 @@ from kestrel_feature_skills.errors import (
     SkillPathError,
 )
 from kestrel_feature_skills.format import (
+    MAX_FOLDER_BYTES,
     MAX_FOLDER_FILES,
     serialize_skill_markdown,
     validate_skill_folder,
@@ -245,6 +246,36 @@ def test_limit_crossing_resource_edit_is_not_published(tmp_path):
         store.write_file(record, "resources/overflow.md", "overflow")
 
     assert not rejected.exists()
+    assert validate_skill_folder(folder, source_root=store.local_root).name == "bounded"
+
+
+def test_limit_crossing_primary_edit_preserves_the_original(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("bounded", "Bounded", "Procedure."))
+    record = SkillRecord(
+        document=SkillDocument("bounded", "Bounded", "Procedure."),
+        folder=folder,
+        source_id="agent-local",
+        source_kind="agent-local",
+        precedence=0,
+        provenance=SkillProvenance("agent-local", "agent-local", "bounded"),
+    )
+    primary = folder / "SKILL.md"
+    original = primary.read_bytes()
+    resources = folder / "resources"
+    resources.mkdir()
+    (resources / "padding.md").write_bytes(
+        b"x" * (MAX_FOLDER_BYTES - len(original) - 16)
+    )
+    validate_skill_folder(folder, source_root=store.local_root)
+    replacement = serialize_skill_markdown(
+        SkillDocument("bounded", "Bounded", "Procedure.\n\n" + ("y" * 128))
+    )
+
+    with pytest.raises(SkillFormatError, match="exceeds"):
+        store.edit_primary(record, replacement)
+
+    assert primary.read_bytes() == original
     assert validate_skill_folder(folder, source_root=store.local_root).name == "bounded"
 
 

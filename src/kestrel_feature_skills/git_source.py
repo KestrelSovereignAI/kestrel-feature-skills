@@ -6,9 +6,11 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 from urllib.parse import urlsplit
 
 from .errors import GitSourceError, SkillNotFoundError
@@ -17,7 +19,16 @@ from .format import validate_skill_folder, validate_skill_name
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_GIT_TRANSFER_BYTES = 32 * 1024 * 1024
+MAX_GIT_OUTPUT_BYTES = 1024 * 1024
 _TRANSFER_POLL_SECONDS = 0.05
+_GIT_CONFIG_PREFIX = (
+    "-c",
+    "protocol.allow=never",
+    "-c",
+    "protocol.https.allow=always",
+    "-c",
+    "protocol.file.allow=never",
+)
 
 
 def validate_remote_url(url: object) -> str:
@@ -64,7 +75,7 @@ def _tree_exceeds(root: Path, limit: int) -> bool:
     return False
 
 
-def _kill_process_group(process: subprocess.Popen[str]) -> None:
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (AttributeError, ProcessLookupError, PermissionError):
@@ -78,6 +89,37 @@ def _git_failure_detail(stdout: str | None, stderr: str | None) -> str:
     )[-1][:500]
 
 
+def _git_environment() -> dict[str, str]:
+    """Return a noninteractive Git environment isolated from host Git config."""
+
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_LFS_SKIP_SMUDGE": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "Never",
+        }
+    )
+    return environment
+
+
+def _bounded_output_size(*handles: BinaryIO) -> int:
+    try:
+        return sum(os.fstat(handle.fileno()).st_size for handle in handles)
+    except OSError as exc:
+        raise GitSourceError("could not measure bounded git command output") from exc
+
+
+def _read_git_output(handle: BinaryIO) -> str:
+    handle.seek(0)
+    payload = handle.read(MAX_GIT_OUTPUT_BYTES + 1)
+    return payload.decode("utf-8", errors="replace")
+
+
 def _run_git(
     argv: list[str],
     *,
@@ -89,68 +131,65 @@ def _run_git(
         max_bytes is not None and max_bytes < 1
     ):
         raise ValueError("git size limiting requires a root and a positive byte bound")
-    command = ["git", *argv]
-    environment = os.environ.copy()
-    environment["GIT_LFS_SKIP_SMUDGE"] = "1"
-    environment["GIT_TERMINAL_PROMPT"] = "0"
-    if size_limit_root is not None and max_bytes is not None:
+    command = ["git", *_GIT_CONFIG_PREFIX, *argv]
+    environment = _git_environment()
+    with (
+        tempfile.TemporaryFile() as stdout_file,
+        tempfile.TemporaryFile() as stderr_file,
+    ):
         try:
             process = subprocess.Popen(
                 command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+                stdout=stdout_file,
+                stderr=stderr_file,
                 start_new_session=True,
                 env=environment,
             )
         except FileNotFoundError as exc:
             raise GitSourceError("git executable is unavailable") from exc
         deadline = time.monotonic() + timeout
-        while True:
+        while process.poll() is None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _kill_process_group(process)
-                process.communicate()
+                process.wait()
                 raise GitSourceError("git source operation timed out")
-            try:
-                stdout, stderr = process.communicate(
-                    timeout=min(_TRANSFER_POLL_SECONDS, remaining)
+            if _bounded_output_size(stdout_file, stderr_file) > MAX_GIT_OUTPUT_BYTES:
+                _kill_process_group(process)
+                process.wait()
+                raise GitSourceError(
+                    f"git source exceeded the {MAX_GIT_OUTPUT_BYTES}-byte output limit"
                 )
-            except subprocess.TimeoutExpired:
-                if _tree_exceeds(size_limit_root, max_bytes):
-                    _kill_process_group(process)
-                    process.communicate()
-                    raise GitSourceError(
-                        f"git source exceeded the {max_bytes}-byte transfer limit"
-                    )
-                continue
-            break
-        if _tree_exceeds(size_limit_root, max_bytes):
+            if (
+                size_limit_root is not None
+                and max_bytes is not None
+                and _tree_exceeds(size_limit_root, max_bytes)
+            ):
+                _kill_process_group(process)
+                process.wait()
+                raise GitSourceError(
+                    f"git source exceeded the {max_bytes}-byte transfer limit"
+                )
+            time.sleep(min(_TRANSFER_POLL_SECONDS, max(remaining, 0)))
+        if _bounded_output_size(stdout_file, stderr_file) > MAX_GIT_OUTPUT_BYTES:
+            raise GitSourceError(
+                f"git source exceeded the {MAX_GIT_OUTPUT_BYTES}-byte output limit"
+            )
+        if (
+            size_limit_root is not None
+            and max_bytes is not None
+            and _tree_exceeds(size_limit_root, max_bytes)
+        ):
             raise GitSourceError(
                 f"git source exceeded the {max_bytes}-byte transfer limit"
             )
+        stdout = _read_git_output(stdout_file)
+        stderr = _read_git_output(stderr_file)
         if process.returncode:
             raise GitSourceError(
                 f"git source operation failed: {_git_failure_detail(stdout, stderr)}"
             )
         return stdout.strip()
-    try:
-        completed = subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=environment,
-        )
-    except FileNotFoundError as exc:
-        raise GitSourceError("git executable is unavailable") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise GitSourceError("git source operation timed out") from exc
-    except subprocess.CalledProcessError as exc:
-        detail = _git_failure_detail(exc.stdout, exc.stderr)
-        raise GitSourceError(f"git source operation failed: {detail}") from exc
-    return completed.stdout.strip()
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +283,7 @@ class GitSkillSource:
 
 
 __all__ = [
+    "MAX_GIT_OUTPUT_BYTES",
     "MAX_GIT_TRANSFER_BYTES",
     "GitCheckout",
     "GitSkillSource",

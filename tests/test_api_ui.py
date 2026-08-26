@@ -70,6 +70,25 @@ async def test_invalid_frontmatter_rejected_at_save_with_visible_reason(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("priority", (True, 1.5, "1"))
+async def test_create_api_rejects_non_integer_priority_before_writing(
+    priority, client, feature
+):
+    response = await client.post(
+        "/api/procedural-skills",
+        json={
+            "name": "invalid-priority",
+            "description": "Invalid priority",
+            "body": "body",
+            "priority": priority,
+        },
+    )
+
+    assert response.status_code == 422
+    assert not (feature.agent.procedural_skills_root / "invalid-priority").exists()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "path",
     ["../secret.md", "/etc/passwd", "scripts\\escape.py", "scripts/../../escape.py"],

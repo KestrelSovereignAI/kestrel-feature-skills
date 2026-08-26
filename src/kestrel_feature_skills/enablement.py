@@ -16,12 +16,9 @@ MAX_PRIORITY = 100_000
 
 
 def validate_priority(value: object) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError("priority must be an integer")  # noqa: TRY004
-    try:
-        priority = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError) as exc:
-        raise ValueError("priority must be an integer") from exc
+    priority = value
     if not MIN_PRIORITY <= priority <= MAX_PRIORITY:
         raise ValueError(f"priority must be between {MIN_PRIORITY} and {MAX_PRIORITY}")
     return priority
