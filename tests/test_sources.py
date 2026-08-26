@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
 import kestrel_feature_skills.git_source as git_source_module
+import kestrel_feature_skills.sources as sources_module
 from kestrel_feature_skills.errors import GitSourceError
 from kestrel_feature_skills.format import serialize_skill_markdown
 from kestrel_feature_skills.git_source import GitSkillSource, validate_remote_url
@@ -141,6 +143,67 @@ def test_malformed_folder_is_reported_not_loaded(tmp_path):
     assert snapshot.records == ()
     assert len(snapshot.errors) == 1
     assert "empty" in snapshot.errors[0].error
+
+
+def test_discovery_rejects_folder_moved_outside_root_then_replaced_by_symlink(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    shared = tmp_path / "shared"
+    outside = tmp_path / "outside"
+    local.mkdir()
+    shared.mkdir()
+    outside.mkdir()
+    folder = make_skill(local, "raced", "Race containment")
+    moved = outside / folder.name
+    real_validate = sources_module.validate_skill_folder
+    swapped = False
+
+    def validate_then_swap(candidate, *, source_root):
+        nonlocal swapped
+        document = real_validate(candidate, source_root=source_root)
+        if candidate == folder and not swapped:
+            candidate.rename(moved)
+            candidate.symlink_to(moved, target_is_directory=True)
+            swapped = True
+        return document
+
+    monkeypatch.setattr(sources_module, "validate_skill_folder", validate_then_swap)
+
+    snapshot = catalog(local, shared).refresh()
+
+    assert snapshot.records == ()
+    assert len(snapshot.errors) == 1
+    assert any(
+        word in snapshot.errors[0].error for word in ("changed", "escape", "symlink")
+    )
+
+
+def test_source_root_disappearing_during_resolution_is_a_visible_error(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    local.mkdir()
+    real_resolve = Path.resolve
+
+    def fail_root_resolution(path, *args, **kwargs):
+        if path == local:
+            raise FileNotFoundError("source root moved")
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_root_resolution)
+    source = DirectorySkillSource(
+        root=local,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=AGENT_LOCAL_PRECEDENCE,
+    )
+
+    records, errors = source.discover()
+
+    assert records == ()
+    assert len(errors) == 1
+    assert "source root" in errors[0].error
 
 
 def test_unknown_provenance_metadata_is_visible_error(tmp_path):

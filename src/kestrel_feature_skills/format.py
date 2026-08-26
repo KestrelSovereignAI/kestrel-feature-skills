@@ -21,6 +21,7 @@ MAX_FOLDER_BYTES = 2_097_152
 SKILL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
 _FRONTMATTER_KEYS = frozenset({"name", "description"})
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_UNICODE_LINE_SEPARATOR = re.compile(r"[\x85\u2028\u2029]")
 _MARKDOWN_DESTINATION = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 _MARKDOWN_REFERENCE_DEFINITION = re.compile(
     r"(?m)^[ \t]{0,3}\[[^\]\r\n]+\]:[ \t]*"
@@ -131,7 +132,12 @@ def parse_skill_markdown(
     description = fields["description"].strip()
     if not description:
         raise SkillFormatError("description must not be empty")
-    if "\n" in description or "\r" in description or _CONTROL.search(description):
+    if (
+        "\n" in description
+        or "\r" in description
+        or _CONTROL.search(description)
+        or _UNICODE_LINE_SEPARATOR.search(description)
+    ):
         raise SkillFormatError("description must be one printable line")
     if len(_utf8_bytes(description, label="description")) > MAX_DESCRIPTION_BYTES:
         raise SkillFormatError(

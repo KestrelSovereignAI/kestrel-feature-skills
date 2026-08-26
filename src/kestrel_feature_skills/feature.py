@@ -346,7 +346,6 @@ class ProceduralSkillsFeature(Feature):
             "token_cost": estimate_skill_token_cost(
                 record.name,
                 record.document.description,
-                record.state.priority,
             ),
             "context_included": record.name in included,
             "source_id": record.source_id,
@@ -582,12 +581,40 @@ class ProceduralSkillsFeature(Feature):
                 revision=checkout.revision,
                 remote_url=checkout.remote_url,
             )
+            previous_state: SkillState | None = None
+            state_was_persisted = False
             if enablement.available:
+                previous_state = (await enablement.load()).get(skill_name)
                 state = await enablement.set(
                     skill_name, enabled=False, priority=DEFAULT_PRIORITY
                 )
                 self._states[skill_name] = state
-            folder = store.install_folder(checkout.skill_folder, provenance=provenance)
+                state_was_persisted = True
+            try:
+                folder = store.install_folder(
+                    checkout.skill_folder, provenance=provenance
+                )
+            except Exception as publication_error:
+                if state_was_persisted:
+                    try:
+                        if previous_state is None:
+                            await enablement.delete(skill_name)
+                            self._states.pop(skill_name, None)
+                        else:
+                            restored = await enablement.set(
+                                skill_name,
+                                enabled=previous_state.enabled,
+                                priority=previous_state.priority,
+                            )
+                            self._states[skill_name] = restored
+                    except DatabaseError as rollback_error:
+                        message = (
+                            f"skill install publication failed ({publication_error}); "
+                            f"enablement rollback also failed ({rollback_error})"
+                        )
+                        self._enablement_error = message
+                        raise DatabaseError(message) from rollback_error
+                raise
         await self._refresh_locked()
         record = SkillStore.get(self._snapshot, skill_name)
         return {

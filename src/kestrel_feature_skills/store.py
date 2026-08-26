@@ -96,12 +96,16 @@ def _lock_claim(path: Path, *, expected: tuple[int, int] | None = None) -> int |
     except OSError:
         return None
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         value = os.fstat(descriptor)
         identity = (value.st_dev, value.st_ino)
-        if (expected is not None and identity != expected) or (
-            _claim_identity(path) != identity
-        ):
+        # A stale owner can resume after its claim path was unlinked and
+        # recreated by a replacement writer. Never lock that replacement inode:
+        # doing so can make both writers lose their nonblocking lock attempt.
+        if expected is not None and identity != expected:
+            os.close(descriptor)
+            return None
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if _claim_identity(path) != identity:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
             return None

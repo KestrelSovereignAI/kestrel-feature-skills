@@ -15,7 +15,7 @@ from kestrel_feature_skills.enablement import MAX_PRIORITY
 from kestrel_feature_skills.feature import PROCEDURAL_SKILL_NODE_TYPE
 from kestrel_feature_skills.format import serialize_skill_markdown
 from kestrel_feature_skills.git_source import GitCheckout
-from kestrel_feature_skills.models import SkillDocument
+from kestrel_feature_skills.models import SkillDocument, SkillState
 
 EXPECTED_TOOLS = {
     "skill_list",
@@ -527,6 +527,56 @@ async def test_git_install_is_not_published_when_disabled_state_cannot_persist(
     assert not folder.exists()
     assert "remote-fail" not in feature.snapshot.by_name()
     assert "Untrusted remote description" not in feature.context_clause_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_state", (SkillState(True, 7), None))
+async def test_failed_git_install_restores_prior_enablement_state(
+    feature, tmp_path, monkeypatch, prior_state
+):
+    name = "install-rollback"
+    folder = feature.agent.procedural_skills_root / name
+    if prior_state is not None:
+        await feature.skill_create(name, "Previously local", "body")
+        await feature.skill_enable(name, priority=prior_state.priority)
+        (folder / "SKILL.md").write_text("", encoding="utf-8")
+    else:
+        folder.mkdir()
+        (folder / "SKILL.md").write_text("", encoding="utf-8")
+    await feature.refresh()
+    assert name not in feature.snapshot.by_name()
+
+    checkout_root = tmp_path / "checkout-rollback"
+    source = checkout_root / "skills" / name
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(SkillDocument(name, "Remote", "body")),
+        encoding="utf-8",
+    )
+
+    def fake_checkout(self, *, url, ref, skill_name, target):
+        return GitCheckout(
+            root=checkout_root,
+            skill_folder=source,
+            revision="d" * 40,
+            remote_url=url,
+            ref=ref,
+        )
+
+    monkeypatch.setattr(
+        "kestrel_feature_skills.git_source.GitSkillSource.checkout", fake_checkout
+    )
+
+    result = await feature.skill_install("https://example.com/repo.git", name, "main")
+
+    assert result.status is ToolResultStatus.ERROR
+    persisted = await feature._enablement.load()
+    if prior_state is None:
+        assert name not in persisted
+        assert name not in feature._states
+    else:
+        assert persisted[name] == prior_state
+        assert feature._states[name] == prior_state
 
 
 @pytest.mark.asyncio

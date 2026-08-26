@@ -17,17 +17,15 @@ _OPEN = (
 _CLOSE = "</procedural-skills>"
 
 
-def _skill_line(name: str, description: str, priority: int) -> str:
+def _skill_line(name: str, description: str) -> str:
     safe_description = html.escape(description, quote=True)
-    return f'<skill name="{name}" priority="{priority}">{safe_description}</skill>'
+    return f'<skill name="{name}">{safe_description}</skill>'
 
 
-def estimate_skill_token_cost(name: str, description: str, priority: int) -> int:
+def estimate_skill_token_cost(name: str, description: str) -> int:
     """Conservative four-UTF-8-bytes-per-token estimate for one catalog line."""
 
-    return math.ceil(
-        len((_skill_line(name, description, priority) + "\n").encode("utf-8")) / 4
-    )
+    return math.ceil(len((_skill_line(name, description) + "\n").encode("utf-8")) / 4)
 
 
 def render_context_clause(
@@ -57,16 +55,11 @@ def render_context_clause(
     dropped: list[str] = []
     costs: dict[str, int] = {}
     for record in enabled:
-        line = _skill_line(
-            record.name,
-            record.document.description,
-            record.state.priority,
-        )
+        line = _skill_line(record.name, record.document.description)
         line_bytes = len((line + "\n").encode("utf-8"))
         costs[record.name] = estimate_skill_token_cost(
             record.name,
             record.document.description,
-            record.state.priority,
         )
         if used + line_bytes <= max_bytes:
             lines.append(line)

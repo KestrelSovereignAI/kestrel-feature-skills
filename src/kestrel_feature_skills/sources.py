@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+import stat
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
-from .errors import SkillError, SkillFormatError
+from .errors import SkillError, SkillFormatError, SkillPathError
 from .format import validate_skill_folder
 from .models import (
     CatalogSnapshot,
@@ -146,11 +147,28 @@ class DirectorySkillSource(SkillSource):
     def discover(self) -> tuple[tuple[SkillRecord, ...], tuple[DiscoveryError, ...]]:
         if not self.root.exists():
             return (), ()
-        if self.root.is_symlink() or not self.root.is_dir():
+        try:
+            root_before = self.root.lstat()
+            root_identity = (root_before.st_dev, root_before.st_ino)
+            if stat.S_ISLNK(root_before.st_mode) or not stat.S_ISDIR(
+                root_before.st_mode
+            ):
+                raise SkillPathError(
+                    "skill source root must be a real directory, not a symlink"
+                )
+            root_resolved = self.root.resolve(strict=True)
+            root_after = self.root.lstat()
+            if (
+                stat.S_ISLNK(root_after.st_mode)
+                or not stat.S_ISDIR(root_after.st_mode)
+                or (root_after.st_dev, root_after.st_ino) != root_identity
+            ):
+                raise SkillPathError("skill source root changed during discovery")
+        except (SkillError, OSError) as exc:
             error = DiscoveryError(
                 source_id=self.source_id,
                 locator=str(self.root),
-                error="skill source root must be a real directory, not a symlink",
+                error=f"could not resolve skill source root: {exc}",
             )
             return (), (error,)
         records: list[SkillRecord] = []
@@ -176,6 +194,21 @@ class DirectorySkillSource(SkillSource):
                 document = validate_skill_folder(folder, source_root=self.root)
                 provenance = _load_provenance(self, folder)
                 resolved_folder = folder.resolve(strict=True)
+                lexical_after = folder.lstat()
+                lexical_identity = (lexical_after.st_dev, lexical_after.st_ino)
+                if (
+                    stat.S_ISLNK(lexical_after.st_mode)
+                    or lexical_identity != before_identity
+                ):
+                    raise SkillPathError(
+                        "skill folder changed identity during discovery"
+                    )
+                try:
+                    resolved_folder.relative_to(root_resolved)
+                except ValueError as exc:
+                    raise SkillPathError(
+                        "skill folder escaped its configured source during discovery"
+                    ) from exc
                 after = resolved_folder.lstat()
                 folder_identity = (after.st_dev, after.st_ino)
                 if folder_identity != before_identity:

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import kestrel_feature_skills.store as store_module
 from kestrel_feature_skills.errors import (
     SkillConflictError,
     SkillFormatError,
@@ -224,6 +225,24 @@ def test_reclaimed_claim_fences_the_expired_writer(tmp_path, monkeypatch):
         validate_skill_folder(folder, source_root=tmp_path).description
         == "replacement payload"
     )
+
+
+def test_unexpected_claim_inode_is_rejected_before_locking(tmp_path, monkeypatch):
+    claim = tmp_path / ".SKILL.md.claim"
+    claim.write_text("replacement", encoding="utf-8")
+    current = claim.stat()
+    expected = (current.st_dev, current.st_ino + 1)
+    lock_operations = []
+    real_flock = store_module.fcntl.flock
+
+    def tracked_flock(descriptor, operation):
+        lock_operations.append(operation)
+        return real_flock(descriptor, operation)
+
+    monkeypatch.setattr(store_module.fcntl, "flock", tracked_flock)
+
+    assert store_module._lock_claim(claim, expected=expected) is None
+    assert lock_operations == []
 
 
 def test_active_writer_claim_cannot_be_stolen_during_final_publication(

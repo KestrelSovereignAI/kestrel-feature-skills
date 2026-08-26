@@ -98,8 +98,27 @@ def test_context_contains_exactly_one_line_per_enabled_skill_and_no_body_or_path
         "OFF BODY",
         "/tmp",
         "scripts/",
+        "priority=",
     ):
         assert forbidden not in rendered.text
+
+
+def test_priority_orders_entries_without_entering_prompt_or_byte_cost():
+    a = record("a", "First description", "body", priority=1)
+    b = record("b", "Second description", "body", priority=20)
+    baseline = render_context_clause(CatalogSnapshot(records=(b, a)))
+    changed = render_context_clause(
+        CatalogSnapshot(
+            records=(
+                replace(b, state=SkillState(True, 20_000)),
+                replace(a, state=SkillState(True, -10_000)),
+            )
+        )
+    )
+
+    assert baseline.text == changed.text
+    assert baseline.token_costs == changed.token_costs
+    assert "priority=" not in baseline.text
 
 
 def test_prompt_injection_description_is_escaped_inside_data_fence():

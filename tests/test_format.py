@@ -68,6 +68,18 @@ def test_json_escaped_lone_surrogate_is_a_visible_format_error():
         parse_skill_markdown(content)
 
 
+@pytest.mark.parametrize("separator", ("\\u0085", "\\u2028", "\\u2029"))
+def test_json_escaped_unicode_line_separators_are_rejected(separator):
+    content = (
+        '---\nname: "line-break"\ndescription: "safe'
+        f"{separator}"
+        'injected"\n---\n\nProcedure.\n'
+    )
+
+    with pytest.raises(SkillFormatError, match="one printable line"):
+        parse_skill_markdown(content)
+
+
 def test_serializer_rejects_lone_surrogate_body_as_a_format_error():
     with pytest.raises(SkillFormatError, match="UTF-8"):
         serialize_skill_markdown(
