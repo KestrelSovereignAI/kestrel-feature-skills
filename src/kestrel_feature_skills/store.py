@@ -579,6 +579,14 @@ class SkillStore:
         return record
 
     def create(self, document: SkillDocument) -> Path:
+        """Create a skill and return its public folder path."""
+
+        folder, _identity = self.create_pinned(document)
+        return folder
+
+    def create_pinned(self, document: SkillDocument) -> tuple[Path, tuple[int, int]]:
+        """Create a skill and retain the inode identity captured at publication."""
+
         name = validate_skill_name(document.name)
         payload = serialize_skill_markdown(document).encode("utf-8")
         with tempfile.TemporaryDirectory(prefix=".kestrel-skill-create-") as temporary:
@@ -606,6 +614,7 @@ class SkillStore:
             created_identity = _identity_at(root_fd, name)
             if created_identity is None:
                 raise SkillPathError("created skill folder vanished before publication")
+            published_identity = created_identity
             folder_fd = _open_directory_at(
                 root_fd,
                 name,
@@ -647,7 +656,7 @@ class SkillStore:
             raise
         finally:
             os.close(root_fd)
-        return folder
+        return folder, published_identity
 
     def edit_primary(self, record: SkillRecord, content: str) -> SkillDocument:
         document = parse_skill_markdown(

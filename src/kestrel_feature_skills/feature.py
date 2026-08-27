@@ -485,7 +485,7 @@ class ProceduralSkillsFeature(Feature):
             self._states[document.name] = state
             state_was_persisted = True
         try:
-            folder = store.create(document)
+            folder, created_identity = store.create_pinned(document)
         except Exception as publication_error:
             if state_was_persisted:
                 await self._restore_enablement_after_publication_failure(
@@ -496,8 +496,6 @@ class ProceduralSkillsFeature(Feature):
                     operation="skill create",
                 )
             raise
-        created_stat = folder.stat()
-        created_identity = (created_stat.st_dev, created_stat.st_ino)
         state_error: str | None = None
         if enablement.available and enabled:
             try:
@@ -508,23 +506,29 @@ class ProceduralSkillsFeature(Feature):
             except DatabaseError as exc:
                 try:
                     persisted_states = await enablement.load()
-                except DatabaseError:
-                    store.rollback_created(folder, identity=created_identity)
-                    if previous_state is None:
-                        self._states.pop(name, None)
-                    else:
-                        self._states[name] = previous_state
+                except DatabaseError as load_error:
+                    load_error.add_note(
+                        f"skill enablement update originally failed: {exc}"
+                    )
+                    await self._rollback_created_publication(
+                        store,
+                        enablement,
+                        folder,
+                        identity=created_identity,
+                        previous_state=previous_state,
+                        publication_error=load_error,
+                    )
                     await self._refresh_locked()
                     raise
                 observed_state = persisted_states.get(name)
                 if observed_state and observed_state.enabled:
-                    store.rollback_created(folder, identity=created_identity)
-                    await self._restore_enablement_after_publication_failure(
+                    await self._rollback_created_publication(
+                        store,
                         enablement,
-                        name,
-                        previous_state,
-                        exc,
-                        operation="skill create state update",
+                        folder,
+                        identity=created_identity,
+                        previous_state=previous_state,
+                        publication_error=exc,
                     )
                     await self._refresh_locked()
                     raise
@@ -557,6 +561,46 @@ class ProceduralSkillsFeature(Feature):
             "indexed": name in self._indexed_names,
             "state_error": state_error,
         }
+
+    async def _rollback_created_publication(
+        self,
+        store: SkillStore,
+        enablement: SkillEnablementStore,
+        folder: Path,
+        *,
+        identity: tuple[int, int],
+        previous_state: SkillState | None,
+        publication_error: BaseException,
+    ) -> None:
+        """Restore enablement even when inode-pinned filesystem rollback refuses."""
+
+        rollback_error: BaseException | None = None
+        try:
+            store.rollback_created(folder, identity=identity)
+        except BaseException as exc:  # noqa: BLE001 - both cleanup rails must run
+            rollback_error = exc
+            exc.add_note(
+                f"skill create state update originally failed: {publication_error}"
+            )
+        restoration = asyncio.create_task(
+            self._restore_enablement_after_publication_failure(
+                enablement,
+                folder.name,
+                previous_state,
+                publication_error,
+                operation="skill create state update",
+            )
+        )
+        try:
+            await self._drain_shielded_task(restoration)
+        except BaseException as state_error:
+            if rollback_error is not None:
+                state_error.add_note(
+                    f"filesystem rollback also reported: {rollback_error}"
+                )
+            raise
+        if rollback_error is not None:
+            raise rollback_error from publication_error
 
     async def _restore_enablement_after_publication_failure(
         self,

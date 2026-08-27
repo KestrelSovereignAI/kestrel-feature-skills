@@ -199,11 +199,19 @@ class DirectorySkillSource(SkillSource):
         self.precedence = precedence
 
     def discover(self) -> tuple[tuple[SkillRecord, ...], tuple[DiscoveryError, ...]]:
-        if not self.root.exists():
-            return (), ()
-        root_fd: int | None = None
         try:
             root_before = self.root.lstat()
+        except FileNotFoundError:
+            return (), ()
+        except OSError as exc:
+            error = DiscoveryError(
+                source_id=_json_safe_text(self.source_id),
+                locator=_json_safe_text(self.root),
+                error=_json_safe_text(f"could not resolve skill source root: {exc}"),
+            )
+            return (), (error,)
+        root_fd: int | None = None
+        try:
             root_identity = (root_before.st_dev, root_before.st_ino)
             if stat.S_ISLNK(root_before.st_mode) or not stat.S_ISDIR(
                 root_before.st_mode

@@ -567,6 +567,105 @@ async def test_ambiguous_prepublication_disable_restores_prior_create_state(
 
 
 @pytest.mark.asyncio
+async def test_create_rollback_preserves_replacement_swapped_after_publication(
+    feature, tmp_path, monkeypatch
+):
+    name = "create-rollback-replacement"
+    published = feature.agent.procedural_skills_root / name
+    displaced = tmp_path / "displaced-created-skill"
+    marker = published / "replacement-must-survive.md"
+    real_create = feature._store.create_pinned
+
+    def create_then_swap(document):
+        folder, identity = real_create(document)
+        folder.rename(displaced)
+        folder.mkdir()
+        marker.write_text("replacement", encoding="utf-8")
+        (folder / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(
+                    name,
+                    "Raced replacement must remain disabled",
+                    "Unapproved procedure.",
+                )
+            ),
+            encoding="utf-8",
+        )
+        return folder, identity
+
+    original_set = feature._enablement.set
+
+    async def commit_enable_then_fail(*args, **kwargs):
+        state = await original_set(*args, **kwargs)
+        if kwargs["enabled"] is True:
+            raise DatabaseError("connection lost after enabling commit")
+        return state
+
+    monkeypatch.setattr(feature._store, "create_pinned", create_then_swap)
+    monkeypatch.setattr(feature._enablement, "set", commit_enable_then_fail)
+
+    result = await feature.skill_create(
+        name,
+        "Rollback must stay inode-pinned",
+        "Procedure.",
+        enabled=True,
+    )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert marker.read_text(encoding="utf-8") == "replacement"
+    assert (displaced / "SKILL.md").is_file()
+    assert name not in await feature._enablement.load()
+    assert feature.snapshot.by_name()[name].state.enabled is False
+    assert "Raced replacement must remain disabled" not in feature.context_clause_text
+
+
+@pytest.mark.asyncio
+async def test_cancelled_create_drains_enablement_restore_after_publication_failure(
+    feature, monkeypatch
+):
+    name = "cancelled-create-restore"
+    original_set = feature._enablement.set
+    original_delete = feature._enablement.delete
+    restoration_started = asyncio.Event()
+    release_restoration = asyncio.Event()
+
+    async def commit_enable_then_fail(*args, **kwargs):
+        state = await original_set(*args, **kwargs)
+        if kwargs["enabled"] is True:
+            raise DatabaseError("connection lost after enabling commit")
+        return state
+
+    async def paused_restore(candidate):
+        restoration_started.set()
+        await release_restoration.wait()
+        return await original_delete(candidate)
+
+    monkeypatch.setattr(feature._enablement, "set", commit_enable_then_fail)
+    monkeypatch.setattr(feature._enablement, "delete", paused_restore)
+    creation = asyncio.create_task(
+        feature.create_skill(
+            name=name,
+            description="Cancelled restoration",
+            body="Procedure.",
+            enabled=True,
+        )
+    )
+    await asyncio.wait_for(restoration_started.wait(), timeout=5)
+    creation.cancel()
+    await asyncio.sleep(0)
+    try:
+        assert not creation.done(), "cancellation skipped owned enablement cleanup"
+    finally:
+        release_restoration.set()
+
+    with pytest.raises(DatabaseError, match="connection lost"):
+        await creation
+    assert name not in await feature._enablement.load()
+    assert not (feature.agent.procedural_skills_root / name).exists()
+    assert name not in feature.snapshot.by_name()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("prior_state", (SkillState(True, 8), None))
 async def test_ambiguous_enabled_create_failure_restores_prior_state(
     feature, monkeypatch, prior_state
@@ -629,7 +728,7 @@ async def test_failed_create_publication_restores_prior_enablement(
     def fail_publication(_document):
         raise OSError("disk publication failed")
 
-    monkeypatch.setattr(feature._store, "create", fail_publication)
+    monkeypatch.setattr(feature._store, "create_pinned", fail_publication)
 
     result = await feature.skill_create(name, "Replacement", "body")
 

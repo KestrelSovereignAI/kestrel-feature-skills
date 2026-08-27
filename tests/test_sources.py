@@ -235,6 +235,24 @@ def test_source_root_disappearing_during_resolution_is_a_visible_error(
     assert "source root" in errors[0].error
 
 
+def test_dangling_configured_source_root_is_a_visible_error(tmp_path):
+    missing = tmp_path / "missing-source"
+    configured = tmp_path / "configured-source"
+    configured.symlink_to(missing, target_is_directory=True)
+    source = DirectorySkillSource(
+        root=configured,
+        source_id="host-shared",
+        kind="host-shared",
+        precedence=HOST_SHARED_PRECEDENCE,
+    )
+
+    records, errors = source.discover()
+
+    assert records == ()
+    assert len(errors) == 1
+    assert "source root" in errors[0].error
+
+
 def test_discovery_does_not_follow_a_source_root_path_replacement(
     tmp_path, monkeypatch
 ):
