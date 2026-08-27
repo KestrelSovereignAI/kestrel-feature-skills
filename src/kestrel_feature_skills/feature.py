@@ -395,16 +395,12 @@ class ProceduralSkillsFeature(Feature):
         previous_state: SkillState | None = None
         state_was_persisted = False
         if enablement.available:
-            try:
-                previous_state = (await enablement.load()).get(document.name)
-                state = await enablement.set(
-                    document.name,
-                    enabled=False,
-                    priority=resolved_priority,
-                )
-            except DatabaseError as exc:
-                self._enablement_error = str(exc)
-                raise
+            previous_state, state = await self._prepare_disabled_state(
+                enablement,
+                document.name,
+                priority=resolved_priority,
+                operation="skill create disabled-state preparation",
+            )
             self._states[document.name] = state
             state_was_persisted = True
         try:
@@ -496,6 +492,35 @@ class ProceduralSkillsFeature(Feature):
             )
             self._enablement_error = message
             raise DatabaseError(message) from rollback_error
+
+    async def _prepare_disabled_state(
+        self,
+        enablement: SkillEnablementStore,
+        name: str,
+        *,
+        priority: int,
+        operation: str,
+    ) -> tuple[SkillState | None, SkillState]:
+        """Persist a disabled publication guard without losing prior state."""
+
+        try:
+            previous_state = (await enablement.load()).get(name)
+        except DatabaseError as exc:
+            self._enablement_error = str(exc)
+            raise
+        try:
+            state = await enablement.set(name, enabled=False, priority=priority)
+        except DatabaseError as exc:
+            self._enablement_error = str(exc)
+            await self._restore_enablement_after_publication_failure(
+                enablement,
+                name,
+                previous_state,
+                exc,
+                operation=operation,
+            )
+            raise
+        return previous_state, state
 
     async def edit_skill(
         self, *, name: str, relative_path: str, content: str
@@ -645,9 +670,11 @@ class ProceduralSkillsFeature(Feature):
             previous_state: SkillState | None = None
             state_was_persisted = False
             if enablement.available:
-                previous_state = (await enablement.load()).get(skill_name)
-                state = await enablement.set(
-                    skill_name, enabled=False, priority=DEFAULT_PRIORITY
+                previous_state, state = await self._prepare_disabled_state(
+                    enablement,
+                    skill_name,
+                    priority=DEFAULT_PRIORITY,
+                    operation="skill install disabled-state preparation",
                 )
                 self._states[skill_name] = state
                 state_was_persisted = True

@@ -153,6 +153,40 @@ def test_markdown_reference_escape_rejected(tmp_path, destination):
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "body",
+    (
+        "[outer [inner]](../secret.md)",
+        r"[escaped \]](../secret.md)",
+        r"[complex \]]: ../secret.md",
+    ),
+)
+def test_markdown_reference_escape_with_complex_label_is_rejected(tmp_path, body):
+    value = SkillDocument("complex-label", "Complex label", body)
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "body, resource",
+    (
+        ("[outer [inner]](notes.md)", "notes.md"),
+        (r"[escaped \]](notes\(one\).md)", "notes(one).md"),
+        (r"[complex \]]: notes.md", "notes.md"),
+    ),
+)
+def test_markdown_complex_label_and_destination_resolve_local_resource(
+    tmp_path, body, resource
+):
+    value = SkillDocument("complex-local", "Complex local link", body)
+    folder = write_skill(tmp_path, value)
+    (folder / resource).write_text("notes", encoding="utf-8")
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
 def test_local_resource_reference_must_exist_and_stay_inside(tmp_path):
     value = SkillDocument("linked", "Linked resource", "Read [notes](notes.md).")
     folder = write_skill(tmp_path, value)

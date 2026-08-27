@@ -417,6 +417,37 @@ async def test_cancelled_create_never_publishes_against_stale_enabled_state(
 
 
 @pytest.mark.asyncio
+async def test_ambiguous_prepublication_disable_restores_prior_create_state(
+    feature, monkeypatch
+):
+    name = "ambiguous-disable-create"
+    prior_state = await feature._enablement.set(name, enabled=True, priority=17)
+    feature._states[name] = prior_state
+    original_set = feature._enablement.set
+    failure_injected = False
+
+    async def commit_then_fail(*args, **kwargs):
+        nonlocal failure_injected
+        state = await original_set(*args, **kwargs)
+        if kwargs["enabled"] is False and not failure_injected:
+            failure_injected = True
+            raise DatabaseError("connection lost after disabling commit")
+        return state
+
+    monkeypatch.setattr(feature._enablement, "set", commit_then_fail)
+
+    with pytest.raises(DatabaseError, match="connection lost"):
+        await feature.create_skill(
+            name=name,
+            description="Replacement",
+            body="body",
+        )
+
+    assert not (feature.agent.procedural_skills_root / name).exists()
+    assert (await feature._enablement.load())[name] == SkillState(True, 17)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("prior_state", (SkillState(True, 8), None))
 async def test_ambiguous_enabled_create_failure_restores_prior_state(
     feature, monkeypatch, prior_state
@@ -664,6 +695,57 @@ async def test_cancelled_git_install_waits_for_worker_before_releasing(
         "install cancellation propagated and released the privacy lock while "
         "the Git worker was still running"
     )
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_prepublication_disable_restores_prior_install_state(
+    feature, tmp_path, monkeypatch
+):
+    name = "ambiguous-disable-install"
+    prior_state = await feature._enablement.set(name, enabled=True, priority=19)
+    feature._states[name] = prior_state
+    checkout_root = tmp_path / "checkout-ambiguous-disable"
+    source = checkout_root / "skills" / name
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(SkillDocument(name, "Remote", "body")),
+        encoding="utf-8",
+    )
+
+    def fake_checkout(self, *, url, ref, skill_name, target, cancel_event=None):
+        return GitCheckout(
+            root=checkout_root,
+            skill_folder=source,
+            revision="e" * 40,
+            remote_url=url,
+            ref=ref,
+        )
+
+    original_set = feature._enablement.set
+    failure_injected = False
+
+    async def commit_then_fail(*args, **kwargs):
+        nonlocal failure_injected
+        state = await original_set(*args, **kwargs)
+        if kwargs["enabled"] is False and not failure_injected:
+            failure_injected = True
+            raise DatabaseError("connection lost after disabling commit")
+        return state
+
+    monkeypatch.setattr(
+        "kestrel_feature_skills.git_source.GitSkillSource.checkout", fake_checkout
+    )
+    monkeypatch.setattr(feature._enablement, "set", commit_then_fail)
+
+    with pytest.raises(DatabaseError, match="connection lost"):
+        await feature.install_skill(
+            source_url="https://example.com/repo.git",
+            skill_name=name,
+            ref="main",
+        )
+
+    assert not (feature.agent.procedural_skills_root / name).exists()
+    assert (await feature._enablement.load())[name] == SkillState(True, 19)
 
 
 @pytest.mark.asyncio

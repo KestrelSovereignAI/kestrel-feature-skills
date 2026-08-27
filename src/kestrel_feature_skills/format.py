@@ -22,11 +22,11 @@ SKILL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
 _FRONTMATTER_KEYS = frozenset({"name", "description"})
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _UNICODE_LINE_SEPARATOR = re.compile(r"[\x85\u2028\u2029]")
-_MARKDOWN_DESTINATION = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 _MARKDOWN_REFERENCE_DEFINITION = re.compile(
-    r"(?m)^[ \t]{0,3}\[[^\]\r\n]+\]:[ \t]*"
+    r"(?m)^[ \t]{0,3}\[(?:\\[^\r\n]|[^\]\\\r\n])+\]:[ \t]*"
     r"(?:\r?\n[ \t]{0,3})?(?:<([^>\r\n]+)>|(\S+))"
 )
+_MARKDOWN_BACKSLASH_ESCAPE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
 _REMOTE_SCHEMES = frozenset({"http", "https", "mailto"})
 
 
@@ -171,11 +171,83 @@ def serialize_skill_markdown(document: SkillDocument) -> str:
     )
 
 
+def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
+    """Extract inline-link targets with balanced, escape-aware label parsing."""
+
+    destinations: list[str] = []
+    bracket_depth = 0
+    index = 0
+    while index < len(body):
+        character = body[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character == "[":
+            bracket_depth += 1
+            index += 1
+            continue
+        if character != "]" or bracket_depth < 1:
+            index += 1
+            continue
+        bracket_depth -= 1
+        if index + 1 >= len(body) or body[index + 1] != "(":
+            index += 1
+            continue
+
+        cursor = index + 2
+        while cursor < len(body) and body[cursor].isspace():
+            cursor += 1
+        if cursor >= len(body):
+            break
+        if body[cursor] == ")":
+            index = cursor + 1
+            continue
+        if body[cursor] == "<":
+            start = cursor
+            cursor += 1
+            while cursor < len(body):
+                if body[cursor] == "\\" and cursor + 1 < len(body):
+                    cursor += 2
+                    continue
+                if body[cursor] in "\r\n<":
+                    break
+                if body[cursor] == ">":
+                    destinations.append(body[start : cursor + 1])
+                    cursor += 1
+                    break
+                cursor += 1
+            index = cursor
+            continue
+
+        start = cursor
+        parenthesis_depth = 0
+        while cursor < len(body):
+            if body[cursor] == "\\" and cursor + 1 < len(body):
+                cursor += 2
+                continue
+            if body[cursor] == "(":
+                parenthesis_depth += 1
+                cursor += 1
+                continue
+            if body[cursor] == ")":
+                if parenthesis_depth == 0:
+                    destinations.append(body[start:cursor])
+                    cursor += 1
+                    break
+                parenthesis_depth -= 1
+                cursor += 1
+                continue
+            if body[cursor].isspace() and parenthesis_depth == 0:
+                destinations.append(body[start:cursor])
+                break
+            cursor += 1
+        index = cursor
+    return tuple(destinations)
+
+
 def _local_markdown_destinations(body: str) -> tuple[str, ...]:
     destinations: list[str] = []
-    raw_destinations = [
-        match.group(1) for match in _MARKDOWN_DESTINATION.finditer(body)
-    ]
+    raw_destinations = list(_inline_markdown_destinations(body))
     raw_destinations.extend(
         match.group(1) or match.group(2)
         for match in _MARKDOWN_REFERENCE_DEFINITION.finditer(body)
@@ -186,6 +258,7 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
             raw = raw[1 : raw.index(">")]
         else:
             raw = raw.split(maxsplit=1)[0]
+        raw = _MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", raw)
         if not raw or raw.startswith("#"):
             continue
         decoded = unquote(raw)
