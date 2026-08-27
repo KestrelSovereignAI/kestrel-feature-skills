@@ -50,12 +50,18 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-blockquote-tab-link",
         "kite-setext-code-boundary",
         "kite-html-code-boundary",
+        "kite-ordered-interruption",
+        "kite-blank-list-interruption",
+        "kite-html-container-exit",
+        "kite-consecutive-reference",
     )
     code_example_name = "kite-code-examples"
+    commonmark_control_name = "kite-commonmark-controls"
     unapproved_install = "permission-sentinel"
     for rejected_name in rejected_names:
         shutil.rmtree(root / rejected_name, ignore_errors=True)
     shutil.rmtree(root / code_example_name, ignore_errors=True)
+    shutil.rmtree(root / commonmark_control_name, ignore_errors=True)
     shutil.rmtree(root / unapproved_install, ignore_errors=True)
     (root.parent / "kite-outside.md").unlink(missing_ok=True)
 
@@ -274,6 +280,44 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             "<!--\n`\n-->\n[outside](../kite-outside.md) `\n",
             encoding="utf-8",
         )
+        ordered_interruption_folder = root / "kite-ordered-interruption"
+        ordered_interruption_folder.mkdir()
+        (ordered_interruption_folder / "SKILL.md").write_text(
+            '---\nname: "kite-ordered-interruption"\n'
+            'description: "Ordered paragraph interruption attempt"\n---\n\n'
+            "Paragraph text\n2. ```markdown\n"
+            "   [outside](../kite-outside.md)\n   ```\n",
+            encoding="utf-8",
+        )
+        blank_list_interruption_folder = root / "kite-blank-list-interruption"
+        blank_list_interruption_folder.mkdir()
+        (blank_list_interruption_folder / "SKILL.md").write_text(
+            '---\nname: "kite-blank-list-interruption"\n'
+            'description: "Blank list paragraph interruption attempt"\n---\n\n'
+            "Paragraph text\n*   \n    ~~~markdown\n"
+            "    [outside](../kite-outside.md)\n    ~~~\n",
+            encoding="utf-8",
+        )
+        html_container_exit_folder = root / "kite-html-container-exit"
+        html_container_exit_folder.mkdir()
+        (html_container_exit_folder / "SKILL.md").write_text(
+            '---\nname: "kite-html-container-exit"\n'
+            'description: "HTML container escape attempt"\n---\n\n'
+            "> <!--\n> literal HTML\n[outside](../kite-outside.md)\n",
+            encoding="utf-8",
+        )
+        consecutive_reference_folder = root / "kite-consecutive-reference"
+        consecutive_reference_folder.mkdir()
+        (consecutive_reference_folder / "SKILL.md").write_text(
+            '---\nname: "kite-consecutive-reference"\n'
+            'description: "Consecutive reference escape attempt"\n---\n\n'
+            "[notes]:\n  notes.md\n[outside]: ../kite-outside.md\n\n"
+            "Read [outside][outside].\n",
+            encoding="utf-8",
+        )
+        (consecutive_reference_folder / "notes.md").write_text(
+            "notes\n", encoding="utf-8"
+        )
         code_example_folder = root / code_example_name
         code_example_folder.mkdir()
         (code_example_folder / "SKILL.md").write_text(
@@ -286,6 +330,17 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             "> ```markdown\n> literal\n> > [nested](missing-nested.md)\n",
             encoding="utf-8",
         )
+        commonmark_control_folder = root / commonmark_control_name
+        commonmark_control_folder.mkdir()
+        (commonmark_control_folder / "SKILL.md").write_text(
+            f'---\nname: "{commonmark_control_name}"\n'
+            'description: "Valid CommonMark boundary controls"\n---\n\n'
+            "Switch to [full view](?mode=full).\n\n"
+            "Introductory paragraph\n[example]: ../missing-reference.md\n\n"
+            "Use `[example](../missing-code.md)\n<a>\nend` inline.\n\n"
+            "<div>\n[example](../missing-html.md)\n",
+            encoding="utf-8",
+        )
 
         reloaded = client.post(f"{base}/reload")
         assert reloaded.status_code == 200, reloaded.text
@@ -293,7 +348,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         errors = {item["locator"]: item["error"] for item in payload["errors"]}
         assert set(rejected_names) <= errors.keys()
         discovered = {skill["name"] for skill in payload["skills"]}
-        assert {name, code_example_name} <= discovered
+        assert {name, code_example_name, commonmark_control_name} <= discovered
         assert all(rejected_name not in discovered for rejected_name in rejected_names)
 
         invalid_state = client.patch(
@@ -364,6 +419,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         for rejected_name in rejected_names:
             shutil.rmtree(root / rejected_name, ignore_errors=True)
         shutil.rmtree(root / code_example_name, ignore_errors=True)
+        shutil.rmtree(root / commonmark_control_name, ignore_errors=True)
         shutil.rmtree(root / unapproved_install, ignore_errors=True)
         escape_target.unlink(missing_ok=True)
         cleaned = client.post(f"{base}/reload")

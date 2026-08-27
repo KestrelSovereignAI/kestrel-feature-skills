@@ -235,6 +235,19 @@ def test_multiline_reference_style_markdown_escape_is_rejected(tmp_path):
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+def test_reference_definition_after_multiline_definition_is_validated(tmp_path):
+    value = SkillDocument(
+        "consecutive-references",
+        "Consecutive reference definitions",
+        "[notes]:\n  notes.md\n[outside]: ../secret.md\n\nRead [outside][outside].",
+    )
+    folder = write_skill(tmp_path, value)
+    (folder / "notes.md").write_text("notes", encoding="utf-8")
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_reference_style_markdown_local_resource_is_accepted(tmp_path):
     value = SkillDocument(
         "reference-local",
@@ -289,6 +302,54 @@ def test_live_link_after_unclosed_list_fence_is_validated(tmp_path):
         "list-fence-exit",
         "List fence exit",
         "- ```markdown\n  literal example\n\n[outside](../secret.md)",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_non_one_ordered_marker_cannot_interrupt_paragraph_to_hide_live_link(
+    tmp_path,
+):
+    value = SkillDocument(
+        "ordered-interruption",
+        "Ordered paragraph interruption",
+        "Paragraph text\n2. ```markdown\n   [outside](../secret.md)\n   ```",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_one_ordered_marker_can_interrupt_paragraph_with_literal_fence(tmp_path):
+    value = SkillDocument(
+        "ordered-one-interruption",
+        "Ordered one paragraph interruption",
+        "Paragraph text\n1. ```markdown\n   [literal](../example.md)\n   ```",
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_non_one_ordered_marker_can_start_list_after_blank_line(tmp_path):
+    value = SkillDocument(
+        "ordered-after-blank",
+        "Ordered list after blank",
+        "Paragraph text\n\n2. ```markdown\n   [literal](../example.md)\n   ```",
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_blank_list_item_cannot_interrupt_paragraph_to_hide_live_link(tmp_path):
+    value = SkillDocument(
+        "blank-list-interruption",
+        "Blank list paragraph interruption",
+        "Paragraph text\n*   \n    ~~~markdown\n    [outside](../secret.md)\n    ~~~",
     )
     folder = write_skill(tmp_path, value)
 
@@ -411,6 +472,15 @@ def test_remote_https_link_is_not_treated_as_bundled_path(tmp_path):
         "remote-link", "Remote reference", "See [docs](https://example.com/a)."
     )
     folder = write_skill(tmp_path, value)
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_query_only_same_document_link_is_accepted(tmp_path):
+    value = SkillDocument(
+        "query-link", "Query-only reference", "Switch to [full view](?mode=full)."
+    )
+    folder = write_skill(tmp_path, value)
+
     assert validate_skill_folder(folder, source_root=tmp_path) == value
 
 
@@ -539,11 +609,63 @@ def test_code_span_delimiters_cannot_escape_multiline_html_block(tmp_path, body)
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "body",
+    (
+        "> <!--\n> literal HTML\n[outside](../secret.md)",
+        "- <div>\n  literal HTML\n[outside](../secret.md)",
+    ),
+)
+def test_live_link_after_unclosed_container_html_block_is_validated(tmp_path, body):
+    value = SkillDocument("html-container-exit", "HTML container exit", body)
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_multiline_code_span_within_one_paragraph_remains_literal(tmp_path):
     value = SkillDocument(
         "multiline-code",
         "Multiline code span",
         "Use `[literal]\n(../example.md)` as a wrapped example.",
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_type_seven_html_tag_does_not_interrupt_multiline_code_span(tmp_path):
+    value = SkillDocument(
+        "inline-html-code",
+        "Inline HTML inside code span",
+        "Use `[example](../example.md)\n<a>\nend` as a wrapped example.",
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "<!--\n[example](../example.md)\n-->",
+        "<div>\n[example](../example.md)\n\nAfter the block.",
+        "<a>\n[example](../example.md)\n\nAfter the block.",
+    ),
+)
+def test_markdown_links_inside_html_blocks_remain_literal(tmp_path, body):
+    value = SkillDocument("html-literal", "Literal HTML contents", body)
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_reference_definition_shape_cannot_interrupt_open_paragraph(tmp_path):
+    value = SkillDocument(
+        "paragraph-reference-shape",
+        "Paragraph reference shape",
+        "Introductory paragraph\n[example]: ../missing.md",
     )
     folder = write_skill(tmp_path, value)
 

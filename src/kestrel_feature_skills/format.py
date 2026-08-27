@@ -29,6 +29,9 @@ _MARKDOWN_REFERENCE_DEFINITION = re.compile(
     r"(?m)^[ \t]{0,3}\[(?:\\[^\r\n]|[^\]\\\r\n])+\]:[ \t]*"
     r"(?:\r?\n[ \t]{0,3})?(?:<([^>\r\n]+)>|(\S+))"
 )
+_MARKDOWN_REFERENCE_DEFINITION_START = re.compile(
+    r"^[ \t]{0,3}\[(?:\\[^\r\n]|[^\]\\\r\n])+\]:"
+)
 _MARKDOWN_BACKSLASH_ESCAPE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
 _MARKDOWN_AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*)>")
 # A CommonMark fence may be indented by at most three *columns*. Any tab in
@@ -39,10 +42,28 @@ _MARKDOWN_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _MARKDOWN_LIST_PREFIX = re.compile(r"^([ ]{0,3})((?:[-+*]|\d{1,9}[.)]))([ \t]+)")
 _MARKDOWN_SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 _MARKDOWN_NONPARAGRAPH_BLOCK = re.compile(
-    r"^(?:#{1,6}(?:[ \t]+|$)|(?:[*_-][ \t]*){3,}$|<[!/?A-Za-z])"
+    r"^(?:#{1,6}(?:[ \t]+|$)|(?:[*_-][ \t]*){3,}$)"
 )
 _MARKDOWN_RAW_HTML_TAG = re.compile(
     r"^<(script|pre|style|textarea)(?:[ \t]|>|$)", re.IGNORECASE
+)
+_MARKDOWN_BLOCK_HTML_TAG = re.compile(
+    r"^</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|"
+    r"col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|"
+    r"footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|"
+    r"link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|"
+    r"section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)"
+    r"(?:[ \t]|/?>|$)",
+    re.IGNORECASE,
+)
+_MARKDOWN_COMPLETE_HTML_TAG = re.compile(
+    r"^(?:"
+    r"<[A-Za-z][A-Za-z0-9-]*"
+    r"(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:[ \t]*=[ \t]*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?)*"
+    r"[ \t]*/?>"
+    r"|</[A-Za-z][A-Za-z0-9-]*[ \t]*>"
+    r")[ \t]*$"
 )
 _REMOTE_SCHEMES = frozenset({"http", "https", "mailto"})
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
@@ -216,8 +237,8 @@ def _indent_prefix(line: str, required_columns: int) -> int | None:
     return None
 
 
-def _list_marker_prefix(line: str) -> tuple[int, int] | None:
-    """Return the consumed characters and continuation columns for a list marker."""
+def _list_marker_prefix(line: str) -> tuple[int, int, str] | None:
+    """Return consumed characters, continuation columns, and marker text."""
 
     match = _MARKDOWN_LIST_PREFIX.match(line)
     if match is None:
@@ -240,7 +261,7 @@ def _list_marker_prefix(line: str) -> tuple[int, int] | None:
         whitespace_columns = 1
         consumed_whitespace = 1
     consumed = marker_end + consumed_whitespace
-    return consumed, marker_end + whitespace_columns
+    return consumed, marker_end + whitespace_columns, match.group(2)
 
 
 def _strip_blockquote_prefix(line: str) -> str | None:
@@ -277,28 +298,31 @@ def _strip_blockquote_prefix(line: str) -> str | None:
     return f"{' ' * retained_indent}{line[index:]}"
 
 
-def _html_block_terminator(line: str) -> tuple[str, bool] | None:
-    """Return the end marker for a CommonMark HTML block opener."""
+def _html_block_terminator(line: str) -> tuple[str, bool, bool] | None:
+    """Return marker, case handling, and paragraph-interruption behavior."""
 
     if line.startswith("<!--"):
-        return "-->", False
+        return "-->", False, True
     if line.startswith("<?"):
-        return "?>", False
+        return "?>", False, True
     if line.startswith("<![CDATA["):
-        return "]]>", False
+        return "]]>", False, True
     if re.match(r"^<![A-Z]", line):
-        return ">", False
+        return ">", False, True
     raw_tag = _MARKDOWN_RAW_HTML_TAG.match(line)
     if raw_tag is not None:
-        return f"</{raw_tag.group(1)}>", True
-    if re.match(r"^</?[A-Za-z]", line):
-        # CommonMark's block-tag and complete-tag forms end at a blank line.
-        return "", False
+        return f"</{raw_tag.group(1)}>", True, True
+    if _MARKDOWN_BLOCK_HTML_TAG.match(line):
+        return "", False, True
+    if _MARKDOWN_COMPLETE_HTML_TAG.match(line):
+        # Type-7 complete tags end at a blank line but cannot interrupt an
+        # existing paragraph.
+        return "", False, False
     return None
 
 
-def _html_block_ends(line: str, terminator: tuple[str, bool]) -> bool:
-    marker, case_insensitive = terminator
+def _html_block_ends(line: str, terminator: tuple[str, bool, bool]) -> bool:
+    marker, case_insensitive, _can_interrupt_paragraph = terminator
     if not marker:
         return not line.strip()
     if case_insensitive:
@@ -306,98 +330,41 @@ def _html_block_ends(line: str, terminator: tuple[str, bool]) -> bool:
     return marker in line
 
 
-def _markdown_container_lines(
-    body: str,
-) -> tuple[
-    tuple[str, str, tuple[int, tuple[int, ...]], tuple[int, tuple[int, ...]]],
-    ...,
-]:
-    """Normalize explicit containers and list continuations line by line.
+def _reference_continuation_content(
+    line: str,
+    *,
+    quote_depth: int,
+    list_levels: list[tuple[int, int]],
+) -> str | None:
+    """Normalize one look-ahead line within an existing container."""
 
-    The container key lets fenced-code masking notice when an unclosed fence's
-    blockquote or list item has ended. List levels are retained across blank
-    lines so continuation-indented reference definitions receive the same view
-    that CommonMark gives its inline/reference parser.
-    """
-
-    rows: list[
-        tuple[str, str, tuple[int, tuple[int, ...]], tuple[int, tuple[int, ...]]]
-    ] = []
-    list_levels: list[tuple[int, int]] = []
-    list_quote_depth = 0
-    next_list_id = 0
-    for line in body.splitlines(keepends=True):
-        content = line.rstrip("\r\n")
-        ending = line[len(content) :]
-        quote_depth = 0
-        working = content
-        while (stripped := _strip_blockquote_prefix(working)) is not None:
-            quote_depth += 1
-            working = stripped
-
-        if quote_depth != list_quote_depth:
-            list_levels = []
-        list_quote_depth = quote_depth
-        active_level: int | None = None
-        retained_levels: list[tuple[int, int]] = []
-        if not working.strip():
-            retained_levels = list_levels
-            active_level = list_levels[-1][0] if list_levels else None
-            continued_ids = (
-                tuple(item_id for _indent, item_id in retained_levels)
-                if active_level is not None
-                and _indent_prefix(working, active_level) is not None
-                else ()
-            )
-            working = ""
-        else:
-            for level_index in range(len(list_levels) - 1, -1, -1):
-                prefix = _indent_prefix(working, list_levels[level_index][0])
-                if prefix is None:
-                    continue
-                active_level = list_levels[level_index][0]
-                retained_levels = list_levels[: level_index + 1]
-                working = working[prefix:]
-                break
-
-            continued_ids = tuple(item_id for _indent, item_id in retained_levels)
-            absolute_indent = active_level or 0
-            while marker := _list_marker_prefix(working):
-                consumed, continuation_columns = marker
-                absolute_indent += continuation_columns
-                next_list_id += 1
-                retained_levels.append((absolute_indent, next_list_id))
-                active_level = absolute_indent
-                working = working[consumed:]
-
-        list_levels = retained_levels
-        final_ids = tuple(item_id for _indent, item_id in retained_levels)
-        rows.append(
-            (
-                working,
-                ending,
-                (quote_depth, final_ids),
-                (quote_depth, continued_ids),
-            )
-        )
-    return tuple(rows)
+    content = line.rstrip("\r\n")
+    for _ in range(quote_depth):
+        stripped = _strip_blockquote_prefix(content)
+        if stripped is None:
+            return None
+        content = stripped
+    if list_levels:
+        prefix = _indent_prefix(content, list_levels[-1][0])
+        if prefix is None:
+            return None
+        content = content[prefix:]
+    return content
 
 
-def _mask_markdown_code(body: str) -> str:
-    """Normalize containers and mask code while preserving line boundaries."""
+def _analyze_markdown(body: str) -> tuple[str, tuple[str, ...]]:
+    """Normalize containers, mask code, and find block-valid definitions."""
 
-    rows = _markdown_container_lines(body)
-    normalized = "".join(
-        f"{content}{ending}" for content, ending, _key, _continued in rows
-    )
-    masked = list(normalized)
+    masked: list[str] = []
 
     def mask(start: int, end: int) -> None:
         for position in range(start, end):
             if masked[position] not in "\r\n":
                 masked[position] = " "
 
-    offset = 0
+    list_levels: list[tuple[int, int]] = []
+    list_quote_depth = 0
+    next_list_id = 0
     fence_character: str | None = None
     fence_length = 0
     fence_container: tuple[int, tuple[int, ...]] | None = None
@@ -407,8 +374,75 @@ def _mask_markdown_code(body: str) -> str:
     paragraph_open = False
     inline_blocks: list[list[int]] = []
     active_inline_block: int | None = None
-    html_block_terminator: tuple[str, bool] | None = None
-    for content, ending, container, continued_container in rows:
+    html_block_terminator: tuple[str, bool, bool] | None = None
+    html_block_container: tuple[int, tuple[int, ...]] | None = None
+    reference_destinations: list[str] = []
+    reference_continuation_lines: set[int] = set()
+    lines = body.splitlines(keepends=True)
+    for line_index, line in enumerate(lines):
+        raw_content = line.rstrip("\r\n")
+        ending = line[len(raw_content) :]
+        quote_depth = 0
+        content = raw_content
+        while (stripped := _strip_blockquote_prefix(content)) is not None:
+            quote_depth += 1
+            content = stripped
+
+        if quote_depth != list_quote_depth:
+            list_levels = []
+        list_quote_depth = quote_depth
+        active_level: int | None = None
+        retained_levels: list[tuple[int, int]] = []
+        if not content.strip():
+            retained_levels = list_levels
+            active_level = list_levels[-1][0] if list_levels else None
+            continued_ids = (
+                tuple(item_id for _indent, item_id in retained_levels)
+                if active_level is not None
+                and _indent_prefix(content, active_level) is not None
+                else ()
+            )
+            content = ""
+        else:
+            for level_index in range(len(list_levels) - 1, -1, -1):
+                prefix = _indent_prefix(content, list_levels[level_index][0])
+                if prefix is None:
+                    continue
+                active_level = list_levels[level_index][0]
+                retained_levels = list_levels[: level_index + 1]
+                content = content[prefix:]
+                break
+
+            continued_ids = tuple(item_id for _indent, item_id in retained_levels)
+            absolute_indent = active_level or 0
+            while marker := _list_marker_prefix(content):
+                consumed, continuation_columns, marker_text = marker
+                parent_ids = tuple(item_id for _indent, item_id in retained_levels)
+                parent_container = (quote_depth, parent_ids)
+                interrupts_paragraph = (
+                    paragraph_open and paragraph_container == parent_container
+                )
+                ordered_start = (
+                    int(marker_text[:-1]) if marker_text[0].isdigit() else None
+                )
+                remaining = content[consumed:]
+                if interrupts_paragraph and (
+                    not remaining.strip()
+                    or (ordered_start is not None and ordered_start != 1)
+                ):
+                    break
+                absolute_indent += continuation_columns
+                next_list_id += 1
+                retained_levels.append((absolute_indent, next_list_id))
+                active_level = absolute_indent
+                content = remaining
+
+        list_levels = retained_levels
+        final_ids = tuple(item_id for _indent, item_id in retained_levels)
+        container = (quote_depth, final_ids)
+        continued_container = (quote_depth, continued_ids)
+        offset = len(masked)
+        masked.extend(f"{content}{ending}")
         line_length = len(content) + len(ending)
         if fence_character is not None and fence_container is not None:
             opening_quote_depth, opening_list_ids = fence_container
@@ -426,13 +460,40 @@ def _mask_markdown_code(body: str) -> str:
                 fence_character = None
                 fence_length = 0
                 fence_container = None
-        if fence_character is None and html_block_terminator is not None:
+        if (
+            fence_character is None
+            and html_block_terminator is not None
+            and html_block_container is not None
+        ):
+            opening_quote_depth, opening_list_ids = html_block_container
+            current_quote_depth, continued_list_ids = continued_container
+            continues_container = (
+                current_quote_depth >= opening_quote_depth
+                and continued_list_ids[: len(opening_list_ids)] == opening_list_ids
+            )
+            if continues_container:
+                in_indented_code = False
+                paragraph_open = False
+                active_inline_block = None
+                mask(offset, offset + line_length)
+                marker = html_block_terminator[0]
+                terminator_line = (
+                    raw_content
+                    if marker or html_block_container == (0, ())
+                    else content
+                )
+                if _html_block_ends(terminator_line, html_block_terminator):
+                    html_block_terminator = None
+                    html_block_container = None
+                continue
+            html_block_terminator = None
+            html_block_container = None
+        if line_index in reference_continuation_lines:
             in_indented_code = False
+            paragraph_container = container
             paragraph_open = False
             active_inline_block = None
-            if _html_block_ends(content, html_block_terminator):
-                html_block_terminator = None
-            offset += line_length
+            mask(offset, offset + line_length)
             continue
         match = _MARKDOWN_FENCE.match(content)
         if fence_character is None:
@@ -447,7 +508,6 @@ def _mask_markdown_code(body: str) -> str:
                     paragraph_open = False
                     active_inline_block = None
                     mask(offset, offset + line_length)
-                    offset += line_length
                     continue
         else:
             active_inline_block = None
@@ -460,7 +520,6 @@ def _mask_markdown_code(body: str) -> str:
                         fence_character = None
                         fence_length = 0
                         fence_container = None
-            offset += line_length
             continue
 
         if container != paragraph_container:
@@ -483,7 +542,28 @@ def _mask_markdown_code(body: str) -> str:
             else:
                 in_indented_code = False
                 stripped_content = content.lstrip(" \t")
-                reference_definition = _MARKDOWN_REFERENCE_DEFINITION.match(content)
+                reference_definition = (
+                    _MARKDOWN_REFERENCE_DEFINITION.match(content)
+                    if not paragraph_open
+                    else None
+                )
+                if (
+                    reference_definition is None
+                    and not paragraph_open
+                    and _MARKDOWN_REFERENCE_DEFINITION_START.match(content)
+                    and line_index + 1 < len(lines)
+                ):
+                    continuation = _reference_continuation_content(
+                        lines[line_index + 1],
+                        quote_depth=quote_depth,
+                        list_levels=retained_levels,
+                    )
+                    if continuation is not None:
+                        reference_definition = _MARKDOWN_REFERENCE_DEFINITION.match(
+                            f"{content}\n{continuation}"
+                        )
+                        if reference_definition is not None:
+                            reference_continuation_lines.add(line_index + 1)
                 nonparagraph_block = _MARKDOWN_NONPARAGRAPH_BLOCK.match(
                     stripped_content
                 )
@@ -494,12 +574,20 @@ def _mask_markdown_code(body: str) -> str:
                 if setext_underline:
                     paragraph_open = False
                     active_inline_block = None
-                elif opened_html_block is not None:
+                elif opened_html_block is not None and (
+                    not paragraph_open or opened_html_block[2]
+                ):
+                    mask(offset, offset + line_length)
                     if not _html_block_ends(content, opened_html_block):
                         html_block_terminator = opened_html_block
+                        html_block_container = container
                     paragraph_open = False
                     active_inline_block = None
                 elif reference_definition is not None:
+                    reference_destinations.append(
+                        reference_definition.group(1) or reference_definition.group(2)
+                    )
+                    mask(offset, offset + line_length)
                     paragraph_open = False
                     active_inline_block = None
                 elif nonparagraph_block is not None:
@@ -516,8 +604,6 @@ def _mask_markdown_code(body: str) -> str:
                     inline_blocks.append([offset, offset + line_length])
                     active_inline_block = len(inline_blocks) - 1
                     paragraph_open = True
-        offset += line_length
-
     visible = "".join(masked)
 
     def escaped(position: int, lower_bound: int) -> bool:
@@ -550,7 +636,13 @@ def _mask_markdown_code(body: str) -> str:
                 closing_index += 1
             else:
                 position += 1
-    return "".join(masked)
+    return "".join(masked), tuple(reference_destinations)
+
+
+def _mask_markdown_code(body: str) -> str:
+    """Normalize containers and mask code while preserving line boundaries."""
+
+    return _analyze_markdown(body)[0]
 
 
 def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
@@ -629,12 +721,9 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
 
 def _local_markdown_destinations(body: str) -> tuple[str, ...]:
     destinations: list[str] = []
-    visible_body = _mask_markdown_code(body)
+    visible_body, reference_destinations = _analyze_markdown(body)
     raw_destinations = list(_inline_markdown_destinations(visible_body))
-    raw_destinations.extend(
-        match.group(1) or match.group(2)
-        for match in _MARKDOWN_REFERENCE_DEFINITION.finditer(visible_body)
-    )
+    raw_destinations.extend(reference_destinations)
     raw_destinations.extend(
         match.group(1) for match in _MARKDOWN_AUTOLINK.finditer(visible_body)
     )
@@ -664,6 +753,8 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
             continue
         if split.netloc:
             raise SkillPathError("network-path links are not bundled skill resources")
+        if not split.path:
+            continue
         destinations.append(unquote(split.path))
     return tuple(destinations)
 
