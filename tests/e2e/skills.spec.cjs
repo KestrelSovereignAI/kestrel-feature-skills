@@ -201,9 +201,9 @@ test.describe.serial('procedural skills contributed console', () => {
       bus.emit('agent:switch', { prev: 'kite', next: 'other-agent' });
     });
 
-    await expect(editor).toBeDisabled();
-    await expect(editor).toHaveValue('');
-    await expect(page.getByTestId('skills-save')).toBeDisabled();
+    await expect(page.locator('.nav-tab[data-panel="procedural-skills"]')).toHaveCount(0);
+    await expect(editor).toHaveCount(0);
+    await expect(page.getByTestId('skills-save')).toHaveCount(0);
   });
 
   test('route disappearance removes the stale panel and recovery restores it', async ({ page }) => {
