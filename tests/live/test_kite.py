@@ -40,6 +40,8 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-percent-link",
         "kite-malformed-link",
         "kite-script-autolink",
+        "kite-container-link",
+        "kite-literal-separator",
     )
     code_example_name = "kite-code-examples"
     unapproved_install = "permission-sentinel"
@@ -76,6 +78,18 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             json={"path": "references.md", "content": resource_body},
         )
         assert resource.status_code == 200, resource.text
+        long_resource = f"{'a' * 252}.md"
+        assert len(long_resource.encode("utf-8")) == 255
+        long_resource_write = client.put(
+            f"{base}/{name}/file",
+            json={"path": long_resource, "content": "LONG-RESOURCE-KITE-3018"},
+        )
+        assert long_resource_write.status_code == 200, long_resource_write.text
+        long_resource_read = client.get(
+            f"{base}/{name}/file", params={"path": long_resource}
+        )
+        assert long_resource_read.status_code == 200, long_resource_read.text
+        assert long_resource_read.json()["content"] == "LONG-RESOURCE-KITE-3018"
         catalog = client.get(base).json()
         assert catalog["context"]["text"] == ""
 
@@ -172,13 +186,30 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             "Open <javascript:alert(1)>.\n",
             encoding="utf-8",
         )
+        container_link_folder = root / "kite-container-link"
+        container_link_folder.mkdir()
+        (container_link_folder / "SKILL.md").write_text(
+            '---\nname: "kite-container-link"\n'
+            'description: "Container reference attempt"\n---\n\n'
+            "> [bad]: javascript:alert(1)\n>\n> [click][bad]\n",
+            encoding="utf-8",
+        )
+        literal_separator_folder = root / "kite-literal-separator"
+        literal_separator_folder.mkdir()
+        (literal_separator_folder / "SKILL.md").write_text(
+            '---\nname: "kite-literal-separator"\n'
+            'description: "Literal separator attempt"\n---\n\n'
+            "before\x0bafter\n",
+            encoding="utf-8",
+        )
         code_example_folder = root / code_example_name
         code_example_folder.mkdir()
         (code_example_folder / "SKILL.md").write_text(
             f'---\nname: "{code_example_name}"\n'
             'description: "Markdown code examples"\n---\n\n'
             "Use `[inline](missing-inline.md)` when documenting a link.\n\n"
-            "```markdown\n[fenced](missing-fenced.md)\n```\n",
+            "```markdown\n[fenced](missing-fenced.md)\n```\n\n"
+            "> ```markdown\n> [bad]: javascript:alert(1)\n> [click][bad]\n> ````\n",
             encoding="utf-8",
         )
 

@@ -417,7 +417,7 @@ def _open_parent_at(
 def _atomic_replace_file_at(directory_fd: int, name: str, payload: bytes) -> None:
     if len(payload) > MAX_EDITOR_FILE_BYTES:
         raise SkillFormatError(f"editor file exceeds {MAX_EDITOR_FILE_BYTES} bytes")
-    temporary = f".{name}.tmp.{uuid.uuid4().hex}"
+    temporary = f".tmp.{uuid.uuid4().hex}"
     _write_tmp_at(directory_fd, temporary, payload)
     try:
         os.replace(
@@ -492,7 +492,7 @@ def atomic_replace_file(path: Path, payload: bytes) -> None:
 
     if len(payload) > MAX_EDITOR_FILE_BYTES:
         raise SkillFormatError(f"editor file exceeds {MAX_EDITOR_FILE_BYTES} bytes")
-    tmp = path.with_name(f".{path.name}.tmp.{uuid.uuid4().hex}")
+    tmp = path.with_name(f".tmp.{uuid.uuid4().hex}")
     _write_tmp(tmp, payload)
     try:
         os.replace(tmp, path)

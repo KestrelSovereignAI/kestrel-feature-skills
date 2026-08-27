@@ -721,6 +721,30 @@ def test_primary_path_alias_uses_the_serialized_primary_writer(tmp_path, monkeyp
     assert calls == [(record, replacement)]
 
 
+def test_resource_edit_supports_maximum_length_filename(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    document = SkillDocument("long-resource", "Long resource", "Procedure.")
+    folder = store.create(document)
+    folder_stat = folder.stat()
+    record = SkillRecord(
+        document=document,
+        folder=folder,
+        source_id="agent-local",
+        source_kind="agent-local",
+        precedence=0,
+        provenance=SkillProvenance("agent-local", "agent-local", document.name),
+        folder_identity=(folder_stat.st_dev, folder_stat.st_ino),
+    )
+    filename = f"{'a' * 252}.md"
+    assert len(filename.encode("utf-8")) == 255
+
+    store.write_file(record, filename, "replacement")
+
+    assert (folder / filename).read_text(encoding="utf-8") == "replacement"
+    assert not tuple(folder.glob(".tmp.*"))
+    assert not tuple(folder.glob(".*.tmp.*"))
+
+
 def test_install_copies_resources_then_publishes_primary(tmp_path):
     source_root = tmp_path / "source"
     source_root.mkdir()

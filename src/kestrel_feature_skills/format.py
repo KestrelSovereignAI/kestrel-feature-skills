@@ -32,6 +32,9 @@ _MARKDOWN_REFERENCE_DEFINITION = re.compile(
 _MARKDOWN_BACKSLASH_ESCAPE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
 _MARKDOWN_AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*)>")
 _MARKDOWN_FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+_MARKDOWN_CONTAINER_PREFIX = re.compile(
+    r"^[ \t]{0,3}(?:>[ \t]?|(?:[-+*]|\d{1,9}[.)])[ \t]+)"
+)
 _REMOTE_SCHEMES = frozenset({"http", "https", "mailto"})
 
 
@@ -99,6 +102,10 @@ def parse_skill_markdown(
     normalized = text.replace("\r\n", "\n")
     if normalized.startswith("\ufeff"):
         raise SkillFormatError(f"{source} must not start with a byte-order mark")
+    if _CONTROL.search(normalized) or _UNICODE_LINE_SEPARATOR.search(normalized):
+        raise SkillFormatError(
+            f"{source} contains control or Unicode line-separator characters"
+        )
     lines = normalized.splitlines()
     if not lines or lines[0] != "---":
         raise SkillFormatError(
@@ -191,11 +198,12 @@ def _mask_markdown_code(body: str) -> str:
     fence_length = 0
     for line in body.splitlines(keepends=True):
         content = line.rstrip("\r\n")
-        match = _MARKDOWN_FENCE.match(content)
+        fence_content = _strip_markdown_container_prefix(content)
+        match = _MARKDOWN_FENCE.match(fence_content)
         if fence_character is None:
             if match:
                 run = match.group(1)
-                tail = content[match.end() :]
+                tail = fence_content[match.end() :]
                 if run[0] != "`" or "`" not in tail:
                     fence_character = run[0]
                     fence_length = len(run)
@@ -205,7 +213,7 @@ def _mask_markdown_code(body: str) -> str:
             if match:
                 run = match.group(1)
                 if run[0] == fence_character and len(run) >= fence_length:
-                    tail = content[match.end() :]
+                    tail = fence_content[match.end() :]
                     if not tail.strip():
                         fence_character = None
                         fence_length = 0
@@ -238,6 +246,26 @@ def _mask_markdown_code(body: str) -> str:
         else:
             position += 1
     return "".join(masked)
+
+
+def _strip_markdown_container_prefix(line: str) -> str:
+    """Expose content nested below blockquote or list container markers."""
+
+    cursor = 0
+    while match := _MARKDOWN_CONTAINER_PREFIX.match(line[cursor:]):
+        cursor += match.end()
+    return line[cursor:]
+
+
+def _markdown_container_view(body: str) -> str:
+    """Return a line-stable view with leading container markers removed."""
+
+    lines: list[str] = []
+    for line in body.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        ending = line[len(content) :]
+        lines.append(f"{_strip_markdown_container_prefix(content)}{ending}")
+    return "".join(lines)
 
 
 def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
@@ -317,10 +345,11 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
 def _local_markdown_destinations(body: str) -> tuple[str, ...]:
     destinations: list[str] = []
     visible_body = _mask_markdown_code(body)
+    reference_body = _markdown_container_view(visible_body)
     raw_destinations = list(_inline_markdown_destinations(visible_body))
     raw_destinations.extend(
         match.group(1) or match.group(2)
-        for match in _MARKDOWN_REFERENCE_DEFINITION.finditer(visible_body)
+        for match in _MARKDOWN_REFERENCE_DEFINITION.finditer(reference_body)
     )
     raw_destinations.extend(
         match.group(1) for match in _MARKDOWN_AUTOLINK.finditer(visible_body)

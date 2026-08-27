@@ -95,6 +95,19 @@ def test_json_escaped_c1_controls_are_rejected(codepoint, field):
         parse_skill_markdown(content)
 
 
+@pytest.mark.parametrize(
+    "separator", ("\x0b", "\x0c", "\x1c", "\x1e", "\x85", "\u2028", "\u2029")
+)
+def test_literal_control_and_unicode_separators_cannot_be_normalized_away(separator):
+    content = (
+        '---\nname: "literal-separator"\ndescription: "Safe"\n---\n\n'
+        f"before{separator}after\n"
+    )
+
+    with pytest.raises(SkillFormatError, match="control|line-separator"):
+        parse_skill_markdown(content)
+
+
 def test_serializer_rejects_lone_surrogate_body_as_a_format_error():
     with pytest.raises(SkillFormatError, match="UTF-8"):
         serialize_skill_markdown(
@@ -230,6 +243,32 @@ def test_reference_style_markdown_local_resource_is_accepted(tmp_path):
     )
     folder = write_skill(tmp_path, value)
     (folder / "notes.md").write_text("notes", encoding="utf-8")
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "> [bad]: javascript:alert(1)\n>\n> [click][bad]",
+        "- [bad]: javascript:alert(1)\n\n  [click][bad]",
+    ),
+)
+def test_reference_definitions_inside_markdown_containers_are_validated(tmp_path, body):
+    value = SkillDocument("container-link", "Container link", body)
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="unsupported link scheme"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_reference_definitions_inside_container_fences_remain_literal(tmp_path):
+    value = SkillDocument(
+        "container-code",
+        "Container code",
+        "> ```markdown\n> [bad]: javascript:alert(1)\n> [click][bad]\n> ````",
+    )
+    folder = write_skill(tmp_path, value)
+
     assert validate_skill_folder(folder, source_root=tmp_path) == value
 
 

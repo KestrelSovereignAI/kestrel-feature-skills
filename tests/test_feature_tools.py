@@ -388,6 +388,39 @@ async def test_create_validates_priority_before_publishing_folder(feature, prior
 
 
 @pytest.mark.asyncio
+async def test_create_reports_unpersisted_custom_priority_without_database(
+    feature, tmp_path
+):
+    agent = SimpleNamespace(
+        did="did:test:no-skills-database",
+        agent_id="did:test:no-skills-database",
+        procedural_skills_root=tmp_path / "skills",
+        storage=feature.agent.storage,
+    )
+    unavailable = ProceduralSkillsFeature(agent)
+    await unavailable.initialize()
+    try:
+        result = await unavailable.skill_create(
+            "unpersisted-priority",
+            "Unpersisted priority",
+            "Procedure.",
+            enabled=False,
+            priority=7,
+        )
+
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "priority" in result.error
+        assert "database unavailable" in result.error
+        assert result.data["enabled"] is False
+        assert result.data["priority"] == 100
+        assert (
+            agent.procedural_skills_root / "unpersisted-priority" / "SKILL.md"
+        ).is_file()
+    finally:
+        await unavailable.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_failed_create_cannot_reenable_from_stale_persisted_state(
     feature, monkeypatch
 ):

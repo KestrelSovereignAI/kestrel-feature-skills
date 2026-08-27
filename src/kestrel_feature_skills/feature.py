@@ -461,8 +461,20 @@ class ProceduralSkillsFeature(Feature):
                     False, resolved_priority
                 )
                 state_error = str(exc)
+        elif enabled and resolved_priority != DEFAULT_PRIORITY:
+            state_error = (
+                "agent database unavailable; the new skill remains disabled and uses "
+                f"default priority {DEFAULT_PRIORITY} instead of requested priority "
+                f"{resolved_priority}"
+            )
         elif enabled:
             state_error = "agent database unavailable; the new skill remains disabled"
+        elif resolved_priority != DEFAULT_PRIORITY:
+            state_error = (
+                "agent database unavailable; requested priority "
+                f"{resolved_priority} could not be persisted; the new skill uses "
+                f"default priority {DEFAULT_PRIORITY}"
+            )
         await self._refresh_locked()
         record = SkillStore.get(self._snapshot, name)
         return {
