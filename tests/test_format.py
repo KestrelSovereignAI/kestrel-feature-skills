@@ -505,11 +505,58 @@ def test_code_span_delimiters_cannot_pair_across_paragraphs(tmp_path):
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+def test_code_span_delimiters_cannot_pair_across_setext_heading(tmp_path):
+    value = SkillDocument(
+        "setext-code-boundary",
+        "Setext heading code boundary",
+        "Heading `\n===\n[outside](../secret.md) `",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "<!--\n`\n-->\n[outside](../secret.md) `",
+        "<script>\n`\ncontent </script>\n[outside](../secret.md) `",
+        "<?instruction\n`\n?>\n[outside](../secret.md) `",
+        "<!DECLARATION\n`\n>\n[outside](../secret.md) `",
+        "<![CDATA[\n`\n]]>\n[outside](../secret.md) `",
+    ),
+)
+def test_code_span_delimiters_cannot_escape_multiline_html_block(tmp_path, body):
+    value = SkillDocument(
+        "html-code-boundary",
+        "HTML block code boundary",
+        body,
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_multiline_code_span_within_one_paragraph_remains_literal(tmp_path):
     value = SkillDocument(
         "multiline-code",
         "Multiline code span",
         "Use `[literal]\n(../example.md)` as a wrapped example.",
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_code_spans_within_setext_heading_and_after_html_remain_literal(tmp_path):
+    value = SkillDocument(
+        "block-code-controls",
+        "Block code span controls",
+        "Heading `[heading](../example.md)`\n===\n\n"
+        "<!-- comment -->\n"
+        "Use `[paragraph](../example.md)` as a literal.",
     )
     folder = write_skill(tmp_path, value)
 

@@ -48,6 +48,8 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-tab-pseudo-fence",
         "kite-cross-paragraph-code",
         "kite-blockquote-tab-link",
+        "kite-setext-code-boundary",
+        "kite-html-code-boundary",
     )
     code_example_name = "kite-code-examples"
     unapproved_install = "permission-sentinel"
@@ -254,6 +256,22 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             '---\nname: "kite-blockquote-tab-link"\n'
             'description: "Blockquote tab-stop escape attempt"\n---\n\n'
             "> \t[outside](../kite-outside.md)\n",
+            encoding="utf-8",
+        )
+        setext_code_folder = root / "kite-setext-code-boundary"
+        setext_code_folder.mkdir()
+        (setext_code_folder / "SKILL.md").write_text(
+            '---\nname: "kite-setext-code-boundary"\n'
+            'description: "Setext code delimiter attempt"\n---\n\n'
+            "Heading `\n===\n[outside](../kite-outside.md) `\n",
+            encoding="utf-8",
+        )
+        html_code_folder = root / "kite-html-code-boundary"
+        html_code_folder.mkdir()
+        (html_code_folder / "SKILL.md").write_text(
+            '---\nname: "kite-html-code-boundary"\n'
+            'description: "HTML code delimiter attempt"\n---\n\n'
+            "<!--\n`\n-->\n[outside](../kite-outside.md) `\n",
             encoding="utf-8",
         )
         code_example_folder = root / code_example_name

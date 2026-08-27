@@ -37,8 +37,12 @@ _MARKDOWN_AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*
 # following line when the pseudo-fence is left open.
 _MARKDOWN_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _MARKDOWN_LIST_PREFIX = re.compile(r"^([ ]{0,3})((?:[-+*]|\d{1,9}[.)]))([ \t]+)")
+_MARKDOWN_SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 _MARKDOWN_NONPARAGRAPH_BLOCK = re.compile(
     r"^(?:#{1,6}(?:[ \t]+|$)|(?:[*_-][ \t]*){3,}$|<[!/?A-Za-z])"
+)
+_MARKDOWN_RAW_HTML_TAG = re.compile(
+    r"^<(script|pre|style|textarea)(?:[ \t]|>|$)", re.IGNORECASE
 )
 _REMOTE_SCHEMES = frozenset({"http", "https", "mailto"})
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
@@ -273,6 +277,35 @@ def _strip_blockquote_prefix(line: str) -> str | None:
     return f"{' ' * retained_indent}{line[index:]}"
 
 
+def _html_block_terminator(line: str) -> tuple[str, bool] | None:
+    """Return the end marker for a CommonMark HTML block opener."""
+
+    if line.startswith("<!--"):
+        return "-->", False
+    if line.startswith("<?"):
+        return "?>", False
+    if line.startswith("<![CDATA["):
+        return "]]>", False
+    if re.match(r"^<![A-Z]", line):
+        return ">", False
+    raw_tag = _MARKDOWN_RAW_HTML_TAG.match(line)
+    if raw_tag is not None:
+        return f"</{raw_tag.group(1)}>", True
+    if re.match(r"^</?[A-Za-z]", line):
+        # CommonMark's block-tag and complete-tag forms end at a blank line.
+        return "", False
+    return None
+
+
+def _html_block_ends(line: str, terminator: tuple[str, bool]) -> bool:
+    marker, case_insensitive = terminator
+    if not marker:
+        return not line.strip()
+    if case_insensitive:
+        return marker.casefold() in line.casefold()
+    return marker in line
+
+
 def _markdown_container_lines(
     body: str,
 ) -> tuple[
@@ -374,6 +407,7 @@ def _mask_markdown_code(body: str) -> str:
     paragraph_open = False
     inline_blocks: list[list[int]] = []
     active_inline_block: int | None = None
+    html_block_terminator: tuple[str, bool] | None = None
     for content, ending, container, continued_container in rows:
         line_length = len(content) + len(ending)
         if fence_character is not None and fence_container is not None:
@@ -392,6 +426,14 @@ def _mask_markdown_code(body: str) -> str:
                 fence_character = None
                 fence_length = 0
                 fence_container = None
+        if fence_character is None and html_block_terminator is not None:
+            in_indented_code = False
+            paragraph_open = False
+            active_inline_block = None
+            if _html_block_ends(content, html_block_terminator):
+                html_block_terminator = None
+            offset += line_length
+            continue
         match = _MARKDOWN_FENCE.match(content)
         if fence_character is None:
             if match:
@@ -445,7 +487,19 @@ def _mask_markdown_code(body: str) -> str:
                 nonparagraph_block = _MARKDOWN_NONPARAGRAPH_BLOCK.match(
                     stripped_content
                 )
-                if reference_definition is not None:
+                setext_underline = bool(
+                    paragraph_open and _MARKDOWN_SETEXT_UNDERLINE.match(content)
+                )
+                opened_html_block = _html_block_terminator(stripped_content)
+                if setext_underline:
+                    paragraph_open = False
+                    active_inline_block = None
+                elif opened_html_block is not None:
+                    if not _html_block_ends(content, opened_html_block):
+                        html_block_terminator = opened_html_block
+                    paragraph_open = False
+                    active_inline_block = None
+                elif reference_definition is not None:
                     paragraph_open = False
                     active_inline_block = None
                 elif nonparagraph_block is not None:
