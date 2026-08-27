@@ -158,7 +158,7 @@ def _load_provenance_at(
         if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
             raise SkillFormatError(f"{PROVENANCE_FILENAME} changed during discovery")
         payload = json.loads(bytes(payload_bytes).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise SkillFormatError(f"invalid {PROVENANCE_FILENAME}: {exc}") from exc
     finally:
         os.close(descriptor)

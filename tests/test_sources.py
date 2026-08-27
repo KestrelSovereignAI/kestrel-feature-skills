@@ -350,6 +350,28 @@ def test_unknown_provenance_metadata_is_visible_error(tmp_path):
     assert "unsupported field" in snapshot.errors[0].error
 
 
+def test_provenance_decoder_value_error_is_quarantined_without_aborting_catalog(
+    tmp_path,
+):
+    local = tmp_path / "local"
+    shared = tmp_path / "shared"
+    local.mkdir()
+    shared.mkdir()
+    make_skill(local, "healthy", "healthy skill")
+    broken = make_skill(local, "bad-provenance-number", "bad provenance")
+    (broken / PROVENANCE_FILENAME).write_text(
+        '{"version":' + "9" * 5000 + "}",
+        encoding="ascii",
+    )
+
+    snapshot = catalog(local, shared).refresh()
+
+    assert [record.name for record in snapshot.records] == ["healthy"]
+    assert len(snapshot.errors) == 1
+    assert snapshot.errors[0].locator == "bad-provenance-number"
+    assert f"invalid {PROVENANCE_FILENAME}" in snapshot.errors[0].error
+
+
 def test_json_escaped_surrogates_are_rejected_in_documents_and_provenance(tmp_path):
     local = tmp_path / "local"
     shared = tmp_path / "shared"

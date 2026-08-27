@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import (
@@ -47,6 +48,17 @@ _DIRECTORY_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_CLOEXEC", 0)
 )
+
+
+@dataclass(frozen=True, slots=True)
+class CreatedSkillPublication:
+    """Inode evidence proving a new folder still has its published contents."""
+
+    folder_identity: tuple[int, int]
+    primary_identity: tuple[int, int]
+    primary_size: int
+    primary_mtime_ns: int
+    primary_ctime_ns: int
 
 
 @contextmanager
@@ -584,7 +596,9 @@ class SkillStore:
         folder, _identity = self.create_pinned(document)
         return folder
 
-    def create_pinned(self, document: SkillDocument) -> tuple[Path, tuple[int, int]]:
+    def create_pinned(
+        self, document: SkillDocument
+    ) -> tuple[Path, CreatedSkillPublication]:
         """Create a skill and retain the inode identity captured at publication."""
 
         name = validate_skill_name(document.name)
@@ -596,67 +610,81 @@ class SkillStore:
             (staged_folder / SKILL_FILENAME).write_bytes(payload)
             validate_skill_folder(staged_folder, source_root=staged_root)
 
-        root_fd = _open_directory(
-            self.local_root,
-            expected=self._local_root_identity,
-        )
         created_identity: tuple[int, int] | None = None
-        try:
-            folder = direct_child(
-                self.local_root,
-                name,
-                root_identity=self._local_root_identity,
-            )
+        with _serialized_skill_mutation(
+            self.local_root,
+            name,
+            root_identity=self._local_root_identity,
+        ) as root_fd:
             try:
-                os.mkdir(name, mode=0o700, dir_fd=root_fd)
-            except FileExistsError as exc:
-                raise SkillConflictError(f"skill already exists: {name}") from exc
-            created_identity = _identity_at(root_fd, name)
-            if created_identity is None:
-                raise SkillPathError("created skill folder vanished before publication")
-            published_identity = created_identity
-            folder_fd = _open_directory_at(
-                root_fd,
-                name,
-                expected=created_identity,
-            )
-            try:
-                _atomic_write_primary_at(
-                    folder_fd,
+                folder = direct_child(
+                    self.local_root,
                     name,
-                    payload,
-                    overwrite=False,
+                    root_identity=self._local_root_identity,
                 )
-                if set(os.listdir(folder_fd)) != {SKILL_FILENAME}:
-                    raise SkillConflictError(
+                try:
+                    os.mkdir(name, mode=0o700, dir_fd=root_fd)
+                except FileExistsError as exc:
+                    raise SkillConflictError(f"skill already exists: {name}") from exc
+                created_identity = _identity_at(root_fd, name)
+                if created_identity is None:
+                    raise SkillPathError(
+                        "created skill folder vanished before publication"
+                    )
+                folder_fd = _open_directory_at(
+                    root_fd,
+                    name,
+                    expected=created_identity,
+                )
+                try:
+                    _atomic_write_primary_at(
+                        folder_fd,
+                        name,
+                        payload,
+                        overwrite=False,
+                    )
+                    if set(os.listdir(folder_fd)) != {SKILL_FILENAME}:
+                        raise SkillConflictError(
+                            "created skill folder changed during publication"
+                        )
+                    primary = os.stat(
+                        SKILL_FILENAME,
+                        dir_fd=folder_fd,
+                        follow_symlinks=False,
+                    )
+                    published = CreatedSkillPublication(
+                        folder_identity=created_identity,
+                        primary_identity=(primary.st_dev, primary.st_ino),
+                        primary_size=primary.st_size,
+                        primary_mtime_ns=primary.st_mtime_ns,
+                        primary_ctime_ns=primary.st_ctime_ns,
+                    )
+                finally:
+                    os.close(folder_fd)
+                if _identity_at(root_fd, name) != created_identity:
+                    raise SkillPathError(
                         "created skill folder changed during publication"
                     )
-            finally:
-                os.close(folder_fd)
-            if _identity_at(root_fd, name) != created_identity:
-                raise SkillPathError("created skill folder changed during publication")
-            verification_fd = _open_directory(
-                self.local_root,
-                expected=self._local_root_identity,
-            )
-            os.close(verification_fd)
-        except BaseException as publication_error:
-            if created_identity is not None:
-                try:
-                    _remove_expected_directory_at(
-                        root_fd,
-                        name,
-                        expected=created_identity,
-                    )
-                except BaseException as cleanup_error:
-                    cleanup_error.add_note(
-                        f"skill creation originally failed: {publication_error}"
-                    )
-                    raise cleanup_error from publication_error
-            raise
-        finally:
-            os.close(root_fd)
-        return folder, published_identity
+                verification_fd = _open_directory(
+                    self.local_root,
+                    expected=self._local_root_identity,
+                )
+                os.close(verification_fd)
+            except BaseException as publication_error:
+                if created_identity is not None:
+                    try:
+                        _remove_expected_directory_at(
+                            root_fd,
+                            name,
+                            expected=created_identity,
+                        )
+                    except BaseException as cleanup_error:
+                        cleanup_error.add_note(
+                            f"skill creation originally failed: {publication_error}"
+                        )
+                        raise cleanup_error from publication_error
+                raise
+        return folder, published
 
     def edit_primary(self, record: SkillRecord, content: str) -> SkillDocument:
         document = parse_skill_markdown(
@@ -704,7 +732,12 @@ class SkillStore:
                 os.close(descriptor)
         return candidate
 
-    def rollback_created(self, folder: Path, *, identity: tuple[int, int]) -> None:
+    def rollback_created(
+        self,
+        folder: Path,
+        *,
+        identity: CreatedSkillPublication | tuple[int, int],
+    ) -> None:
         """Remove this operation's new folder without following a replacement."""
 
         name = validate_skill_name(folder.name)
@@ -713,16 +746,58 @@ class SkillStore:
             raise SkillPathError(
                 "created skill folder changed before persistence rollback"
             )
-        root_fd = _open_directory(
-            self.local_root,
-            expected=self._local_root_identity,
+        folder_identity = (
+            identity.folder_identity
+            if isinstance(identity, CreatedSkillPublication)
+            else identity
         )
-        try:
+        with _serialized_skill_mutation(
+            self.local_root,
+            name,
+            root_identity=self._local_root_identity,
+        ) as root_fd:
             if _identity_at(root_fd, name) is None:
                 return
-            _remove_expected_directory_at(root_fd, name, expected=identity)
-        finally:
-            os.close(root_fd)
+            if isinstance(identity, CreatedSkillPublication):
+                descriptor = _open_directory_at(
+                    root_fd,
+                    name,
+                    expected=folder_identity,
+                )
+                try:
+                    if set(os.listdir(descriptor)) != {SKILL_FILENAME}:
+                        raise SkillPathError(
+                            "created skill contents changed; rollback preserved them"
+                        )
+                    primary = os.stat(
+                        SKILL_FILENAME,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                    observed_primary = (
+                        primary.st_dev,
+                        primary.st_ino,
+                        primary.st_size,
+                        primary.st_mtime_ns,
+                        primary.st_ctime_ns,
+                    )
+                    expected_primary = (
+                        *identity.primary_identity,
+                        identity.primary_size,
+                        identity.primary_mtime_ns,
+                        identity.primary_ctime_ns,
+                    )
+                    if observed_primary != expected_primary:
+                        raise SkillPathError(
+                            "created skill contents changed; rollback preserved them"
+                        )
+                finally:
+                    os.close(descriptor)
+            _remove_expected_directory_at(
+                root_fd,
+                name,
+                expected=folder_identity,
+            )
 
     def read_file(self, record: SkillRecord, relative_path: str) -> str:
         folder = self._require_real_folder(record)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fcntl
+import multiprocessing
 import os
 import shutil
 import threading
@@ -35,6 +37,39 @@ def payload(name="atomic"):
     ).encode("utf-8")
 
 
+def _write_resource_from_separate_process(root, lock_state, result):
+    """Discover and mutate a just-published skill from another process."""
+
+    try:
+        lock_path = Path(root) / ".cross-process-create.mutation.lock"
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock_state.put("blocked")
+            else:
+                lock_state.put("acquired")
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+        store = SkillStore(Path(root))
+        source = DirectorySkillSource(
+            root=store.local_root,
+            source_id="agent-local",
+            kind="agent-local",
+            precedence=0,
+        )
+        records, errors = source.discover()
+        if errors or len(records) != 1:
+            raise AssertionError(f"unexpected discovery result: {records=}, {errors=}")
+        store.write_file(records[0], "notes.md", "Concurrent resource.\n")
+    except Exception as exc:  # noqa: BLE001 - report child failures to parent
+        result.put(("error", f"{type(exc).__name__}: {exc}"))
+    else:
+        result.put(("ok", ""))
+
+
 def test_atomic_create_leaves_no_temporary_or_claim_files(tmp_path):
     root = tmp_path / "skills"
     store = SkillStore(root)
@@ -42,6 +77,70 @@ def test_atomic_create_leaves_no_temporary_or_claim_files(tmp_path):
     assert (folder / "SKILL.md").is_file()
     assert not list(folder.glob(".SKILL.md.tmp.*"))
     assert not (folder / ".SKILL.md.claim").exists()
+
+
+def test_create_serializes_post_publication_validation_across_processes(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    published = threading.Event()
+    release_publication = threading.Event()
+    creation_errors = []
+    real_publish = store_module._atomic_write_primary_at
+
+    def publish_then_pause(*args, **kwargs):
+        real_publish(*args, **kwargs)
+        published.set()
+        assert release_publication.wait(timeout=10)
+
+    def create_skill():
+        try:
+            store.create(
+                SkillDocument(
+                    "cross-process-create",
+                    "Cross-process creation",
+                    "Procedure.",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - asserted in the parent
+            creation_errors.append(exc)
+
+    monkeypatch.setattr(
+        store_module,
+        "_atomic_write_primary_at",
+        publish_then_pause,
+    )
+    creator = threading.Thread(target=create_skill)
+    creator.start()
+    assert published.wait(timeout=10)
+
+    context = multiprocessing.get_context("spawn")
+    lock_state = context.Queue()
+    result = context.Queue()
+    mutator = context.Process(
+        target=_write_resource_from_separate_process,
+        args=(str(root), lock_state, result),
+    )
+    mutator.start()
+    observed_lock_state = lock_state.get(timeout=10)
+
+    release_publication.set()
+    creator.join(timeout=10)
+    mutator.join(timeout=10)
+    if mutator.is_alive():  # pragma: no cover - prevents a leaked test process
+        mutator.terminate()
+        mutator.join(timeout=5)
+        pytest.fail("concurrent mutator did not finish")
+
+    assert observed_lock_state == "blocked"
+    assert creation_errors == []
+    assert result.get(timeout=2) == ("ok", "")
+    folder = root / "cross-process-create"
+    assert (folder / "SKILL.md").is_file()
+    assert (folder / "notes.md").read_text(encoding="utf-8") == (
+        "Concurrent resource.\n"
+    )
 
 
 def test_create_cleans_folder_after_malformed_link_url(tmp_path):

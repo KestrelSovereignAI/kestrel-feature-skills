@@ -50,7 +50,7 @@ from .sources import (
     DirectorySkillSource,
     SkillCatalog,
 )
-from .store import SkillStore
+from .store import CreatedSkillPublication, SkillStore
 
 logger = logging.getLogger(__name__)
 
@@ -568,7 +568,7 @@ class ProceduralSkillsFeature(Feature):
         enablement: SkillEnablementStore,
         folder: Path,
         *,
-        identity: tuple[int, int],
+        identity: CreatedSkillPublication,
         previous_state: SkillState | None,
         publication_error: BaseException,
     ) -> None:

@@ -620,6 +620,57 @@ async def test_create_rollback_preserves_replacement_swapped_after_publication(
 
 
 @pytest.mark.asyncio
+async def test_create_rollback_preserves_concurrent_same_inode_resource(
+    feature, monkeypatch
+):
+    name = "create-rollback-concurrent-resource"
+    enablement_started = asyncio.Event()
+    release_enablement = asyncio.Event()
+    original_set = feature._enablement.set
+
+    async def pause_after_enable_commit(*args, **kwargs):
+        state = await original_set(*args, **kwargs)
+        if kwargs["enabled"] is True:
+            enablement_started.set()
+            await release_enablement.wait()
+            raise DatabaseError("connection lost after enabling commit")
+        return state
+
+    monkeypatch.setattr(feature._enablement, "set", pause_after_enable_commit)
+    creation = asyncio.create_task(
+        feature.skill_create(
+            name,
+            "Concurrent resource must survive rollback",
+            "Procedure.",
+            enabled=True,
+        )
+    )
+    await asyncio.wait_for(enablement_started.wait(), timeout=5)
+
+    source = DirectorySkillSource(
+        root=feature.agent.procedural_skills_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=AGENT_LOCAL_PRECEDENCE,
+    )
+    records, errors = source.discover()
+    assert errors == ()
+    feature._store.write_file(records[0], "notes.md", "Concurrent resource.\n")
+    release_enablement.set()
+
+    result = await creation
+
+    assert result.status is ToolResultStatus.ERROR
+    folder = feature.agent.procedural_skills_root / name
+    assert (folder / "notes.md").read_text(encoding="utf-8") == (
+        "Concurrent resource.\n"
+    )
+    assert name not in await feature._enablement.load()
+    assert feature.snapshot.by_name()[name].state.enabled is False
+    assert "Concurrent resource must survive" not in feature.context_clause_text
+
+
+@pytest.mark.asyncio
 async def test_cancelled_create_drains_enablement_restore_after_publication_failure(
     feature, monkeypatch
 ):
