@@ -152,6 +152,77 @@ def test_git_provenance_sidecar_survives_reload(tmp_path):
     assert record.editable is True
 
 
+def test_provenance_reader_uses_nonblocking_open_across_fifo_swap(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    local.mkdir()
+    folder = make_skill(local, "swapped-provenance", "Swapped provenance")
+    provenance_path = folder / PROVENANCE_FILENAME
+    provenance_path.write_bytes(
+        serialize_provenance(
+            SkillProvenance(
+                kind="git",
+                source_id="https://example.com/skills.git",
+                locator="main:swapped-provenance",
+                revision="a" * 40,
+                remote_url="https://example.com/skills.git",
+            )
+        )
+    )
+    real_open = os.open
+    folder_fd = real_open(
+        folder,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    source = DirectorySkillSource(
+        root=local,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=AGENT_LOCAL_PRECEDENCE,
+    )
+    swapped = False
+    completed = threading.Event()
+    errors = []
+
+    def swap_during_open(name, flags, *args, dir_fd=None, **kwargs):
+        nonlocal swapped
+        if name == PROVENANCE_FILENAME and dir_fd is not None and not swapped:
+            provenance_path.unlink()
+            os.mkfifo(provenance_path)
+            swapped = True
+        return real_open(name, flags, *args, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(sources_module.os, "open", swap_during_open)
+
+    def read_swapped_provenance():
+        try:
+            sources_module._load_provenance_at(
+                source,
+                folder_fd,
+                folder.name,
+            )
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    reader = threading.Thread(target=read_swapped_provenance)
+    reader.start()
+    finished_without_writer = completed.wait(timeout=0.5)
+    if not finished_without_writer:
+        writer = real_open(provenance_path, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(writer)
+    reader.join(timeout=5)
+    os.close(folder_fd)
+
+    assert swapped
+    assert finished_without_writer, "provenance read blocked while opening a FIFO"
+    assert not reader.is_alive()
+    assert len(errors) == 1
+    assert "changed during discovery" in str(errors[0])
+
+
 def test_host_shared_skill_shadows_git_installed_origin(tmp_path):
     local = tmp_path / "local"
     shared = tmp_path / "shared"

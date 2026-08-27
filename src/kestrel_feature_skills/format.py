@@ -22,6 +22,7 @@ MAX_FOLDER_ENTRIES = 512
 MAX_FOLDER_DEPTH = 32
 MAX_FOLDER_BYTES = 2_097_152
 MAX_RESOURCE_PATH_BYTES = 1024
+MAX_MARKDOWN_CONTAINER_DEPTH = 4096
 SKILL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
 _FRONTMATTER_KEYS = frozenset({"name", "description"})
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
@@ -41,7 +42,7 @@ _MARKDOWN_AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*
 # code rather than a fence. Matching tabs here would mask live Markdown on the
 # following line when the pseudo-fence is left open.
 _MARKDOWN_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_MARKDOWN_LIST_PREFIX = re.compile(r"^([ ]{0,3})((?:[-+*]|\d{1,9}[.)]))([ \t]+)")
+_MARKDOWN_LIST_PREFIX = re.compile(r"([ ]{0,3})((?:[-+*]|\d{1,9}[.)]))([ \t]+)")
 _MARKDOWN_SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 _MARKDOWN_NONPARAGRAPH_BLOCK = re.compile(
     r"^(?:#{1,6}(?:[ \t]+|$)|(?:[*_-][ \t]*){3,}$)"
@@ -255,10 +256,24 @@ def _indent_prefix(line: str, required_columns: int) -> int | None:
     return None
 
 
-def _list_marker_prefix(line: str) -> tuple[int, int, str] | None:
+def _leading_indent_columns(line: str) -> int:
+    """Measure leading CommonMark indentation once for container matching."""
+
+    columns = 0
+    for character in line:
+        if character == " ":
+            columns += 1
+        elif character == "\t":
+            columns += 4 - (columns % 4)
+        else:
+            break
+    return columns
+
+
+def _list_marker_prefix(line: str, start: int = 0) -> tuple[int, int, str] | None:
     """Return consumed characters, continuation columns, and marker text."""
 
-    match = _MARKDOWN_LIST_PREFIX.match(line)
+    match = _MARKDOWN_LIST_PREFIX.match(line, start)
     if match is None:
         return None
     marker_end = len(match.group(1)) + len(match.group(2))
@@ -406,6 +421,10 @@ def _analyze_markdown(
         content = raw_content
         while (stripped := _strip_blockquote_prefix(content)) is not None:
             quote_depth += 1
+            if quote_depth > MAX_MARKDOWN_CONTAINER_DEPTH:
+                raise SkillFormatError(
+                    "Markdown container nesting exceeds validation complexity limit"
+                )
             content = stripped
 
         if quote_depth != list_quote_depth:
@@ -424,38 +443,51 @@ def _analyze_markdown(
             )
             content = ""
         else:
+            available_indent = _leading_indent_columns(content)
             for level_index in range(len(list_levels) - 1, -1, -1):
-                prefix = _indent_prefix(content, list_levels[level_index][0])
-                if prefix is None:
+                required_indent = list_levels[level_index][0]
+                if required_indent > available_indent:
                     continue
-                active_level = list_levels[level_index][0]
+                prefix = _indent_prefix(content, required_indent)
+                assert prefix is not None
+                active_level = required_indent
                 retained_levels = list_levels[: level_index + 1]
-                content = content[prefix:]
+                content_offset = prefix
                 break
+            else:
+                content_offset = 0
 
             continued_ids = tuple(item_id for _indent, item_id in retained_levels)
             absolute_indent = active_level or 0
-            while marker := _list_marker_prefix(content):
+            marker_cursor = content_offset
+            paragraph_may_interrupt = paragraph_open
+            while marker := _list_marker_prefix(content, marker_cursor):
                 consumed, continuation_columns, marker_text = marker
-                parent_ids = tuple(item_id for _indent, item_id in retained_levels)
-                parent_container = (quote_depth, parent_ids)
-                interrupts_paragraph = (
-                    paragraph_open and paragraph_container == parent_container
-                )
+                interrupts_paragraph = False
+                if paragraph_may_interrupt:
+                    parent_ids = tuple(item_id for _indent, item_id in retained_levels)
+                    parent_container = (quote_depth, parent_ids)
+                    interrupts_paragraph = paragraph_container == parent_container
                 ordered_start = (
                     int(marker_text[:-1]) if marker_text[0].isdigit() else None
                 )
-                remaining = content[consumed:]
+                remaining_start = marker_cursor + consumed
                 if interrupts_paragraph and (
-                    not remaining.strip()
+                    not content[remaining_start:].strip()
                     or (ordered_start is not None and ordered_start != 1)
                 ):
                     break
+                if quote_depth + len(retained_levels) >= MAX_MARKDOWN_CONTAINER_DEPTH:
+                    raise SkillFormatError(
+                        "Markdown container nesting exceeds validation complexity limit"
+                    )
                 absolute_indent += continuation_columns
                 next_list_id += 1
                 retained_levels.append((absolute_indent, next_list_id))
                 active_level = absolute_indent
-                content = remaining
+                marker_cursor = remaining_start
+                paragraph_may_interrupt = False
+            content = content[marker_cursor:]
 
         list_levels = retained_levels
         final_ids = tuple(item_id for _indent, item_id in retained_levels)

@@ -775,6 +775,11 @@ class ProceduralSkillsFeature(Feature):
     ) -> dict[str, object]:
         store, enablement = self._require_services()
         name = validate_skill_name(name)
+        # Reject arbitrary names before the filesystem-backed claim allocator.
+        # Refresh first so skills published by another process remain eligible;
+        # the second refresh under the claim still closes publication races.
+        await self._refresh_locked()
+        SkillStore.get(self._snapshot, name)
         async with self._publication_state_claim(store, name):
             # A publication or deletion in another feature instance may have
             # completed while this caller waited. Resolve the state mutation

@@ -15,7 +15,11 @@ import kestrel_feature_skills.store as store_module
 from kestrel_feature_skills import ProceduralSkillsFeature
 from kestrel_feature_skills.context import render_context_clause
 from kestrel_feature_skills.enablement import DEFAULT_PRIORITY, MAX_PRIORITY
-from kestrel_feature_skills.errors import GitSourceError, SkillConflictError
+from kestrel_feature_skills.errors import (
+    GitSourceError,
+    SkillConflictError,
+    SkillNotFoundError,
+)
 from kestrel_feature_skills.feature import PROCEDURAL_SKILL_NODE_TYPE
 from kestrel_feature_skills.format import serialize_skill_markdown
 from kestrel_feature_skills.git_source import GitCheckout
@@ -604,6 +608,51 @@ async def test_enable_disable_updates_bootstrap_and_cached_context(feature):
     disabled = await feature.skill_disable("toggle")
     assert disabled.status is ToolResultStatus.OK
     assert feature.context_clause_text == ""
+
+
+@pytest.mark.asyncio
+async def test_unknown_state_update_does_not_create_publication_claim(
+    feature, monkeypatch
+):
+    attempted_claims = []
+    real_acquire = feature._store.try_acquire_publication_state_claim
+
+    def record_claim(name):
+        attempted_claims.append(name)
+        return real_acquire(name)
+
+    monkeypatch.setattr(
+        feature._store,
+        "try_acquire_publication_state_claim",
+        record_claim,
+    )
+
+    with pytest.raises(SkillNotFoundError, match="was not found"):
+        await feature.set_skill_state(name="never-published", enabled=True)
+
+    assert attempted_claims == []
+    assert not (
+        feature.agent.procedural_skills_root / ".never-published.publication-state.lock"
+    ).exists()
+
+
+@pytest.mark.asyncio
+async def test_state_update_refreshes_external_publication_before_precheck(feature):
+    name = "externally-published-state"
+    folder = feature.agent.procedural_skills_root / name
+    folder.mkdir()
+    (folder / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "External publication", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+
+    updated = await feature.set_skill_state(name=name, enabled=True, priority=19)
+
+    assert updated["enabled"] is True
+    assert updated["priority"] == 19
+    assert feature.snapshot.by_name()[name].state == SkillState(True, 19)
 
 
 @pytest.mark.asyncio

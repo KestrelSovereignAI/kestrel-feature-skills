@@ -645,6 +645,57 @@ def test_many_incomplete_inline_links_fail_with_bounded_validation_work(tmp_path
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+def test_deep_list_continuation_bounds_indent_prefix_work(tmp_path, monkeypatch):
+    marker_count = 1024
+    value = SkillDocument(
+        "bounded-list-indent",
+        "Bounded nested list indentation",
+        "- " * marker_count + "item\n" + " " * marker_count + "continuation\n",
+    )
+    folder = write_skill(tmp_path, value)
+    real_indent_prefix = format_module._indent_prefix
+    real_list_marker_prefix = format_module._list_marker_prefix
+    indent_calls = 0
+    marker_offsets = []
+
+    def counted_indent_prefix(line, required_columns):
+        nonlocal indent_calls
+        indent_calls += 1
+        return real_indent_prefix(line, required_columns)
+
+    def recorded_list_marker_prefix(line, start=0):
+        marker_offsets.append(start)
+        return real_list_marker_prefix(line, start)
+
+    monkeypatch.setattr(format_module, "_indent_prefix", counted_indent_prefix)
+    monkeypatch.setattr(
+        format_module,
+        "_list_marker_prefix",
+        recorded_list_marker_prefix,
+    )
+
+    validated = validate_skill_folder(folder, source_root=tmp_path)
+    assert validated == SkillDocument(
+        value.name,
+        value.description,
+        value.body.strip(),
+    )
+    assert indent_calls <= 4, (
+        "list continuation rescanned indentation for each nesting level"
+    )
+    assert max(marker_offsets) >= 2 * (marker_count - 1), (
+        "nested list parsing copied progressively shorter line suffixes"
+    )
+
+
+@pytest.mark.parametrize("marker", ("- ", "> "))
+def test_markdown_container_depth_has_explicit_complexity_limit(marker):
+    body = marker * (format_module.MAX_MARKDOWN_CONTAINER_DEPTH + 1) + "item"
+
+    with pytest.raises(SkillFormatError, match="complexity limit"):
+        format_module._mask_markdown_code(body)
+
+
 def test_regular_file_reader_rejects_fifo_before_open(tmp_path, monkeypatch):
     resource = tmp_path / "resource"
     os.mkfifo(resource)
