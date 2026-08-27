@@ -7,6 +7,8 @@ import pytest
 from kestrel_feature_skills.errors import SkillFormatError, SkillPathError
 from kestrel_feature_skills.format import (
     MAX_DESCRIPTION_BYTES,
+    MAX_FOLDER_DEPTH,
+    MAX_FOLDER_ENTRIES,
     MAX_SKILL_FILE_BYTES,
     parse_skill_markdown,
     serialize_skill_markdown,
@@ -288,6 +290,18 @@ def test_commonmark_entities_cannot_hide_escape_or_executable_scheme(
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+def test_percent_encoded_colon_cannot_turn_a_local_escape_into_remote_url(tmp_path):
+    value = SkillDocument(
+        "encoded-scheme",
+        "Encoded scheme delimiter",
+        "[outside](https%3A/../../outside.md)",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_malformed_link_url_is_a_visible_path_error(tmp_path):
     value = SkillDocument("bad-url", "Bad URL", "[broken](//[invalid)")
     folder = write_skill(tmp_path, value)
@@ -348,4 +362,24 @@ def test_escaped_backtick_does_not_hide_a_live_markdown_link(tmp_path):
     folder = write_skill(tmp_path, value)
 
     with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_directory_only_tree_is_bounded_by_total_entries(tmp_path):
+    folder = write_skill(tmp_path)
+    for index in range(MAX_FOLDER_ENTRIES):
+        (folder / f"empty-{index:03}").mkdir()
+
+    with pytest.raises(SkillFormatError, match="filesystem entries"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_deep_directory_only_tree_is_bounded(tmp_path):
+    folder = write_skill(tmp_path)
+    current = folder
+    for _ in range(MAX_FOLDER_DEPTH + 1):
+        current = current / "d"
+        current.mkdir()
+
+    with pytest.raises(SkillFormatError, match="depth"):
         validate_skill_folder(folder, source_root=tmp_path)

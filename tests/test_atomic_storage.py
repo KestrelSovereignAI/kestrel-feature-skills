@@ -749,6 +749,48 @@ def test_install_copies_resources_then_publishes_primary(tmp_path):
     assert validate_skill_folder(folder, source_root=store.local_root) == document
 
 
+def test_install_rejects_generated_provenance_crossing_file_limit(tmp_path):
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "file-boundary"
+    source.mkdir()
+    document = SkillDocument("file-boundary", "Boundary", "Procedure.")
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(document), encoding="utf-8"
+    )
+    for index in range(MAX_FOLDER_FILES - 1):
+        (source / f"{index:03}.md").write_bytes(b"")
+    store = SkillStore(tmp_path / "local")
+
+    with pytest.raises(SkillFormatError, match="exceeds.*files"):
+        store.install_folder(
+            source,
+            provenance=SkillProvenance("git", "https://example.com/repo.git", "main"),
+        )
+
+    assert not (store.local_root / document.name).exists()
+
+
+def test_install_rejects_generated_provenance_crossing_byte_limit(tmp_path):
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "byte-boundary"
+    source.mkdir()
+    document = SkillDocument("byte-boundary", "Boundary", "Procedure.")
+    primary = serialize_skill_markdown(document).encode("utf-8")
+    (source / "SKILL.md").write_bytes(primary)
+    (source / "padding.md").write_bytes(b"x" * (MAX_FOLDER_BYTES - len(primary)))
+    store = SkillStore(tmp_path / "local")
+
+    with pytest.raises(SkillFormatError, match="exceeds.*bytes"):
+        store.install_folder(
+            source,
+            provenance=SkillProvenance("git", "https://example.com/repo.git", "main"),
+        )
+
+    assert not (store.local_root / document.name).exists()
+
+
 def test_python_edit_is_scoped_to_scripts_and_never_runs(tmp_path):
     store = SkillStore(tmp_path / "skills")
     folder = store.create(SkillDocument("edit", "Edit", "Procedure."))

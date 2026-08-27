@@ -825,9 +825,13 @@ class SkillStore:
             staged_root = Path(temporary).resolve(strict=True)
             staged_folder = staged_root / document.name
             shutil.copytree(source_folder, staged_folder, symlinks=True)
+            provenance_payload = serialize_provenance(provenance)
+            atomic_replace_file(
+                staged_folder / PROVENANCE_FILENAME,
+                provenance_payload,
+            )
             document = validate_skill_folder(staged_folder, source_root=staged_root)
             primary_payload = (staged_folder / SKILL_FILENAME).read_bytes()
-            provenance_payload = serialize_provenance(provenance)
 
             root_fd = _open_directory(
                 self.local_root,

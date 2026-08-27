@@ -7,7 +7,7 @@ import json
 import os
 import re
 import stat
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
 from .errors import SkillFormatError, SkillPathError
@@ -18,6 +18,8 @@ SKILL_FILENAME = "SKILL.md"
 MAX_SKILL_FILE_BYTES = 262_144
 MAX_DESCRIPTION_BYTES = 512
 MAX_FOLDER_FILES = 256
+MAX_FOLDER_ENTRIES = 512
+MAX_FOLDER_DEPTH = 32
 MAX_FOLDER_BYTES = 2_097_152
 SKILL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
 _FRONTMATTER_KEYS = frozenset({"name", "description"})
@@ -332,12 +334,13 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
         raw = _MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", raw)
         if not raw or raw.startswith("#"):
             continue
-        # CommonMark resolves HTML character references in destinations before
-        # interpreting the resulting URI. Validate that rendered value so an
-        # entity cannot hide traversal or an executable scheme.
-        decoded = unquote(html.unescape(raw))
+        # CommonMark resolves HTML character references before URL parsing, but
+        # URL schemes are classified before percent-decoding. Keep those stages
+        # separate so ``https%3A/...`` remains a local path subject to the same
+        # containment checks as every other bundled reference.
+        rendered = html.unescape(raw)
         try:
-            split = urlsplit(decoded)
+            split = urlsplit(rendered)
         except ValueError as exc:
             raise SkillPathError("malformed link URL in SKILL.md") from exc
         if split.scheme:
@@ -346,7 +349,9 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
                     f"unsupported link scheme in SKILL.md: {split.scheme}"
                 )
             continue
-        destinations.append(decoded.split("#", 1)[0].split("?", 1)[0])
+        if split.netloc:
+            raise SkillPathError("network-path links are not bundled skill resources")
+        destinations.append(unquote(split.path))
     return tuple(destinations)
 
 
@@ -366,6 +371,7 @@ def validate_skill_folder(folder: Path, *, source_root: Path) -> SkillDocument:
         raise SkillFormatError("skill candidate is not a directory")
     contained_path(source_root, folder.name)
 
+    entry_count = 0
     file_count = 0
     byte_count = 0
 
@@ -381,6 +387,15 @@ def validate_skill_folder(folder: Path, *, source_root: Path) -> SkillDocument:
         for entry in (*directories, *files):
             path = current_path / entry
             relative = path.relative_to(folder).as_posix()
+            entry_count += 1
+            if entry_count > MAX_FOLDER_ENTRIES:
+                raise SkillFormatError(
+                    f"skill folder exceeds {MAX_FOLDER_ENTRIES} filesystem entries"
+                )
+            if len(PurePosixPath(relative).parts) > MAX_FOLDER_DEPTH:
+                raise SkillFormatError(
+                    f"skill folder exceeds maximum depth {MAX_FOLDER_DEPTH}"
+                )
             _utf8_bytes(relative, label="skill resource path")
             if path.is_symlink():
                 raise SkillPathError(
@@ -416,6 +431,8 @@ def validate_skill_folder(folder: Path, *, source_root: Path) -> SkillDocument:
 __all__ = [
     "MAX_DESCRIPTION_BYTES",
     "MAX_FOLDER_BYTES",
+    "MAX_FOLDER_DEPTH",
+    "MAX_FOLDER_ENTRIES",
     "MAX_FOLDER_FILES",
     "MAX_SKILL_FILE_BYTES",
     "SKILL_FILENAME",

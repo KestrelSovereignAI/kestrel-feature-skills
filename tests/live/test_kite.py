@@ -37,6 +37,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-no-frontmatter",
         "kite-symlink",
         "kite-nested-link",
+        "kite-percent-link",
         "kite-malformed-link",
         "kite-script-autolink",
     )
@@ -145,6 +146,14 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             '---\nname: "kite-nested-link"\n'
             'description: "Nested link escape attempt"\n---\n\n'
             "Read [outer [inner]](../kite-outside.md).\n",
+            encoding="utf-8",
+        )
+        percent_link_folder = root / "kite-percent-link"
+        percent_link_folder.mkdir()
+        (percent_link_folder / "SKILL.md").write_text(
+            '---\nname: "kite-percent-link"\n'
+            'description: "Encoded scheme escape attempt"\n---\n\n'
+            "Read [outside](https%3A/../../kite-outside.md).\n",
             encoding="utf-8",
         )
         malformed_link_folder = root / "kite-malformed-link"
