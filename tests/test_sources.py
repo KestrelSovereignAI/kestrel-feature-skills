@@ -18,6 +18,7 @@ from kestrel_feature_skills.models import SkillDocument, SkillProvenance, SkillS
 from kestrel_feature_skills.sources import (
     AGENT_LOCAL_PRECEDENCE,
     HOST_SHARED_PRECEDENCE,
+    MAX_SOURCE_ENTRIES,
     PROVENANCE_FILENAME,
     REMOTE_PRECEDENCE,
     DirectorySkillSource,
@@ -66,6 +67,52 @@ def test_agent_local_shadows_host_shared_deterministically(tmp_path):
     assert snapshot.records[0].document.description == "local wins"
     assert snapshot.records[0].source_id == "agent-local"
     assert snapshot.shadowed["overlap"][0].source_id == "host-shared"
+
+
+def test_source_discovery_bounds_immediate_entries_before_sorting(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    local.mkdir()
+    names = [f"ordinary-{index:04}" for index in range(MAX_SOURCE_ENTRIES + 1)]
+
+    class FakeEntry:
+        def __init__(self, name):
+            self.name = name
+
+    class FakeScandir:
+        def __enter__(self):
+            def entries():
+                for name in names:
+                    consumed.append(name)
+                    assert len(consumed) <= MAX_SOURCE_ENTRIES + 1
+                    yield FakeEntry(name)
+
+            return entries()
+
+        def __exit__(self, *_args):
+            return False
+
+    consumed = []
+    monkeypatch.setattr(
+        sources_module.os,
+        "listdir",
+        lambda _root_fd: pytest.fail("unbounded os.listdir must not enumerate sources"),
+    )
+    monkeypatch.setattr(sources_module.os, "scandir", lambda _root_fd: FakeScandir())
+    source = DirectorySkillSource(
+        root=local,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=AGENT_LOCAL_PRECEDENCE,
+    )
+
+    records, errors = source.discover()
+
+    assert records == ()
+    assert len(errors) == 1
+    assert "source entry limit" in errors[0].error
+    assert len(consumed) == MAX_SOURCE_ENTRIES + 1
 
 
 @pytest.mark.parametrize(
@@ -374,7 +421,7 @@ def test_discovery_does_not_follow_a_source_root_path_replacement(
     local.mkdir()
     make_skill(local, "trusted", "Trusted original")
     real_iterdir = Path.iterdir
-    real_listdir = os.listdir
+    real_scandir = os.scandir
     swapped = False
 
     def swap_root():
@@ -393,11 +440,11 @@ def test_discovery_does_not_follow_a_source_root_path_replacement(
     def swap_before_descriptor_enumeration(path):
         if isinstance(path, int):
             swap_root()
-        return real_listdir(path)
+        return real_scandir(path)
 
     monkeypatch.setattr(Path, "iterdir", swap_before_path_enumeration)
     monkeypatch.setattr(
-        sources_module.os, "listdir", swap_before_descriptor_enumeration
+        sources_module.os, "scandir", swap_before_descriptor_enumeration
     )
     source = DirectorySkillSource(
         root=local,
@@ -419,17 +466,24 @@ def test_discovery_error_with_non_utf8_locator_remains_json_serializable(
 ):
     local = tmp_path / "local"
     local.mkdir()
-    real_listdir = os.listdir
+    real_scandir = os.scandir
     injected = False
 
-    def fake_listdir(path):
+    class InjectedScandir:
+        def __enter__(self):
+            return iter((type("Entry", (), {"name": "bad-\udcff"})(),))
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_scandir(path):
         nonlocal injected
         if isinstance(path, int) and not injected:
             injected = True
-            return ["bad-\udcff"]
-        return real_listdir(path)
+            return InjectedScandir()
+        return real_scandir(path)
 
-    monkeypatch.setattr(sources_module.os, "listdir", fake_listdir)
+    monkeypatch.setattr(sources_module.os, "scandir", fake_scandir)
     source = DirectorySkillSource(
         root=local,
         source_id="agent-local",

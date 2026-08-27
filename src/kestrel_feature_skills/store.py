@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import fcntl
 import os
 import shutil
@@ -198,13 +200,19 @@ def _lock_claim_at(
     try:
         descriptor = os.open(
             name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
             dir_fd=directory_fd,
         )
     except OSError:
         return None
     try:
         value = os.fstat(descriptor)
+        if not stat.S_ISREG(value.st_mode):
+            os.close(descriptor)
+            return None
         identity = (value.st_dev, value.st_ino)
         if expected is not None and identity != expected:
             os.close(descriptor)
@@ -218,6 +226,57 @@ def _lock_claim_at(
         os.close(descriptor)
         return None
     return descriptor
+
+
+def _rename_directory_no_replace_at(
+    directory_fd: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    """Atomically publish a directory only when its destination is absent."""
+
+    source = os.fsencode(source_name)
+    destination = os.fsencode(destination_name)
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    if hasattr(libc, "renameatx_np"):
+        rename = libc.renameatx_np
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        arguments = (directory_fd, source, directory_fd, destination, 0x00000004)
+    elif hasattr(libc, "renameat2"):
+        rename = libc.renameat2
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        arguments = (directory_fd, source, directory_fd, destination, 0x00000001)
+    else:
+        raise SkillPathError(
+            "atomic no-replace directory publication is unavailable on this platform"
+        )
+
+    ctypes.set_errno(0)
+    if rename(*arguments) == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            destination_name,
+        )
+    raise OSError(error_number, os.strerror(error_number), destination_name)
 
 
 def _unlink_at(directory_fd: int, name: str) -> None:
@@ -778,6 +837,7 @@ class SkillStore:
             staging_name = f".{name}.create.{uuid.uuid4().hex}"
             created_identity: tuple[int, int] | None = None
             cleanup_name = staging_name
+            publication_collision = False
             try:
                 try:
                     os.mkdir(staging_name, mode=0o700, dir_fd=root_fd)
@@ -839,12 +899,11 @@ class SkillStore:
                 os.close(verification_fd)
                 if _identity_at(root_fd, name) is not None:
                     raise SkillConflictError(f"skill already exists: {name}")
-                os.rename(
-                    staging_name,
-                    name,
-                    src_dir_fd=root_fd,
-                    dst_dir_fd=root_fd,
-                )
+                try:
+                    _rename_directory_no_replace_at(root_fd, staging_name, name)
+                except FileExistsError as exc:
+                    publication_collision = True
+                    raise SkillConflictError(f"skill already exists: {name}") from exc
                 cleanup_name = name
                 if _identity_at(root_fd, name) != created_identity:
                     raise SkillPathError(
@@ -873,7 +932,11 @@ class SkillStore:
                             "skill creation cleanup could not confirm removal: "
                             f"{cleanup_error}"
                         ) from cleanup_error
-                if cleanup_name != name and _identity_at(root_fd, name) is not None:
+                if (
+                    cleanup_name != name
+                    and _identity_at(root_fd, name) is not None
+                    and not publication_collision
+                ):
                     raise SkillPublicationCleanupError(
                         "skill creation failed while an unowned same-named folder "
                         "appeared; its removal was not attempted"
@@ -1207,6 +1270,7 @@ class SkillStore:
                 staging_name = f".{document.name}.install.{uuid.uuid4().hex}"
                 created_identity: tuple[int, int] | None = None
                 cleanup_name = staging_name
+                publication_collision = False
                 try:
                     os.mkdir(staging_name, mode=0o700, dir_fd=root_fd)
                 except FileExistsError as exc:
@@ -1288,12 +1352,17 @@ class SkillStore:
                         raise SkillConflictError(
                             f"skill already exists: {document.name}"
                         )
-                    os.rename(
-                        staging_name,
-                        document.name,
-                        src_dir_fd=root_fd,
-                        dst_dir_fd=root_fd,
-                    )
+                    try:
+                        _rename_directory_no_replace_at(
+                            root_fd,
+                            staging_name,
+                            document.name,
+                        )
+                    except FileExistsError as exc:
+                        publication_collision = True
+                        raise SkillConflictError(
+                            f"skill already exists: {document.name}"
+                        ) from exc
                     cleanup_name = document.name
                     if _identity_at(root_fd, document.name) != created_identity:
                         raise SkillPathError(
@@ -1326,6 +1395,7 @@ class SkillStore:
                     if (
                         cleanup_name != document.name
                         and _identity_at(root_fd, document.name) is not None
+                        and not publication_collision
                     ):
                         raise SkillPublicationCleanupError(
                             "skill installation failed while an unowned same-named "

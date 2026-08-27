@@ -27,6 +27,7 @@ PROVENANCE_VERSION = 1
 AGENT_LOCAL_PRECEDENCE = 0
 HOST_SHARED_PRECEDENCE = 100
 REMOTE_PRECEDENCE = 200
+MAX_SOURCE_ENTRIES = 4096
 _PROVENANCE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _PROVENANCE_BOUNDS = {
     "kind": 64,
@@ -67,6 +68,21 @@ _READ_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_CLOEXEC", 0)
 )
+
+
+def _bounded_source_names(root_fd: int) -> list[str]:
+    """Enumerate one source root without materializing unbounded attacker work."""
+
+    names: list[str] = []
+    with os.scandir(root_fd) as entries:
+        for entry in entries:
+            if len(names) >= MAX_SOURCE_ENTRIES:
+                raise SkillFormatError(
+                    f"skill source exceeds source entry limit {MAX_SOURCE_ENTRIES}"
+                )
+            names.append(entry.name)
+    names.sort()
+    return names
 
 
 def _default_provenance(
@@ -268,8 +284,8 @@ class DirectorySkillSource(SkillSource):
         records: list[SkillRecord] = []
         errors: list[DiscoveryError] = []
         try:
-            candidate_names = sorted(os.listdir(root_fd))
-        except OSError as exc:
+            candidate_names = _bounded_source_names(root_fd)
+        except (SkillError, OSError) as exc:
             os.close(root_fd)
             return (), (
                 DiscoveryError(
@@ -418,6 +434,7 @@ class SkillCatalog:
 __all__ = [
     "AGENT_LOCAL_PRECEDENCE",
     "HOST_SHARED_PRECEDENCE",
+    "MAX_SOURCE_ENTRIES",
     "PROVENANCE_FILENAME",
     "REMOTE_PRECEDENCE",
     "DirectorySkillSource",

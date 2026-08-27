@@ -626,6 +626,56 @@ def test_unexpected_claim_inode_is_rejected_before_locking(tmp_path, monkeypatch
     assert lock_operations == []
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO requires POSIX")
+def test_stale_fifo_claim_is_rejected_without_waiting_for_a_writer(
+    tmp_path, monkeypatch
+):
+    claim = tmp_path / ".SKILL.md.claim"
+    os.mkfifo(claim)
+    stale = time.time() - CLAIM_STALENESS_SECONDS - 1
+    os.utime(claim, (stale, stale))
+    claim_stat = claim.stat()
+    expected = (claim_stat.st_dev, claim_stat.st_ino)
+    completed = threading.Event()
+    result = {}
+    lock_operations = []
+    real_flock = store_module.fcntl.flock
+
+    def tracked_flock(descriptor, operation):
+        lock_operations.append(operation)
+        return real_flock(descriptor, operation)
+
+    monkeypatch.setattr(store_module.fcntl, "flock", tracked_flock)
+
+    directory_fd = store_module._open_directory(tmp_path)
+
+    def lock_stale_claim():
+        try:
+            result["descriptor"] = store_module._lock_claim_at(
+                directory_fd,
+                claim.name,
+                expected=expected,
+            )
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=lock_stale_claim)
+    worker.start()
+    completed_without_writer = completed.wait(timeout=0.25)
+    if not completed_without_writer:
+        # Release the buggy blocking open so this regression never strands a
+        # test worker while demonstrating the missing O_NONBLOCK/type guard.
+        unblocker = os.open(claim, os.O_RDWR | getattr(os, "O_NONBLOCK", 0))
+        os.close(unblocker)
+    worker.join(timeout=5)
+    os.close(directory_fd)
+
+    assert not worker.is_alive()
+    assert completed_without_writer, "stale FIFO claim blocked waiting for a writer"
+    assert result["descriptor"] is None
+    assert lock_operations == []
+
+
 def test_active_writer_claim_cannot_be_stolen_during_final_publication(
     tmp_path, monkeypatch
 ):
@@ -1706,6 +1756,57 @@ def test_create_keeps_target_hidden_until_complete(tmp_path, monkeypatch):
     assert observed_write
     assert created == target
     assert (target / "SKILL.md").is_file()
+
+
+@pytest.mark.parametrize("operation", ("create", "install"))
+def test_publication_does_not_replace_raced_empty_destination(
+    tmp_path, monkeypatch, operation
+):
+    name = f"no-replace-{operation}"
+    store = SkillStore(tmp_path / "skills")
+    target = store.local_root / name
+    real_identity = store_module._identity_at
+    target_checks = 0
+    raced_identity = None
+
+    def race_after_absence_check(directory_fd, candidate):
+        nonlocal raced_identity, target_checks
+        identity = real_identity(directory_fd, candidate)
+        if candidate == name and identity is None:
+            target_checks += 1
+            if target_checks == 2:
+                os.mkdir(name, mode=0o700, dir_fd=directory_fd)
+                raced = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                raced_identity = (raced.st_dev, raced.st_ino)
+                return None
+        return identity
+
+    monkeypatch.setattr(store_module, "_identity_at", race_after_absence_check)
+
+    with pytest.raises(SkillConflictError, match="already exists"):
+        if operation == "create":
+            store.create(SkillDocument(name, "No replace create", "Procedure."))
+        else:
+            source_root = tmp_path / "source"
+            source = source_root / name
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_text(
+                serialize_skill_markdown(
+                    SkillDocument(name, "No replace install", "Procedure.")
+                ),
+                encoding="utf-8",
+            )
+            store.install_folder(
+                source,
+                provenance=SkillProvenance(
+                    "git", "https://example.com/repo.git", f"main:{name}"
+                ),
+            )
+
+    assert raced_identity is not None
+    target_stat = target.stat()
+    assert (target_stat.st_dev, target_stat.st_ino) == raced_identity
+    assert list(target.iterdir()) == []
 
 
 def test_hidden_install_orphan_does_not_block_retry(tmp_path):
