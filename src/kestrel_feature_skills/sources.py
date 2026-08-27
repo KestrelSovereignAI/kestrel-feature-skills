@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import stat
 from abc import ABC, abstractmethod
@@ -12,7 +13,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 from .errors import SkillError, SkillFormatError, SkillPathError
-from .format import validate_skill_folder
+from .format import validate_skill_folder_descriptor
 from .models import (
     CatalogSnapshot,
     DiscoveryError,
@@ -54,11 +55,22 @@ class SkillSource(ABC):
         """Return valid records and visible rejections."""
 
 
-def _default_provenance(source: DirectorySkillSource, folder: Path) -> SkillProvenance:
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+
+
+def _default_provenance(
+    source: DirectorySkillSource, folder_name: str
+) -> SkillProvenance:
     return SkillProvenance(
         kind=source.kind,
         source_id=source.source_id,
-        locator=folder.name,
+        locator=folder_name,
     )
 
 
@@ -102,18 +114,54 @@ def _validated_provenance(provenance: SkillProvenance) -> SkillProvenance:
     )
 
 
-def _load_provenance(source: DirectorySkillSource, folder: Path) -> SkillProvenance:
-    metadata = folder / PROVENANCE_FILENAME
-    if not metadata.exists():
-        return _default_provenance(source, folder)
-    if metadata.is_symlink() or not metadata.is_file():
+def _load_provenance_at(
+    source: DirectorySkillSource,
+    folder_fd: int,
+    folder_name: str,
+) -> SkillProvenance:
+    try:
+        before = os.stat(
+            PROVENANCE_FILENAME,
+            dir_fd=folder_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return _default_provenance(source, folder_name)
+    except OSError as exc:
+        raise SkillFormatError(f"could not inspect {PROVENANCE_FILENAME}") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         raise SkillFormatError(f"{PROVENANCE_FILENAME} must be a regular file")
-    if metadata.stat().st_size > 16_384:
+    if before.st_size > 16_384:
         raise SkillFormatError(f"{PROVENANCE_FILENAME} exceeds 16384 bytes")
     try:
-        payload = json.loads(metadata.read_text(encoding="utf-8"))
+        descriptor = os.open(PROVENANCE_FILENAME, _READ_FLAGS, dir_fd=folder_fd)
+    except OSError as exc:
+        raise SkillFormatError(f"could not read {PROVENANCE_FILENAME}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            before.st_dev,
+            before.st_ino,
+        ):
+            raise SkillFormatError(f"{PROVENANCE_FILENAME} changed during discovery")
+        if opened.st_size > 16_384:
+            raise SkillFormatError(f"{PROVENANCE_FILENAME} exceeds 16384 bytes")
+        payload_bytes = bytearray()
+        while len(payload_bytes) <= 16_384:
+            chunk = os.read(descriptor, min(16_385 - len(payload_bytes), 16_384))
+            if not chunk:
+                break
+            payload_bytes.extend(chunk)
+        if len(payload_bytes) > 16_384:
+            raise SkillFormatError(f"{PROVENANCE_FILENAME} exceeds 16384 bytes")
+        after = os.fstat(descriptor)
+        if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+            raise SkillFormatError(f"{PROVENANCE_FILENAME} changed during discovery")
+        payload = json.loads(bytes(payload_bytes).decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SkillFormatError(f"invalid {PROVENANCE_FILENAME}: {exc}") from exc
+    finally:
+        os.close(descriptor)
     if not isinstance(payload, dict) or payload.get("version") != PROVENANCE_VERSION:
         raise SkillFormatError(f"{PROVENANCE_FILENAME} has an unsupported version")
     allowed = {"version", "kind", "source_id", "locator", "revision", "remote_url"}
@@ -153,6 +201,7 @@ class DirectorySkillSource(SkillSource):
     def discover(self) -> tuple[tuple[SkillRecord, ...], tuple[DiscoveryError, ...]]:
         if not self.root.exists():
             return (), ()
+        root_fd: int | None = None
         try:
             root_before = self.root.lstat()
             root_identity = (root_before.st_dev, root_before.st_ino)
@@ -163,14 +212,19 @@ class DirectorySkillSource(SkillSource):
                     "skill source root must be a real directory, not a symlink"
                 )
             root_resolved = self.root.resolve(strict=True)
+            root_fd = os.open(self.root, _DIRECTORY_FLAGS)
+            opened_root = os.fstat(root_fd)
             root_after = self.root.lstat()
             if (
                 stat.S_ISLNK(root_after.st_mode)
                 or not stat.S_ISDIR(root_after.st_mode)
                 or (root_after.st_dev, root_after.st_ino) != root_identity
+                or (opened_root.st_dev, opened_root.st_ino) != root_identity
             ):
                 raise SkillPathError("skill source root changed during discovery")
         except (SkillError, OSError) as exc:
+            if root_fd is not None:
+                os.close(root_fd)
             error = DiscoveryError(
                 source_id=_json_safe_text(self.source_id),
                 locator=_json_safe_text(self.root),
@@ -180,8 +234,9 @@ class DirectorySkillSource(SkillSource):
         records: list[SkillRecord] = []
         errors: list[DiscoveryError] = []
         try:
-            candidates = sorted(self.root.iterdir(), key=lambda path: path.name)
+            candidate_names = sorted(os.listdir(root_fd))
         except OSError as exc:
+            os.close(root_fd)
             return (), (
                 DiscoveryError(
                     source_id=_json_safe_text(self.source_id),
@@ -189,66 +244,91 @@ class DirectorySkillSource(SkillSource):
                     error=_json_safe_text(f"could not enumerate source: {exc}"),
                 ),
             )
-        for folder in candidates:
-            if folder.name.startswith("."):
-                continue
-            if not folder.is_dir() and not folder.is_symlink():
-                continue
-            try:
-                before = folder.lstat()
-                before_identity = (before.st_dev, before.st_ino)
-                document = validate_skill_folder(folder, source_root=self.root)
-                provenance = _load_provenance(self, folder)
-                resolved_folder = folder.resolve(strict=True)
-                lexical_after = folder.lstat()
-                lexical_identity = (lexical_after.st_dev, lexical_after.st_ino)
-                if (
-                    stat.S_ISLNK(lexical_after.st_mode)
-                    or lexical_identity != before_identity
-                ):
-                    raise SkillPathError(
-                        "skill folder changed identity during discovery"
-                    )
+        try:
+            for folder_name in candidate_names:
+                if folder_name.startswith("."):
+                    continue
+                folder_fd: int | None = None
                 try:
-                    resolved_folder.relative_to(root_resolved)
-                except ValueError as exc:
-                    raise SkillPathError(
-                        "skill folder escaped its configured source during discovery"
-                    ) from exc
-                after = resolved_folder.lstat()
-                folder_identity = (after.st_dev, after.st_ino)
-                if folder_identity != before_identity:
-                    raise SkillFormatError(
-                        "skill folder changed identity during discovery"
+                    before = os.stat(
+                        folder_name,
+                        dir_fd=root_fd,
+                        follow_symlinks=False,
                     )
-            except (SkillError, OSError) as exc:
-                errors.append(
-                    DiscoveryError(
-                        source_id=_json_safe_text(self.source_id),
-                        locator=_json_safe_text(folder.name),
-                        error=_json_safe_text(exc),
+                    if not stat.S_ISDIR(before.st_mode) and not stat.S_ISLNK(
+                        before.st_mode
+                    ):
+                        continue
+                    before_identity = (before.st_dev, before.st_ino)
+                    folder_fd = os.open(folder_name, _DIRECTORY_FLAGS, dir_fd=root_fd)
+                    opened = os.fstat(folder_fd)
+                    folder_identity = (opened.st_dev, opened.st_ino)
+                    if (
+                        not stat.S_ISDIR(opened.st_mode)
+                        or folder_identity != before_identity
+                    ):
+                        raise SkillPathError(
+                            "skill folder changed identity during discovery"
+                        )
+                    document = validate_skill_folder_descriptor(
+                        folder_fd,
+                        folder_name=folder_name,
+                    )
+                    provenance = _load_provenance_at(
+                        self,
+                        folder_fd,
+                        folder_name,
+                    )
+                    lexical_after = os.stat(
+                        folder_name,
+                        dir_fd=root_fd,
+                        follow_symlinks=False,
+                    )
+                    root_after = self.root.lstat()
+                    if (
+                        stat.S_ISLNK(lexical_after.st_mode)
+                        or (lexical_after.st_dev, lexical_after.st_ino)
+                        != folder_identity
+                        or stat.S_ISLNK(root_after.st_mode)
+                        or (root_after.st_dev, root_after.st_ino) != root_identity
+                    ):
+                        raise SkillPathError(
+                            "skill source or folder changed identity during discovery"
+                        )
+                    resolved_folder = root_resolved / folder_name
+                except (SkillError, OSError) as exc:
+                    errors.append(
+                        DiscoveryError(
+                            source_id=_json_safe_text(self.source_id),
+                            locator=_json_safe_text(folder_name),
+                            error=_json_safe_text(exc),
+                        )
+                    )
+                    continue
+                finally:
+                    if folder_fd is not None:
+                        os.close(folder_fd)
+                records.append(
+                    SkillRecord(
+                        document=document,
+                        folder=resolved_folder,
+                        source_id=(
+                            provenance.source_id
+                            if provenance.kind == "git"
+                            else self.source_id
+                        ),
+                        source_kind=self.kind,
+                        precedence=(
+                            REMOTE_PRECEDENCE
+                            if provenance.kind == "git"
+                            else self.precedence
+                        ),
+                        provenance=provenance,
+                        folder_identity=folder_identity,
                     )
                 )
-                continue
-            records.append(
-                SkillRecord(
-                    document=document,
-                    folder=resolved_folder,
-                    source_id=(
-                        provenance.source_id
-                        if provenance.kind == "git"
-                        else self.source_id
-                    ),
-                    source_kind=self.kind,
-                    precedence=(
-                        REMOTE_PRECEDENCE
-                        if provenance.kind == "git"
-                        else self.precedence
-                    ),
-                    provenance=provenance,
-                    folder_identity=folder_identity,
-                )
-            )
+        finally:
+            os.close(root_fd)
         return tuple(records), tuple(errors)
 
 

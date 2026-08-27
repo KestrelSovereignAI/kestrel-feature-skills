@@ -18,6 +18,12 @@ from kestrel_feature_skills.feature import PROCEDURAL_SKILL_NODE_TYPE
 from kestrel_feature_skills.format import serialize_skill_markdown
 from kestrel_feature_skills.git_source import GitCheckout
 from kestrel_feature_skills.models import SkillDocument, SkillState
+from kestrel_feature_skills.sources import (
+    AGENT_LOCAL_PRECEDENCE,
+    HOST_SHARED_PRECEDENCE,
+    DirectorySkillSource,
+    SkillCatalog,
+)
 
 EXPECTED_TOOLS = {
     "skill_list",
@@ -503,10 +509,13 @@ async def test_cancelled_create_never_publishes_against_stale_enabled_state(
     await feature.refresh()
 
     entered_state_write = asyncio.Event()
+    original_set = feature._enablement.set
 
-    async def paused_state_write(*_args, **_kwargs):
-        entered_state_write.set()
-        await asyncio.Event().wait()
+    async def paused_state_write(*args, **kwargs):
+        if kwargs["enabled"] is False:
+            entered_state_write.set()
+            await asyncio.Event().wait()
+        return await original_set(*args, **kwargs)
 
     monkeypatch.setattr(feature._enablement, "set", paused_state_write)
     creation = asyncio.create_task(
@@ -685,6 +694,136 @@ async def test_delete_reports_partial_after_authoritative_folder_removal(
     assert result.data["removed_file"] is True
     assert result.data["graph_deleted"] is False
     assert "graph index cleanup failed" in result.error
+
+
+@pytest.mark.asyncio
+async def test_delete_failure_cannot_enable_a_same_named_shared_fallback(
+    feature, tmp_path, monkeypatch
+):
+    name = "shadowed-delete"
+    shared_root = tmp_path / "shared"
+    shared_folder = shared_root / name
+    shared_folder.mkdir(parents=True)
+    (shared_folder / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Unapproved shared fallback", "Shared procedure")
+        ),
+        encoding="utf-8",
+    )
+    feature._catalog = SkillCatalog(
+        (
+            DirectorySkillSource(
+                root=feature.agent.procedural_skills_root,
+                source_id="agent-local",
+                kind="agent-local",
+                precedence=AGENT_LOCAL_PRECEDENCE,
+            ),
+            DirectorySkillSource(
+                root=shared_root,
+                source_id="host-shared",
+                kind="host-shared",
+                precedence=HOST_SHARED_PRECEDENCE,
+            ),
+        )
+    )
+    await feature.skill_create(name, "Approved local skill", "Local procedure")
+    await feature.skill_enable(name, priority=13)
+
+    async def fail_delete(_name):
+        raise DatabaseError("database cleanup offline")
+
+    monkeypatch.setattr(feature._enablement, "delete", fail_delete)
+    result = await feature.skill_delete(name)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    fallback = feature.snapshot.by_name()[name]
+    assert fallback.source_kind == "host-shared"
+    assert fallback.state.enabled is False
+    assert "Unapproved shared fallback" not in feature.context_clause_text
+
+
+@pytest.mark.asyncio
+async def test_failed_folder_removal_retains_disabled_tombstone(feature, monkeypatch):
+    name = "failed-folder-delete"
+    await feature.skill_create(name, "Must not remain enabled", "Procedure")
+    await feature.skill_enable(name, priority=23)
+
+    def fail_removal(_record):
+        raise OSError("recursive removal failed")
+
+    monkeypatch.setattr(feature._store, "delete", fail_removal)
+    result = await feature.skill_delete(name)
+
+    assert result.status is ToolResultStatus.ERROR
+    assert (await feature._enablement.load())[name] == SkillState(False, 23)
+    assert feature.snapshot.by_name()[name].state == SkillState(False, 23)
+    assert "Must not remain enabled" not in feature.context_clause_text
+
+
+@pytest.mark.asyncio
+async def test_cancelled_disabled_guard_restores_enabled_shared_state(
+    feature, tmp_path, monkeypatch
+):
+    name = "cancelled-local-override"
+    shared_root = tmp_path / "shared-cancelled"
+    shared_folder = shared_root / name
+    shared_folder.mkdir(parents=True)
+    (shared_folder / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Approved shared skill", "Shared procedure")
+        ),
+        encoding="utf-8",
+    )
+    feature._catalog = SkillCatalog(
+        (
+            DirectorySkillSource(
+                root=feature.agent.procedural_skills_root,
+                source_id="agent-local",
+                kind="agent-local",
+                precedence=AGENT_LOCAL_PRECEDENCE,
+            ),
+            DirectorySkillSource(
+                root=shared_root,
+                source_id="host-shared",
+                kind="host-shared",
+                precedence=HOST_SHARED_PRECEDENCE,
+            ),
+        )
+    )
+    await feature._enablement.set(name, enabled=True, priority=17)
+    await feature.refresh()
+    original_set = feature._enablement.set
+    guard_committed = asyncio.Event()
+    release_guard = asyncio.Event()
+
+    async def commit_guard_then_pause(*args, **kwargs):
+        state = await original_set(*args, **kwargs)
+        if kwargs["enabled"] is False:
+            guard_committed.set()
+            await release_guard.wait()
+        return state
+
+    monkeypatch.setattr(feature._enablement, "set", commit_guard_then_pause)
+    creation = asyncio.create_task(
+        feature.create_skill(
+            name=name,
+            description="Cancelled local replacement",
+            body="Local procedure",
+        )
+    )
+    await asyncio.wait_for(guard_committed.wait(), timeout=5)
+    creation.cancel()
+    release_guard.set()
+    with pytest.raises(asyncio.CancelledError):
+        await creation
+
+    persisted = (await feature._enablement.load())[name]
+    assert persisted == SkillState(True, 17)
+    assert not (feature.agent.procedural_skills_root / name).exists()
+    resolved = feature.snapshot.by_name()[name]
+    assert resolved.source_kind == "host-shared"
+    assert resolved.state == SkillState(True, 17)
+    assert "Approved shared skill" in feature.context_clause_text
 
 
 @pytest.mark.asyncio

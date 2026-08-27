@@ -38,6 +38,14 @@ _MARKDOWN_NONPARAGRAPH_BLOCK = re.compile(
     r"^(?:#{1,6}(?:[ \t]+|$)|(?:[*_-][ \t]*){3,}$|<[!/?A-Za-z])"
 )
 _REMOTE_SCHEMES = frozenset({"http", "https", "mailto"})
+_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 
 
 def _utf8_bytes(value: str, *, label: str) -> bytes:
@@ -545,6 +553,178 @@ def validate_document_references(document: SkillDocument, folder: Path) -> None:
         contained_path(folder, destination, must_exist=True)
 
 
+def _direct_relative_parts(relative: str) -> tuple[str, ...]:
+    if not isinstance(relative, str) or not relative or "\x00" in relative:
+        raise SkillPathError("path must be a non-empty string without NUL bytes")
+    if "\\" in relative or relative.startswith("/") or _WINDOWS_DRIVE.match(relative):
+        raise SkillPathError("absolute and backslash paths are not allowed")
+    pure = PurePosixPath(relative)
+    if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+        raise SkillPathError("path traversal is not allowed")
+    return pure.parts
+
+
+def _open_pinned_directory_at(
+    parent_fd: int,
+    name: str,
+    *,
+    expected: tuple[int, int] | None = None,
+) -> int:
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:
+        raise SkillPathError("skill directory changed during validation") from exc
+    opened = os.fstat(descriptor)
+    identity = (opened.st_dev, opened.st_ino)
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISDIR(before.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or identity != (before.st_dev, before.st_ino)
+        or (expected is not None and identity != expected)
+    ):
+        os.close(descriptor)
+        raise SkillPathError("skill directory changed during validation")
+    return descriptor
+
+
+def _read_regular_file_at(directory_fd: int, name: str, *, max_bytes: int) -> bytes:
+    try:
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        descriptor = os.open(name, _READ_FLAGS, dir_fd=directory_fd)
+    except OSError as exc:
+        raise SkillFormatError(f"could not read regular file: {name}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise SkillPathError(f"skill resources must be regular files: {name}")
+        payload = bytearray()
+        while len(payload) <= max_bytes:
+            chunk = os.read(descriptor, min(65_536, max_bytes + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > max_bytes:
+            raise SkillFormatError(f"{name} exceeds {max_bytes} bytes")
+        after = os.fstat(descriptor)
+        if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+            raise SkillPathError(f"skill resource changed during validation: {name}")
+        return bytes(payload)
+    finally:
+        os.close(descriptor)
+
+
+def _validate_reference_at(folder_fd: int, relative: str) -> None:
+    descriptor = os.dup(folder_fd)
+    try:
+        parts = _direct_relative_parts(relative)
+        for index, part in enumerate(parts):
+            try:
+                value = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError as exc:
+                raise SkillPathError(f"path does not exist: {relative}") from exc
+            except OSError as exc:
+                raise SkillPathError(
+                    f"could not inspect skill path: {relative}"
+                ) from exc
+            if stat.S_ISLNK(value.st_mode):
+                raise SkillPathError("path escapes the skill folder")
+            if index == len(parts) - 1:
+                return
+            if not stat.S_ISDIR(value.st_mode):
+                raise SkillPathError(f"path does not exist: {relative}")
+            child = _open_pinned_directory_at(
+                descriptor,
+                part,
+                expected=(value.st_dev, value.st_ino),
+            )
+            os.close(descriptor)
+            descriptor = child
+    finally:
+        os.close(descriptor)
+
+
+def validate_skill_folder_descriptor(
+    folder_fd: int,
+    *,
+    folder_name: str,
+) -> SkillDocument:
+    """Validate a skill entirely through an already-pinned folder descriptor."""
+
+    entry_count = 0
+    file_count = 0
+    byte_count = 0
+
+    def scan(directory_fd: int, parents: tuple[str, ...]) -> None:
+        nonlocal entry_count, file_count, byte_count
+        try:
+            names = os.listdir(directory_fd)
+        except OSError as exc:
+            raise SkillFormatError("could not scan the complete skill folder") from exc
+        for name in names:
+            relative_parts = (*parents, name)
+            relative = PurePosixPath(*relative_parts).as_posix()
+            entry_count += 1
+            if entry_count > MAX_FOLDER_ENTRIES:
+                raise SkillFormatError(
+                    f"skill folder exceeds {MAX_FOLDER_ENTRIES} filesystem entries"
+                )
+            if len(relative_parts) > MAX_FOLDER_DEPTH:
+                raise SkillFormatError(
+                    f"skill folder exceeds maximum depth {MAX_FOLDER_DEPTH}"
+                )
+            _utf8_bytes(relative, label="skill resource path")
+            try:
+                value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise SkillFormatError(
+                    "could not scan the complete skill folder"
+                ) from exc
+            if stat.S_ISLNK(value.st_mode):
+                raise SkillPathError(
+                    f"symlinks are not allowed in skill folders: {name}"
+                )
+            if stat.S_ISDIR(value.st_mode):
+                child = _open_pinned_directory_at(
+                    directory_fd,
+                    name,
+                    expected=(value.st_dev, value.st_ino),
+                )
+                try:
+                    scan(child, relative_parts)
+                finally:
+                    os.close(child)
+                continue
+            if not stat.S_ISREG(value.st_mode):
+                raise SkillPathError(f"skill resources must be regular files: {name}")
+            file_count += 1
+            byte_count += value.st_size
+            if file_count > MAX_FOLDER_FILES:
+                raise SkillFormatError(f"skill folder exceeds {MAX_FOLDER_FILES} files")
+            if byte_count > MAX_FOLDER_BYTES:
+                raise SkillFormatError(f"skill folder exceeds {MAX_FOLDER_BYTES} bytes")
+
+    scan(folder_fd, ())
+    primary = _read_regular_file_at(
+        folder_fd,
+        SKILL_FILENAME,
+        max_bytes=MAX_SKILL_FILE_BYTES,
+    )
+    document = parse_skill_markdown(primary, source=f"{folder_name}/{SKILL_FILENAME}")
+    if document.name != folder_name:
+        raise SkillFormatError(
+            f"frontmatter name {document.name!r} must match folder name {folder_name!r}"
+        )
+    for destination in _local_markdown_destinations(document.body):
+        _validate_reference_at(folder_fd, destination)
+    return document
+
+
 def validate_skill_folder(folder: Path, *, source_root: Path) -> SkillDocument:
     """Validate the complete folder, including links and every symlink escape."""
 
@@ -623,5 +803,6 @@ __all__ = [
     "serialize_skill_markdown",
     "validate_document_references",
     "validate_skill_folder",
+    "validate_skill_folder_descriptor",
     "validate_skill_name",
 ]

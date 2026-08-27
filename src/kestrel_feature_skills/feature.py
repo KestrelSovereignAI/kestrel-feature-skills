@@ -407,6 +407,17 @@ class ProceduralSkillsFeature(Feature):
                 )
                 raise refresh_error from operation_error
 
+    @staticmethod
+    async def _drain_shielded_task(worker: asyncio.Task):
+        """Wait for owned cleanup work even if the caller is cancelled again."""
+
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+        return worker.result()
+
     def _record_payload(
         self, record: SkillRecord, included: set[str]
     ) -> dict[str, object]:
@@ -590,17 +601,35 @@ class ProceduralSkillsFeature(Feature):
         except DatabaseError as exc:
             self._enablement_error = str(exc)
             raise
+        guard = asyncio.create_task(
+            enablement.set(name, enabled=False, priority=priority)
+        )
         try:
-            state = await enablement.set(name, enabled=False, priority=priority)
-        except DatabaseError as exc:
-            self._enablement_error = str(exc)
-            await self._restore_enablement_after_publication_failure(
-                enablement,
-                name,
-                previous_state,
-                exc,
-                operation=operation,
+            state = await asyncio.shield(guard)
+        except BaseException as guard_error:
+            if isinstance(guard_error, DatabaseError):
+                self._enablement_error = str(guard_error)
+            # The write may have committed immediately before an exception or
+            # caller cancellation. Drain it, then restore the prior row through
+            # independently owned cleanup before propagating the original error.
+            if not guard.done():
+                guard.cancel()
+            try:
+                await self._drain_shielded_task(guard)
+            except BaseException as drain_error:  # noqa: BLE001 - cleanup owns task
+                guard_error.add_note(
+                    f"disabled-state guard completion also reported: {drain_error}"
+                )
+            restoration = asyncio.create_task(
+                self._restore_enablement_after_publication_failure(
+                    enablement,
+                    name,
+                    previous_state,
+                    guard_error,
+                    operation=operation,
+                )
             )
+            await self._drain_shielded_task(restoration)
             raise
         return previous_state, state
 
@@ -679,7 +708,26 @@ class ProceduralSkillsFeature(Feature):
         store, enablement = self._require_services()
         record = SkillStore.get(self._snapshot, name)
         node_id = self._node_id(name)
-        store.delete(record)
+        store.require_local_record(record)
+        if enablement.available:
+            _previous_state, disabled_state = await self._prepare_disabled_state(
+                enablement,
+                name,
+                priority=record.state.priority,
+                operation="skill delete disabled-state preparation",
+            )
+            self._states[name] = disabled_state
+        try:
+            store.delete(record)
+        except BaseException as deletion_error:
+            # A failed recursive removal can leave the original only under a
+            # quarantine name. Retaining the disabled tombstone is the only
+            # fail-safe result when folder cleanup cannot be confirmed.
+            if enablement.available:
+                deletion_error.add_note(
+                    "the skill was disabled before deletion and remains disabled"
+                )
+            raise
         config_deleted = True
         graph_deleted = True
         errors: list[str] = []

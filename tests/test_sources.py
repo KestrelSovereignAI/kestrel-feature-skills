@@ -6,7 +6,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -181,19 +180,24 @@ def test_discovery_rejects_folder_moved_outside_root_then_replaced_by_symlink(
     outside.mkdir()
     folder = make_skill(local, "raced", "Race containment")
     moved = outside / folder.name
-    real_validate = sources_module.validate_skill_folder
+    real_validate = sources_module.validate_skill_folder_descriptor
     swapped = False
 
-    def validate_then_swap(candidate, *, source_root):
+    def validate_then_swap(descriptor, *, folder_name):
         nonlocal swapped
-        document = real_validate(candidate, source_root=source_root)
-        if candidate == folder and not swapped:
+        document = real_validate(descriptor, folder_name=folder_name)
+        if folder_name == folder.name and not swapped:
+            candidate = local / folder_name
             candidate.rename(moved)
             candidate.symlink_to(moved, target_is_directory=True)
             swapped = True
         return document
 
-    monkeypatch.setattr(sources_module, "validate_skill_folder", validate_then_swap)
+    monkeypatch.setattr(
+        sources_module,
+        "validate_skill_folder_descriptor",
+        validate_then_swap,
+    )
 
     snapshot = catalog(local, shared).refresh()
 
@@ -231,29 +235,70 @@ def test_source_root_disappearing_during_resolution_is_a_visible_error(
     assert "source root" in errors[0].error
 
 
+def test_discovery_does_not_follow_a_source_root_path_replacement(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    displaced = tmp_path / "displaced-local"
+    local.mkdir()
+    make_skill(local, "trusted", "Trusted original")
+    real_iterdir = Path.iterdir
+    real_listdir = os.listdir
+    swapped = False
+
+    def swap_root():
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            local.rename(displaced)
+            local.mkdir()
+            make_skill(local, "attacker", "Untrusted replacement")
+
+    def swap_before_path_enumeration(path):
+        if path == local:
+            swap_root()
+        return real_iterdir(path)
+
+    def swap_before_descriptor_enumeration(path):
+        if isinstance(path, int):
+            swap_root()
+        return real_listdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", swap_before_path_enumeration)
+    monkeypatch.setattr(
+        sources_module.os, "listdir", swap_before_descriptor_enumeration
+    )
+    source = DirectorySkillSource(
+        root=local,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=AGENT_LOCAL_PRECEDENCE,
+    )
+
+    records, errors = source.discover()
+
+    assert swapped
+    assert records == ()
+    assert len(errors) == 1
+    assert "source" in errors[0].error and "changed" in errors[0].error
+
+
 def test_discovery_error_with_non_utf8_locator_remains_json_serializable(
     tmp_path, monkeypatch
 ):
     local = tmp_path / "local"
     local.mkdir()
-    malformed = SimpleNamespace(
-        name="bad-\udcff",
-        is_dir=lambda: True,
-        is_symlink=lambda: False,
-        lstat=lambda: SimpleNamespace(st_dev=1, st_ino=2),
-    )
-    real_iterdir = Path.iterdir
+    real_listdir = os.listdir
+    injected = False
 
-    def fake_iterdir(path):
-        if path == local:
-            return iter((malformed,))
-        return real_iterdir(path)
+    def fake_listdir(path):
+        nonlocal injected
+        if isinstance(path, int) and not injected:
+            injected = True
+            return ["bad-\udcff"]
+        return real_listdir(path)
 
-    def reject_candidate(candidate, *, source_root):
-        raise sources_module.SkillFormatError(f"invalid folder {candidate.name}")
-
-    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
-    monkeypatch.setattr(sources_module, "validate_skill_folder", reject_candidate)
+    monkeypatch.setattr(sources_module.os, "listdir", fake_listdir)
     source = DirectorySkillSource(
         root=local,
         source_id="agent-local",
@@ -267,7 +312,6 @@ def test_discovery_error_with_non_utf8_locator_remains_json_serializable(
     assert records == ()
     assert len(errors) == 1
     assert errors[0].locator == "bad-\\udcff"
-    assert "invalid folder bad-\\udcff" in errors[0].error
     json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
@@ -406,6 +450,8 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
         if argv[0] == "clone":
             make_skill(target / "skills", "remote", "Remote default branch")
             return ""
+        if "ls-tree" in argv:
+            return f"100644 blob {'b' * 40} 128\tskills/remote/SKILL.md\x00"
         return "a" * 40
 
     monkeypatch.setattr(git_source_module, "_run_git", fake_git)
@@ -427,7 +473,14 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
     assert size_limit_root == target
     assert max_bytes is not None and 0 < max_bytes <= 64 * 1024 * 1024
     assert max_entries is not None and 512 < max_entries <= 8192
-    sparse, sparse_root, sparse_max, sparse_entries = commands[1]
+    preflight, preflight_root, preflight_max, preflight_entries = commands[1]
+    assert preflight[:4] == ["-C", str(target), "ls-tree", "-r"]
+    assert (preflight_root, preflight_max, preflight_entries) == (
+        size_limit_root,
+        max_bytes,
+        max_entries,
+    )
+    sparse, sparse_root, sparse_max, sparse_entries = commands[2]
     assert sparse[:5] == [
         "-C",
         str(target),
@@ -441,7 +494,7 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
         max_bytes,
         max_entries,
     )
-    checkout_command, checkout_root, checkout_max, checkout_entries = commands[2]
+    checkout_command, checkout_root, checkout_max, checkout_entries = commands[3]
     assert checkout_command == [
         "-C",
         str(target),
@@ -455,6 +508,38 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
         max_entries,
     )
     assert checkout.ref == "HEAD"
+
+
+def test_git_checkout_rejects_oversized_sparse_blob_before_materialization(
+    tmp_path, monkeypatch
+):
+    commands = []
+
+    def fake_git(argv, **_kwargs):
+        commands.append(argv)
+        if "ls-tree" in argv:
+            return (
+                "100644 blob "
+                f"{'a' * 40} {git_source_module.MAX_GIT_TRANSFER_BYTES + 1}"
+                "\tremote/huge.bin\x00"
+            )
+        if "rev-parse" in argv:
+            return "b" * 40
+        return ""
+
+    monkeypatch.setattr(git_source_module, "_run_git", fake_git)
+
+    with pytest.raises(GitSourceError, match="transfer limit"):
+        GitSkillSource().checkout(
+            url="https://example.com/skills.git",
+            ref="main",
+            skill_name="remote",
+            target=tmp_path / "checkout",
+        )
+
+    assert not any(
+        "checkout" in command and "--detach" in command for command in commands
+    )
 
 
 def test_git_runner_rejects_a_checkout_that_crosses_its_disk_bound(tmp_path):

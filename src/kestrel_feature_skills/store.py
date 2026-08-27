@@ -1011,6 +1011,11 @@ class SkillStore:
                 expected=expected_identity,
             )
 
+    def require_local_record(self, record: SkillRecord) -> None:
+        """Fail before persistent side effects when a record is not mutable here."""
+
+        self._require_local(record)
+
     @staticmethod
     def search(snapshot: CatalogSnapshot, query: str) -> tuple[SkillRecord, ...]:
         if not isinstance(query, str) or not query.strip():

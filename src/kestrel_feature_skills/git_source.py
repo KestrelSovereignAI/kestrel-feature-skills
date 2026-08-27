@@ -167,6 +167,52 @@ def _read_git_output(handle: BinaryIO) -> str:
     return payload.decode("utf-8", errors="replace")
 
 
+def _validate_sparse_tree_listing(listing: str) -> None:
+    """Reject a sparse tree whose logical checkout cannot fit the hard bounds."""
+
+    total_bytes = 0
+    total_entries = 0
+    for raw_entry in listing.split("\x00"):
+        if not raw_entry:
+            continue
+        try:
+            metadata, path = raw_entry.split("\t", 1)
+            mode, object_type, object_id, size_text = metadata.split()
+        except ValueError as exc:
+            raise GitSourceError(
+                "git source returned malformed sparse tree metadata"
+            ) from exc
+        if (
+            not re.fullmatch(r"[0-7]{6}", mode)
+            or not _COMMIT_RE.fullmatch(object_id)
+            or not path
+        ):
+            raise GitSourceError("git source returned malformed sparse tree metadata")
+        total_entries += 1
+        if total_entries > MAX_GIT_TRANSFER_ENTRIES:
+            raise GitSourceError(
+                f"git source exceeded the transfer entry limit of {MAX_GIT_TRANSFER_ENTRIES}"
+            )
+        if object_type == "blob":
+            try:
+                size = int(size_text)
+            except ValueError as exc:
+                raise GitSourceError(
+                    "git source returned malformed sparse blob metadata"
+                ) from exc
+            if size < 0:
+                raise GitSourceError(
+                    "git source returned malformed sparse blob metadata"
+                )
+            total_bytes += size
+            if total_bytes > MAX_GIT_TRANSFER_BYTES:
+                raise GitSourceError(
+                    f"git source exceeded the {MAX_GIT_TRANSFER_BYTES}-byte transfer limit"
+                )
+        elif object_type not in {"tree", "commit"} or size_text != "-":
+            raise GitSourceError("git source returned malformed sparse tree metadata")
+
+
 def _run_git(
     argv: list[str],
     *,
@@ -310,6 +356,26 @@ class GitSkillSource:
             max_entries=MAX_GIT_TRANSFER_ENTRIES,
             cancel_event=cancel_event,
         )
+        sparse_listing = _run_git(
+            [
+                "-C",
+                str(target),
+                "ls-tree",
+                "-r",
+                "-t",
+                "-l",
+                "-z",
+                "HEAD",
+                "--",
+                skill_name,
+                f"skills/{skill_name}",
+            ],
+            size_limit_root=target,
+            max_bytes=MAX_GIT_TRANSFER_BYTES,
+            max_entries=MAX_GIT_TRANSFER_ENTRIES,
+            cancel_event=cancel_event,
+        )
+        _validate_sparse_tree_listing(sparse_listing)
         sparse_paths = [f"/{skill_name}/", f"/skills/{skill_name}/"]
         _run_git(
             [
