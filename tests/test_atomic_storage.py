@@ -285,15 +285,27 @@ def test_stale_claim_is_reclaimed(tmp_path):
     assert not claim.exists()
 
 
-def test_two_edits_serialize_on_same_claim(tmp_path):
+def test_two_edits_serialize_on_same_claim(tmp_path, monkeypatch):
     folder = tmp_path / "atomic"
     folder.mkdir()
     atomic_write_primary(folder, payload(), overwrite=False)
-    barrier = threading.Barrier(2, timeout=5)
+    import kestrel_feature_skills.store as module
+
+    claim_created = threading.Event()
+    release_claim = threading.Event()
     results = []
+    real_link = os.link
+
+    def hold_first_claim(source, destination, **kwargs):
+        result = real_link(source, destination, **kwargs)
+        if Path(destination).name == ".SKILL.md.claim":
+            claim_created.set()
+            assert release_claim.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(module.os, "link", hold_first_claim)
 
     def writer(index):
-        barrier.wait()
         try:
             value = serialize_skill_markdown(
                 SkillDocument("atomic", f"writer {index}", f"body {index}")
@@ -303,11 +315,22 @@ def test_two_edits_serialize_on_same_claim(tmp_path):
         except SkillConflictError:
             results.append("lost")
 
-    threads = [threading.Thread(target=writer, args=(index,)) for index in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=10)
+    winner = threading.Thread(target=writer, args=(0,))
+    loser = threading.Thread(target=writer, args=(1,))
+    winner.start()
+    try:
+        assert claim_created.wait(timeout=5)
+        loser.start()
+        loser.join(timeout=5)
+        assert not loser.is_alive()
+        assert results == ["lost"]
+    finally:
+        release_claim.set()
+        winner.join(timeout=10)
+        if loser.ident is not None:
+            loser.join(timeout=10)
+    assert not winner.is_alive()
+    assert not loser.is_alive()
     assert sorted(results) == ["lost", "won"]
     assert validate_skill_folder(folder, source_root=tmp_path).description.startswith(
         "writer"
