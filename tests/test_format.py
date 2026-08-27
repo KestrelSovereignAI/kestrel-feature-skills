@@ -272,6 +272,91 @@ def test_reference_definitions_inside_container_fences_remain_literal(tmp_path):
     assert validate_skill_folder(folder, source_root=tmp_path) == value
 
 
+def test_live_link_after_unclosed_blockquote_fence_is_validated(tmp_path):
+    value = SkillDocument(
+        "quote-fence-exit",
+        "Blockquote fence exit",
+        "> ```markdown\n> literal example\n\n[outside](../secret.md)",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_live_link_after_unclosed_list_fence_is_validated(tmp_path):
+    value = SkillDocument(
+        "list-fence-exit",
+        "List fence exit",
+        "- ```markdown\n  literal example\n\n[outside](../secret.md)",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "> ```markdown\n> literal example\n[literal](../example.md)",
+        "- ```markdown\n  literal example\n[literal](../example.md)",
+        "- ```markdown\n  literal example\n  - [literal](../example.md)",
+    ),
+)
+def test_lazy_container_lines_inside_unclosed_fence_remain_literal(tmp_path, body):
+    value = SkillDocument("lazy-fence", "Lazy fence continuation", body)
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_new_list_item_ends_unclosed_fence_and_validates_live_link(tmp_path):
+    value = SkillDocument(
+        "sibling-fence",
+        "Sibling list fence",
+        "- ```markdown\n  literal example\n- [outside](../secret.md)",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_reference_definition_in_ordered_list_continuation_is_validated(tmp_path):
+    value = SkillDocument(
+        "list-reference",
+        "Ordered list reference",
+        "10. [outside][target]\n\n    [target]: ../secret.md",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_link_example_inside_indented_code_block_is_literal(tmp_path):
+    value = SkillDocument(
+        "indented-code",
+        "Indented code link",
+        "Example:\n\n    [literal](../example.md)",
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_link_example_inside_list_indented_code_block_is_literal(tmp_path):
+    value = SkillDocument(
+        "list-indented-code",
+        "List indented code link",
+        "- Example:\n\n      [literal](../example.md)",
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
 def test_symlink_file_escape_rejected(tmp_path):
     outside = tmp_path / "outside.md"
     outside.write_text("secret", encoding="utf-8")

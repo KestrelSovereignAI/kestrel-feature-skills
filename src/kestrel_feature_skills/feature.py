@@ -202,6 +202,22 @@ class ProceduralSkillsFeature(Feature):
             self._ensure_persistent_services()
             return await self._refresh_locked()
 
+    async def ensure_catalog_ready(self) -> bool:
+        """Lazily rehydrate read services after persistent privacy returns."""
+
+        async with optional_transition_lock(_privacy_transition_lock(self.agent)):
+            if self._privacy_hidden():
+                self._hide_persistent_state()
+                return False
+            needs_refresh = any(
+                service is None
+                for service in (self._store, self._catalog, self._enablement)
+            )
+            self._ensure_persistent_services()
+            if needs_refresh:
+                await self._refresh_locked()
+            return True
+
     async def _refresh_locked(self) -> CatalogSnapshot:
         if self._catalog is None or self._enablement is None:
             raise RuntimeError("ProceduralSkillsFeature is not initialized")
@@ -343,7 +359,13 @@ class ProceduralSkillsFeature(Feature):
     async def _persistent_mutation(self):
         async with optional_transition_lock(_privacy_transition_lock(self.agent)):
             self._require_persistent_access()
+            needs_refresh = any(
+                service is None
+                for service in (self._store, self._catalog, self._enablement)
+            )
             self._ensure_persistent_services()
+            if needs_refresh:
+                await self._refresh_locked()
             yield
 
     def _record_payload(
@@ -894,7 +916,11 @@ class ProceduralSkillsFeature(Feature):
         command_prefix="!skill list",
     )
     async def skill_list(self) -> ToolResult:
-        payload = self.catalog_payload()
+        try:
+            await self.ensure_catalog_ready()
+            payload = self.catalog_payload()
+        except (SkillError, OSError, DatabaseError, RuntimeError) as exc:
+            return ToolResult.failed(str(exc))
         names = [item["name"] for item in payload["skills"]]  # type: ignore[index]
         confirmation = (
             f"{len(names)} procedural skill(s): {', '.join(names)}"
@@ -911,6 +937,7 @@ class ProceduralSkillsFeature(Feature):
     )
     async def skill_read(self, name: str, path: str = SKILL_FILENAME) -> ToolResult:
         try:
+            await self.ensure_catalog_ready()
             inventory = self.read_skill(name=name)
             if path == SKILL_FILENAME:
                 payload = inventory
@@ -930,7 +957,7 @@ class ProceduralSkillsFeature(Feature):
                     f"Read procedural skill resource {name}/{path} as text; "
                     f"no code was executed:\n{payload['content']}"
                 )
-        except SkillError as exc:
+        except (SkillError, OSError, DatabaseError, RuntimeError) as exc:
             return ToolResult.failed(str(exc))
         return ToolResult.ok(confirmation, data=payload)
 
@@ -942,8 +969,9 @@ class ProceduralSkillsFeature(Feature):
     )
     async def skill_search(self, query: str) -> ToolResult:
         try:
+            await self.ensure_catalog_ready()
             matches = SkillStore.search(self.snapshot, query)
-        except SkillError as exc:
+        except (SkillError, OSError, DatabaseError, RuntimeError) as exc:
             return ToolResult.failed(str(exc))
         rows = [
             self._record_payload(record, set(self._context_render.included))

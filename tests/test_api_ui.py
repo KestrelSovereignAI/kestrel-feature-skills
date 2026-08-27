@@ -5,6 +5,7 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi import FastAPI
+from kestrel_sovereign.privacy import PrivacyConfig
 
 
 @pytest.fixture
@@ -169,6 +170,31 @@ async def test_reload_discovers_folder_without_restart(client, feature):
 
 
 @pytest.mark.asyncio
+async def test_catalog_route_rehydrates_after_persistent_privacy_returns(
+    client, feature
+):
+    await client.post(
+        "/api/procedural-skills",
+        json={"name": "privacy-ui", "description": "Privacy UI", "body": "body"},
+    )
+    feature.agent.privacy_config = PrivacyConfig(storage="none")
+    await feature.refresh()
+    assert (await client.get("/api/procedural-skills")).json()["count"] == 0
+
+    feature.agent.privacy_config = PrivacyConfig(storage="full")
+
+    catalog = await client.get("/api/procedural-skills")
+    opened = await client.get(
+        "/api/procedural-skills/privacy-ui/file",
+        params={"path": "SKILL.md"},
+    )
+    assert catalog.status_code == 200
+    assert catalog.json()["skills"][0]["name"] == "privacy-ui"
+    assert opened.status_code == 200
+    assert "Privacy UI" in opened.json()["content"]
+
+
+@pytest.mark.asyncio
 async def test_state_endpoint_changes_context_breakdown(client):
     await client.post(
         "/api/procedural-skills",
@@ -192,6 +218,17 @@ async def test_state_endpoint_changes_context_breakdown(client):
         json={"enabled": False},
     )
     assert (await client.get("/api/procedural-skills")).json()["context"]["text"] == ""
+
+
+@pytest.mark.asyncio
+async def test_state_endpoint_maps_invalid_skill_name_to_422(client):
+    response = await client.patch(
+        "/api/procedural-skills/INVALID!/state",
+        json={"enabled": True},
+    )
+
+    assert response.status_code == 422
+    assert "skill name" in response.json()["detail"]
 
 
 @pytest.mark.asyncio

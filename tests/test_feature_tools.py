@@ -134,6 +134,44 @@ async def test_transition_to_volatile_mode_blocks_every_persistent_mutation(
 
 
 @pytest.mark.asyncio
+async def test_read_tools_rehydrate_after_returning_to_persistent_privacy(feature):
+    await feature.skill_create("privacy-return", "Privacy return", "Persistent body")
+    await feature.skill_enable("privacy-return", priority=7)
+    feature.agent._privacy_transition_lock = asyncio.Lock()
+    feature.agent.privacy_config = PrivacyConfig(storage="none")
+    await feature.refresh()
+    assert feature._store is None
+    assert (await feature.skill_list()).data["count"] == 0
+
+    feature.agent.privacy_config = PrivacyConfig(storage="full")
+
+    listed = await feature.skill_list()
+    read = await feature.skill_read("privacy-return")
+    searched = await feature.skill_search("privacy return")
+    assert listed.data["count"] == 1
+    assert listed.data["skills"][0]["enabled"] is True
+    assert read.status is ToolResultStatus.OK
+    assert read.data["body"] == "Persistent body"
+    assert searched.data["count"] == 1
+    assert feature.context_clause_text
+
+
+@pytest.mark.asyncio
+async def test_mutation_rehydrates_after_returning_to_persistent_privacy(feature):
+    await feature.skill_create("privacy-mutation", "Privacy mutation", "Body")
+    await feature.skill_enable("privacy-mutation", priority=7)
+    feature.agent._privacy_transition_lock = asyncio.Lock()
+    feature.agent.privacy_config = PrivacyConfig(storage="none")
+    await feature.refresh()
+    feature.agent.privacy_config = PrivacyConfig(storage="full")
+
+    disabled = await feature.skill_disable("privacy-mutation")
+
+    assert disabled.status is ToolResultStatus.OK
+    assert disabled.data["enabled"] is False
+
+
+@pytest.mark.asyncio
 async def test_privacy_transition_waits_for_in_flight_persistent_mutation(
     feature, monkeypatch
 ):

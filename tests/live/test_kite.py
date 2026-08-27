@@ -42,6 +42,9 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-script-autolink",
         "kite-container-link",
         "kite-literal-separator",
+        "kite-fence-exit",
+        "kite-list-reference",
+        "kite-sibling-fence",
     )
     code_example_name = "kite-code-examples"
     unapproved_install = "permission-sentinel"
@@ -202,6 +205,30 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             "before\x0bafter\n",
             encoding="utf-8",
         )
+        fence_exit_folder = root / "kite-fence-exit"
+        fence_exit_folder.mkdir()
+        (fence_exit_folder / "SKILL.md").write_text(
+            '---\nname: "kite-fence-exit"\n'
+            'description: "Fence container escape attempt"\n---\n\n'
+            "> ```markdown\n> literal\n\n[outside](../kite-outside.md)\n",
+            encoding="utf-8",
+        )
+        list_reference_folder = root / "kite-list-reference"
+        list_reference_folder.mkdir()
+        (list_reference_folder / "SKILL.md").write_text(
+            '---\nname: "kite-list-reference"\n'
+            'description: "List continuation escape attempt"\n---\n\n'
+            "10. [outside][target]\n\n    [target]: ../kite-outside.md\n",
+            encoding="utf-8",
+        )
+        sibling_fence_folder = root / "kite-sibling-fence"
+        sibling_fence_folder.mkdir()
+        (sibling_fence_folder / "SKILL.md").write_text(
+            '---\nname: "kite-sibling-fence"\n'
+            'description: "Sibling item fence escape attempt"\n---\n\n'
+            "- ```markdown\n  literal\n- [outside](../kite-outside.md)\n",
+            encoding="utf-8",
+        )
         code_example_folder = root / code_example_name
         code_example_folder.mkdir()
         (code_example_folder / "SKILL.md").write_text(
@@ -209,7 +236,9 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             'description: "Markdown code examples"\n---\n\n'
             "Use `[inline](missing-inline.md)` when documenting a link.\n\n"
             "```markdown\n[fenced](missing-fenced.md)\n```\n\n"
-            "> ```markdown\n> [bad]: javascript:alert(1)\n> [click][bad]\n> ````\n",
+            "> ```markdown\n> [bad]: javascript:alert(1)\n> [click][bad]\n> ````\n"
+            "Indented code stays literal:\n\n    [indented](missing-indented.md)\n\n"
+            "> ```markdown\n> literal\n[lazy](missing-lazy.md)\n",
             encoding="utf-8",
         )
 
@@ -221,6 +250,12 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         discovered = {skill["name"] for skill in payload["skills"]}
         assert {name, code_example_name} <= discovered
         assert all(rejected_name not in discovered for rejected_name in rejected_names)
+
+        invalid_state = client.patch(
+            f"{base}/INVALID!/state",
+            json={"enabled": True},
+        )
+        assert invalid_state.status_code == 422, invalid_state.text
 
         disabled = client.patch(
             f"{base}/{name}/state",
