@@ -89,6 +89,10 @@ class CatalogSnapshot:
     records: tuple[SkillRecord, ...] = ()
     errors: tuple[DiscoveryError, ...] = ()
     shadowed: Mapping[str, tuple[SkillProvenance, ...]] = field(default_factory=dict)
+    shadowed_records: Mapping[str, tuple[SkillRecord, ...]] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
     def by_name(self) -> dict[str, SkillRecord]:
         return {record.name: record for record in self.records}

@@ -1632,6 +1632,106 @@ def test_install_rollback_preserves_a_changed_publication(tmp_path):
     assert (folder / "notes.md").read_text(encoding="utf-8") == (
         "changed after publication"
     )
+    assert not tuple(store.local_root.glob(".rollback-install.delete.*"))
+
+
+def test_install_rollback_quarantines_before_comparing_publication(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "rollback-race-source"
+    source = source_root / "rollback-race-install"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("rollback-race-install", "Remote", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+    (source / "notes.md").write_text("published", encoding="utf-8")
+    store = SkillStore(tmp_path / "rollback-race-local")
+    folder, publication = store.install_folder_pinned(
+        source,
+        provenance=SkillProvenance(
+            "git", "https://example.com/repo.git", "main:rollback-race-install"
+        ),
+    )
+    inspected = False
+    real_inspect = store_module._inspect_child_at
+    real_quarantine = store_module._quarantine_directory_at
+
+    def observe_inspection(*args, **kwargs):
+        nonlocal inspected
+        inspected = True
+        return real_inspect(*args, **kwargs)
+
+    def require_detached_before_inspection(*args, **kwargs):
+        assert not inspected, (
+            "rollback compared the live publication before detaching it, leaving "
+            "a time-of-check/time-of-delete window for direct filesystem edits"
+        )
+        return real_quarantine(*args, **kwargs)
+
+    monkeypatch.setattr(store_module, "_inspect_child_at", observe_inspection)
+    monkeypatch.setattr(
+        store_module, "_quarantine_directory_at", require_detached_before_inspection
+    )
+
+    store.rollback_installed(folder, identity=publication)
+
+    assert not folder.exists()
+
+
+def test_install_rollback_preserves_changed_quarantine_and_raced_replacement(
+    tmp_path, monkeypatch
+):
+    name = "rollback-restore-race"
+    source = tmp_path / "rollback-restore-source" / name
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(SkillDocument(name, "Remote", "Procedure.")),
+        encoding="utf-8",
+    )
+    (source / "notes.md").write_text("published", encoding="utf-8")
+    store = SkillStore(tmp_path / "rollback-restore-local")
+    folder, publication = store.install_folder_pinned(
+        source,
+        provenance=SkillProvenance(
+            "git", "https://example.com/repo.git", f"main:{name}"
+        ),
+    )
+    real_inspect = store_module._inspect_child_at
+    replacement_marker = folder / "replacement.md"
+
+    def change_quarantine_and_republish(root_fd, child_name, **kwargs):
+        quarantined = store.local_root / child_name
+        (quarantined / "notes.md").write_text(
+            "changed while detached", encoding="utf-8"
+        )
+        folder.mkdir()
+        replacement_marker.write_text("replacement", encoding="utf-8")
+        (folder / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(name, "Raced replacement", "Different procedure.")
+            ),
+            encoding="utf-8",
+        )
+        return real_inspect(root_fd, child_name, **kwargs)
+
+    monkeypatch.setattr(
+        store_module,
+        "_inspect_child_at",
+        change_quarantine_and_republish,
+    )
+
+    with pytest.raises(SkillPathError, match="contents changed"):
+        store.rollback_installed(folder, identity=publication)
+
+    assert replacement_marker.read_text(encoding="utf-8") == "replacement"
+    quarantines = list(store.local_root.glob(f".{name}.delete.*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "notes.md").read_text(encoding="utf-8") == (
+        "changed while detached"
+    )
 
 
 def test_install_rejects_generated_provenance_crossing_file_limit(tmp_path):
@@ -1654,6 +1754,36 @@ def test_install_rejects_generated_provenance_crossing_file_limit(tmp_path):
         )
 
     assert not (store.local_root / document.name).exists()
+
+
+def test_created_publication_rollback_removes_only_unchanged_contents(tmp_path):
+    store = SkillStore(tmp_path / "created-rollback-local")
+    document = SkillDocument("created-rollback", "Created", "Procedure.")
+    folder, publication = store.create_pinned(document)
+
+    store.rollback_created(folder, identity=publication)
+
+    assert not folder.exists()
+
+
+def test_created_publication_rollback_restores_changed_contents(tmp_path):
+    store = SkillStore(tmp_path / "changed-created-rollback-local")
+    document = SkillDocument(
+        "changed-created-rollback",
+        "Created",
+        "Procedure.",
+    )
+    folder, publication = store.create_pinned(document)
+    marker = folder / "operator-note.md"
+    marker.write_text("must survive", encoding="utf-8")
+
+    with pytest.raises(SkillPathError, match="contents changed"):
+        store.rollback_created(folder, identity=publication)
+
+    assert marker.read_text(encoding="utf-8") == "must survive"
+    assert not tuple(
+        store.local_root.glob(".changed-created-rollback.delete.*")
+    )
 
 
 def test_install_rejects_generated_provenance_crossing_byte_limit(tmp_path):

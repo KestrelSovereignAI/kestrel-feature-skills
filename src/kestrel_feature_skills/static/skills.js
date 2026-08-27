@@ -193,7 +193,7 @@ function buildDeleteDialog() {
     if (!name) return;
     const agent = currentAgent();
     try {
-      await request(`/${encodeURIComponent(name)}`, {
+      const result = await request(`/${encodeURIComponent(name)}`, {
         method: 'DELETE',
         headers: { 'X-Kestrel-Allow-Destructive': 'operator-confirmed-ui' },
       });
@@ -201,7 +201,11 @@ function buildDeleteDialog() {
       dialog.close('approved');
       clearSelection();
       await loadCatalog();
-      if (currentAgent() === agent) setStatus(`Deleted ${name}.`);
+      if (currentAgent() === agent) {
+        setStatus(result.resolved_skill_retained
+          ? `Deleted the local installation for ${name}; ${result.remaining_source_kind} remains resolved.`
+          : `Deleted ${name}.`);
+      }
     } catch (error) {
       if (currentAgent() === agent) setStatus(detail(error), true);
     }
@@ -349,7 +353,7 @@ function renderSkillControls(skill) {
   const savePriority = button('Set priority', () => setEnabled(skill, skill.enabled, Number(priority.value)));
   savePriority.dataset.stateControl = 'true';
   const remove = button('Delete', () => confirmDelete(skill), 'skills-button skills-danger');
-  remove.disabled = !skill.editable;
+  remove.disabled = !skill.deletable;
   state.ui.controls.replaceChildren(toggle, priority, savePriority, remove);
   setStateControlsDisabled(Boolean(state.stateUpdateOwner));
 }
@@ -521,7 +525,7 @@ async function setEnabled(skill, enabled, priority = null) {
 }
 
 function confirmDelete(skill) {
-  if (!skill.editable || !state.ui) return;
+  if (!skill.deletable || !state.ui) return;
   state.ui.deleteDialog.dataset.skill = skill.name;
   state.ui.deleteDialog.showModal();
 }

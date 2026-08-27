@@ -400,6 +400,7 @@ class SkillCatalog:
         candidates: list[SkillRecord] = []
         errors: list[DiscoveryError] = []
         shadowed: dict[str, list[SkillProvenance]] = {}
+        shadowed_records: dict[str, list[SkillRecord]] = {}
         for source in self.sources:
             records, source_errors = source.discover()
             errors.extend(source_errors)
@@ -415,6 +416,7 @@ class SkillCatalog:
                 resolved[record.name] = configured
             else:
                 shadowed.setdefault(record.name, []).append(record.provenance)
+                shadowed_records.setdefault(record.name, []).append(configured)
         ordered = tuple(
             sorted(
                 resolved.values(),
@@ -424,10 +426,14 @@ class SkillCatalog:
         immutable_shadowed = MappingProxyType(
             {name: tuple(values) for name, values in sorted(shadowed.items())}
         )
+        immutable_shadowed_records = MappingProxyType(
+            {name: tuple(values) for name, values in sorted(shadowed_records.items())}
+        )
         return CatalogSnapshot(
             records=ordered,
             errors=tuple(errors),
             shadowed=immutable_shadowed,
+            shadowed_records=immutable_shadowed_records,
         )
 
 

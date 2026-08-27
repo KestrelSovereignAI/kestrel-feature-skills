@@ -291,6 +291,8 @@ def test_host_shared_skill_shadows_git_installed_origin(tmp_path):
     assert snapshot.records[0].document.description == "host wins"
     assert snapshot.records[0].source_id == "host-shared"
     assert snapshot.shadowed["overlap"] == (provenance,)
+    assert snapshot.shadowed_records["overlap"][0].folder == remote
+    assert snapshot.shadowed_records["overlap"][0].provenance == provenance
 
 
 def test_malformed_folder_is_reported_not_loaded(tmp_path):

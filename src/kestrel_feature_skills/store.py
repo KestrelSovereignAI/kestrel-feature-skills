@@ -638,6 +638,21 @@ def _remove_expected_directory_at(
     """Remove exactly one pinned child, preserving any raced replacement."""
 
     quarantine = _quarantine_directory_at(root_fd, name, expected=expected)
+    _remove_quarantined_directory_at(
+        root_fd,
+        quarantine,
+        expected=expected,
+    )
+
+
+def _remove_quarantined_directory_at(
+    root_fd: int,
+    quarantine: str,
+    *,
+    expected: tuple[int, int],
+) -> None:
+    """Recursively remove one already-detached and inode-pinned directory."""
+
     descriptor: int | None = None
     try:
         # Pin the quarantined inode before traversing it. Resolving the
@@ -665,6 +680,37 @@ def _remove_expected_directory_at(
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def _restore_quarantined_directory_at(
+    root_fd: int,
+    quarantine: str,
+    name: str,
+    *,
+    expected: tuple[int, int],
+) -> None:
+    """Restore preserved rollback data without overwriting a raced replacement."""
+
+    if _identity_at(root_fd, quarantine) != expected:
+        raise SkillPathError(
+            "quarantined skill folder changed while rollback inspected it; "
+            f"remaining data is preserved as {quarantine}"
+        )
+    try:
+        _rename_directory_no_replace_at(
+            root_fd,
+            quarantine,
+            name,
+        )
+    except FileExistsError as exc:
+        raise SkillPathError(
+            "skill name was republished while rollback inspected its prior data; "
+            f"the prior data is preserved as {quarantine}"
+        ) from exc
+    if _identity_at(root_fd, name) != expected:
+        raise SkillPathError(
+            "restored skill folder changed identity after rollback inspection"
+        )
 
 
 def _open_parent_at(
@@ -880,12 +926,16 @@ def _inspect_child_at(
     name: str,
     *,
     expected: tuple[int, int] | None,
+    folder_name: str | None = None,
 ) -> ValidatedSkillFolder:
     """Inspect one child without reopening its mutable lexical path."""
 
     descriptor = _open_directory_at(root_fd, name, expected=expected)
     try:
-        return inspect_skill_folder_descriptor(descriptor, folder_name=name)
+        return inspect_skill_folder_descriptor(
+            descriptor,
+            folder_name=folder_name or name,
+        )
     finally:
         os.close(descriptor)
 
@@ -1284,44 +1334,61 @@ class SkillStore:
         ) as (root_fd, _artifact_fd):
             if _identity_at(root_fd, name) is None:
                 return
-            if isinstance(identity, CreatedSkillPublication):
-                descriptor = _open_directory_at(
-                    root_fd,
-                    name,
-                    expected=folder_identity,
-                )
-                try:
-                    if set(os.listdir(descriptor)) != {SKILL_FILENAME}:
-                        raise SkillPathError(
-                            "created skill contents changed; rollback preserved them"
-                        )
-                    primary = os.stat(
-                        SKILL_FILENAME,
-                        dir_fd=descriptor,
-                        follow_symlinks=False,
-                    )
-                    observed_primary = (
-                        primary.st_dev,
-                        primary.st_ino,
-                        primary.st_size,
-                        primary.st_mtime_ns,
-                        primary.st_ctime_ns,
-                    )
-                    expected_primary = (
-                        *identity.primary_identity,
-                        identity.primary_size,
-                        identity.primary_mtime_ns,
-                        identity.primary_ctime_ns,
-                    )
-                    if observed_primary != expected_primary:
-                        raise SkillPathError(
-                            "created skill contents changed; rollback preserved them"
-                        )
-                finally:
-                    os.close(descriptor)
-            _remove_expected_directory_at(
+            quarantine = _quarantine_directory_at(
                 root_fd,
                 name,
+                expected=folder_identity,
+            )
+            if isinstance(identity, CreatedSkillPublication):
+                try:
+                    descriptor = _open_directory_at(
+                        root_fd,
+                        quarantine,
+                        expected=folder_identity,
+                    )
+                    try:
+                        if set(os.listdir(descriptor)) != {SKILL_FILENAME}:
+                            raise SkillPathError(
+                                "created skill contents changed; rollback preserved them"
+                            )
+                        primary = os.stat(
+                            SKILL_FILENAME,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                        observed_primary = (
+                            primary.st_dev,
+                            primary.st_ino,
+                            primary.st_size,
+                            primary.st_mtime_ns,
+                            primary.st_ctime_ns,
+                        )
+                        expected_primary = (
+                            *identity.primary_identity,
+                            identity.primary_size,
+                            identity.primary_mtime_ns,
+                            identity.primary_ctime_ns,
+                        )
+                        if observed_primary != expected_primary:
+                            raise SkillPathError(
+                                "created skill contents changed; rollback preserved them"
+                            )
+                    finally:
+                        os.close(descriptor)
+                except BaseException as inspection_error:
+                    try:
+                        _restore_quarantined_directory_at(
+                            root_fd,
+                            quarantine,
+                            name,
+                            expected=folder_identity,
+                        )
+                    except Exception as restoration_error:  # noqa: BLE001
+                        inspection_error.add_note(str(restoration_error))
+                    raise
+            _remove_quarantined_directory_at(
+                root_fd,
+                quarantine,
                 expected=folder_identity,
             )
 
@@ -1348,25 +1415,45 @@ class SkillStore:
         ) as (root_fd, _artifact_fd):
             if _identity_at(root_fd, name) is None:
                 return
-            current = _inspect_child_at(
+            quarantine = _quarantine_directory_at(
                 root_fd,
                 name,
                 expected=identity.folder_identity,
             )
-            current_entries = tuple(sorted(current.entries, key=lambda item: item.path))
-            published_entries = tuple(
-                sorted(identity.snapshot.entries, key=lambda item: item.path)
-            )
-            if (
-                current.document != identity.snapshot.document
-                or current_entries != published_entries
-            ):
-                raise SkillPathError(
-                    "installed skill contents changed; rollback preserved them"
+            try:
+                current = _inspect_child_at(
+                    root_fd,
+                    quarantine,
+                    expected=identity.folder_identity,
+                    folder_name=name,
                 )
-            _remove_expected_directory_at(
+                current_entries = tuple(
+                    sorted(current.entries, key=lambda item: item.path)
+                )
+                published_entries = tuple(
+                    sorted(identity.snapshot.entries, key=lambda item: item.path)
+                )
+                if (
+                    current.document != identity.snapshot.document
+                    or current_entries != published_entries
+                ):
+                    raise SkillPathError(
+                        "installed skill contents changed; rollback preserved them"
+                    )
+            except BaseException as inspection_error:
+                try:
+                    _restore_quarantined_directory_at(
+                        root_fd,
+                        quarantine,
+                        name,
+                        expected=identity.folder_identity,
+                    )
+                except Exception as restoration_error:  # noqa: BLE001
+                    inspection_error.add_note(str(restoration_error))
+                raise
+            _remove_quarantined_directory_at(
                 root_fd,
-                name,
+                quarantine,
                 expected=identity.folder_identity,
             )
 

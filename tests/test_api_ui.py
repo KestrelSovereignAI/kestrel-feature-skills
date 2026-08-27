@@ -429,6 +429,8 @@ def test_ui_bundle_contains_required_rails_and_no_run_control(feature):
     assert "MutationObserver" in source
     assert "state.catalog = catalog" in source
     assert "editorOwner" in source
+    assert "skill.deletable" in source
+    assert "remaining_source_kind" in source
     assert "skill_run_script" not in source
     assert "/run" not in source
     assert ".execute(" not in source

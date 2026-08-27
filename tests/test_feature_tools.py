@@ -772,6 +772,44 @@ async def test_refresh_indexes_valid_folder_discovered_outside_the_tools(feature
 
 
 @pytest.mark.asyncio
+async def test_unchanged_refresh_does_not_reindex_graph_node(feature):
+    await feature.skill_create("stable-index", "Stable graph index", "body")
+    feature.agent.storage.added.clear()
+
+    await feature.refresh()
+    await feature.refresh()
+
+    assert feature.agent.storage.added == []
+
+
+@pytest.mark.asyncio
+async def test_state_change_indexes_graph_once_despite_multiple_refreshes(feature):
+    await feature.skill_create("changed-index", "Changed graph index", "body")
+    feature.agent.storage.added.clear()
+
+    result = await feature.skill_enable("changed-index", priority=8)
+
+    assert result.status is ToolResultStatus.OK
+    assert len(feature.agent.storage.added) == 1
+    assert feature.agent.storage.added[0].properties["enabled"] is True
+    assert feature.agent.storage.added[0].properties["priority"] == 8
+
+
+@pytest.mark.asyncio
+async def test_restart_uses_matching_persisted_graph_payload_without_upsert(feature):
+    await feature.skill_create("restart-index", "Restart graph index", "body")
+    feature.agent.storage.added.clear()
+
+    replacement = ProceduralSkillsFeature(feature.agent)
+    await replacement.initialize()
+    try:
+        assert feature.agent.storage.added == []
+        assert "restart-index" in replacement._indexed_names
+    finally:
+        await replacement.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_catalog_discovery_stays_pinned_when_root_ancestor_symlink_moves(
     feature, tmp_path
 ):
@@ -1714,6 +1752,69 @@ async def test_delete_refuses_host_shared_skill(feature, tmp_path, monkeypatch):
         assert result.status is ToolResultStatus.ERROR
         assert "local override" in result.error
         assert folder.is_dir()
+    finally:
+        await other.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_shadowed_local_git_installation(
+    feature, tmp_path, monkeypatch
+):
+    name = "shadowed-git-delete"
+    local = feature.agent.procedural_skills_root / name
+    local.mkdir()
+    (local / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Hidden Git installation", "Local procedure.")
+        ),
+        encoding="utf-8",
+    )
+    (local / PROVENANCE_FILENAME).write_bytes(
+        serialize_provenance(
+            SkillProvenance(
+                kind="git",
+                source_id="https://example.com/skills.git",
+                locator=f"main:{name}",
+                revision="a" * 40,
+                remote_url="https://example.com/skills.git",
+            )
+        )
+    )
+    shared = tmp_path / "shared-shadow"
+    shared_skill = shared / name
+    shared_skill.mkdir(parents=True)
+    (shared_skill / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Visible host skill", "Host procedure.")
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KESTREL_SHARED_SKILLS_DIR", str(shared))
+    other = ProceduralSkillsFeature(feature.agent)
+    await other.initialize()
+    try:
+        assert other.snapshot.by_name()[name].source_kind == "host-shared"
+        catalog_record = next(
+            item for item in other.catalog_payload()["skills"] if item["name"] == name
+        )
+        assert catalog_record["editable"] is False
+        assert catalog_record["deletable"] is True
+        enabled = await other.skill_enable(name, priority=17)
+        assert enabled.status is ToolResultStatus.OK
+        other.agent.storage.added.clear()
+        other.agent.storage.deleted.clear()
+
+        result = await other.skill_delete(name)
+
+        assert result.status is ToolResultStatus.OK
+        assert "host-shared source remains resolved" in result.confirmation
+        assert not local.exists()
+        assert shared_skill.is_dir()
+        remaining = other.snapshot.by_name()[name]
+        assert remaining.source_kind == "host-shared"
+        assert remaining.state == SkillState(True, 17)
+        assert other.agent.storage.added == []
+        assert other.agent.storage.deleted == []
     finally:
         await other.shutdown()
 

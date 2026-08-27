@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import tempfile
@@ -151,6 +152,7 @@ class ProceduralSkillsFeature(Feature):
         self._states: dict[str, SkillState] = {}
         self._enablement_error: str | None = None
         self._indexed_names: frozenset[str] = frozenset()
+        self._indexed_payloads: dict[str, str] | None = None
         self._router = None
 
     @property
@@ -304,16 +306,31 @@ class ProceduralSkillsFeature(Feature):
             self._snapshot,
             max_bytes=DEFAULT_CONTEXT_BUDGET_BYTES,
         )
-        current_names = {record.name for record in self._snapshot.records}
-        indexed = set(self._indexed_names)
-        indexed.update(await self._persisted_index_names())
-        for stale_name in sorted(indexed - current_names):
+        records_by_name = {record.name: record for record in self._snapshot.records}
+        desired_payloads = {
+            name: self._index_payload(self._index_node(record))
+            for name, record in records_by_name.items()
+        }
+        indexed_payloads = (
+            await self._persisted_index_payloads()
+            if self._indexed_payloads is None
+            else dict(self._indexed_payloads)
+        )
+        for stale_name in sorted(indexed_payloads.keys() - records_by_name.keys()):
             if await self._delete_index_node(stale_name):
-                indexed.discard(stale_name)
+                indexed_payloads.pop(stale_name, None)
         for record in self._snapshot.records:
+            desired_payload = desired_payloads[record.name]
+            if indexed_payloads.get(record.name) == desired_payload:
+                continue
             if await self._index_record(record):
-                indexed.add(record.name)
-        self._indexed_names = frozenset(indexed)
+                indexed_payloads[record.name] = desired_payload
+        self._indexed_payloads = indexed_payloads
+        self._indexed_names = frozenset(
+            name
+            for name, payload in indexed_payloads.items()
+            if desired_payloads.get(name) == payload
+        )
         return self._snapshot
 
     def catalog_payload(self) -> dict[str, object]:
@@ -376,6 +393,7 @@ class ProceduralSkillsFeature(Feature):
             "persistent procedural skills are unavailable in the current privacy mode"
         )
         self._indexed_names = frozenset()
+        self._indexed_payloads = None
 
     def _ensure_persistent_services(self) -> None:
         if all(
@@ -502,6 +520,7 @@ class ProceduralSkillsFeature(Feature):
         self, record: SkillRecord, included: set[str]
     ) -> dict[str, object]:
         shadows = self._snapshot.shadowed.get(record.name, ())
+        shadowed_records = self._snapshot.shadowed_records.get(record.name, ())
         return {
             "name": record.name,
             "description": record.document.description,
@@ -515,6 +534,8 @@ class ProceduralSkillsFeature(Feature):
             "source_id": record.source_id,
             "source_kind": record.source_kind,
             "editable": record.editable,
+            "deletable": record.editable
+            or any(item.source_kind == "agent-local" for item in shadowed_records),
             "provenance": record.provenance.to_dict(),
             "shadowed": [provenance.to_dict() for provenance in shadows],
         }
@@ -925,9 +946,36 @@ class ProceduralSkillsFeature(Feature):
         enablement: SkillEnablementStore,
         name: str,
     ) -> dict[str, object]:
-        record = SkillStore.get(self._snapshot, name)
+        resolved_record = SkillStore.get(self._snapshot, name)
+        record = resolved_record
+        deleting_shadowed_local = False
+        if not record.editable:
+            local_candidates = tuple(
+                candidate
+                for candidate in self._snapshot.shadowed_records.get(name, ())
+                if candidate.source_kind == "agent-local"
+            )
+            if local_candidates:
+                record = local_candidates[0]
+                deleting_shadowed_local = True
         node_id = self._node_id(name)
         store.require_local_record(record)
+        if deleting_shadowed_local:
+            store.delete(record)
+            await self._refresh_locked()
+            remaining = SkillStore.get(self._snapshot, name)
+            return {
+                "name": name,
+                "removed_file": True,
+                "config_deleted": False,
+                "config_retained": True,
+                "graph_deleted": False,
+                "graph_retained": True,
+                "errors": [],
+                "deleted_source_kind": record.source_kind,
+                "resolved_skill_retained": True,
+                "remaining_source_kind": remaining.source_kind,
+            }
         if enablement.available:
             _previous_state, disabled_state = await self._prepare_disabled_state(
                 enablement,
@@ -974,12 +1022,18 @@ class ProceduralSkillsFeature(Feature):
                 graph_deleted = False
                 errors.append(f"graph index cleanup failed: {exc}")
         await self._refresh_locked()
+        remaining = self._snapshot.by_name().get(name)
         return {
             "name": name,
             "removed_file": True,
             "config_deleted": config_deleted,
             "graph_deleted": graph_deleted,
             "errors": errors,
+            "deleted_source_kind": record.source_kind,
+            "resolved_skill_retained": remaining is not None,
+            "remaining_source_kind": (
+                remaining.source_kind if remaining is not None else None
+            ),
         }
 
     async def install_skill(
@@ -1242,7 +1296,18 @@ class ProceduralSkillsFeature(Feature):
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "add_node"):
             return False
-        node = GraphNode(
+        node = self._index_node(record)
+        try:
+            await storage.add_node(node)
+        except Exception as exc:  # noqa: BLE001 - graph is a recoverable index
+            logger.warning(
+                "Could not update procedural_skill index for %s: %s", record.name, exc
+            )
+            return False
+        return True
+
+    def _index_node(self, record: SkillRecord) -> GraphNode:
+        return GraphNode(
             node_id=self._node_id(record.name),
             node_type=PROCEDURAL_SKILL_NODE_TYPE,
             label=record.name,
@@ -1255,14 +1320,22 @@ class ProceduralSkillsFeature(Feature):
                 "priority": record.state.priority,
             },
         )
-        try:
-            await storage.add_node(node)
-        except Exception as exc:  # noqa: BLE001 - graph is a recoverable index
-            logger.warning(
-                "Could not update procedural_skill index for %s: %s", record.name, exc
-            )
-            return False
-        return True
+
+    @staticmethod
+    def _index_payload(node: GraphNode) -> str:
+        """Return a type-preserving canonical payload for graph change detection."""
+
+        return json.dumps(
+            {
+                "node_id": node.node_id,
+                "node_type": node.node_type,
+                "label": node.label,
+                "properties": node.properties,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
 
     async def _delete_index_node(self, name: str) -> bool:
         """Best-effort removal for a catalog entry no longer on disk."""
@@ -1293,18 +1366,18 @@ class ProceduralSkillsFeature(Feature):
             return False
         return True
 
-    async def _persisted_index_names(self) -> set[str]:
-        """Discover this agent's prior index nodes so restart can reconcile them."""
+    async def _persisted_index_payloads(self) -> dict[str, str]:
+        """Load this agent's prior graph payloads so restart skips unchanged nodes."""
 
         storage = getattr(self.agent, "storage", None)
         if storage is None or not hasattr(storage, "get_nodes_by_type"):
-            return set()
+            return {}
         try:
             nodes = await storage.get_nodes_by_type(PROCEDURAL_SKILL_NODE_TYPE)
         except Exception as exc:  # noqa: BLE001 - graph is a recoverable index
             logger.warning("Could not enumerate procedural_skill index nodes: %s", exc)
-            return set()
-        names: set[str] = set()
+            return {}
+        payloads: dict[str, str] = {}
         for node in nodes:
             properties = getattr(node, "properties", None)
             name = properties.get("name") if isinstance(properties, dict) else None
@@ -1313,8 +1386,11 @@ class ProceduralSkillsFeature(Feature):
             except SkillError:
                 continue
             if getattr(node, "node_id", None) == self._node_id(name):
-                names.add(name)
-        return names
+                try:
+                    payloads[name] = self._index_payload(node)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+        return payloads
 
     def _node_id(self, name: str) -> str:
         material = f"{_agent_id(self.agent)}\x00{name}".encode()
@@ -1499,6 +1575,12 @@ class ProceduralSkillsFeature(Feature):
             return ToolResult.partial(
                 f"Deleted the authoritative skill folder for {name}.",
                 "; ".join(errors),
+                data=payload,
+            )
+        if payload["resolved_skill_retained"]:
+            return ToolResult.ok(
+                f"Deleted the local procedural skill for {name}; the "
+                f"{payload['remaining_source_kind']} source remains resolved.",
                 data=payload,
             )
         return ToolResult.ok(f"Deleted procedural skill {name}.", data=payload)
