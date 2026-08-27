@@ -22,6 +22,7 @@ from kestrel_feature_skills.models import SkillDocument, SkillState
 from kestrel_feature_skills.sources import (
     AGENT_LOCAL_PRECEDENCE,
     HOST_SHARED_PRECEDENCE,
+    PROVENANCE_FILENAME,
     DirectorySkillSource,
     SkillCatalog,
 )
@@ -1651,6 +1652,32 @@ async def test_read_file_editability_matches_write_policy(feature, relative_path
 
     assert tree_entry["editable"] is False
     assert response["editable"] is False
+
+
+@pytest.mark.asyncio
+async def test_nested_metadata_like_resources_remain_in_inventory(feature):
+    name = "nested-metadata-resources"
+    await feature.skill_create(name, "Nested metadata resources", "body")
+    folder = feature.agent.procedural_skills_root / name
+    resources = folder / "docs"
+    resources.mkdir()
+    expected = {
+        f"docs/{PROVENANCE_FILENAME}": "nested provenance notes",
+        "docs/.SKILL.md.tmp.notes.md": "nested temporary-looking notes",
+    }
+    for relative_path, content in expected.items():
+        (folder / relative_path).write_text(content, encoding="utf-8")
+    root_internal = ".SKILL.md.tmp.stale"
+    (folder / root_internal).write_text("stale internal file", encoding="utf-8")
+    await feature.refresh()
+
+    tree_paths = {entry["path"] for entry in feature.tree(name=name)}
+    assert expected.keys() <= tree_paths
+    assert root_internal not in tree_paths
+    for relative_path, content in expected.items():
+        result = await feature.skill_read(name, relative_path)
+        assert result.status is ToolResultStatus.OK
+        assert result.data["content"] == content
 
 
 def test_context_renderer_is_not_registered_through_a_fake_legacy_hook(feature):

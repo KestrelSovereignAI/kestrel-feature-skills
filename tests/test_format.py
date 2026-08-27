@@ -556,6 +556,32 @@ def test_incomplete_inline_link_with_whitespace_is_literal(tmp_path, body):
     assert validate_skill_folder(folder, source_root=tmp_path) == value
 
 
+@pytest.mark.parametrize(
+    "body, message",
+    (
+        ("[outer](<broken [escape](../secret.md))", "traversal"),
+        (
+            "[outer](<broken [execute](javascript:alert(1)))",
+            "unsupported link scheme",
+        ),
+        ('[outer](<broken> "unterminated [escape](../secret.md))', "traversal"),
+        ("[outer](<broken\n[escape](../secret.md))", "traversal"),
+    ),
+)
+def test_malformed_angle_destination_cannot_hide_nested_live_link(
+    tmp_path, body, message
+):
+    value = SkillDocument(
+        "nested-angle-escape",
+        "Nested angle escape",
+        body,
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match=message):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_escaped_angle_destination_terminator_is_part_of_path(tmp_path):
     value = SkillDocument(
         "escaped-angle", "Escaped angle destination", r"[notes](<foo\>bar.md>)"

@@ -736,6 +736,7 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
         if body[cursor] == "<":
             start = cursor
             cursor += 1
+            completed = False
             while cursor < len(body):
                 if body[cursor] == "\\" and cursor + 1 < len(body):
                     cursor += 2
@@ -747,11 +748,13 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
                     if suffix_end is not None:
                         destinations.append(body[start : cursor + 1])
                         cursor = suffix_end
-                    else:
-                        cursor += 1
+                        completed = True
                     break
                 cursor += 1
-            index = cursor
+            # An invalid outer destination is literal CommonMark, but content
+            # inside it can still begin another live link. Resume immediately
+            # after the rejected ``<`` instead of skipping nested markup.
+            index = cursor if completed else start + 1
             continue
 
         start = cursor

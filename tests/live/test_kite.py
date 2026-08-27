@@ -43,6 +43,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-nested-link",
         "kite-percent-link",
         "kite-malformed-link",
+        "kite-malformed-angle-nested",
         "kite-script-autolink",
         "kite-container-link",
         "kite-literal-separator",
@@ -152,6 +153,14 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert resource_body in invoked_resource.json()["response"]
         assert "no code was executed" in invoked_resource.json()["response"]
 
+        nested_resources = {
+            "docs/.kestrel-provenance.json": "NESTED-PROVENANCE-KITE-3018",
+            "docs/.SKILL.md.tmp.notes.md": "NESTED-TEMP-NOTES-KITE-3018",
+        }
+        (root / name / "docs").mkdir()
+        for relative_path, content in nested_resources.items():
+            (root / name / relative_path).write_text(content, encoding="utf-8")
+
         invalid = {
             "kite-zero": b"",
             "kite-oversized": b"x" * 262_145,
@@ -222,6 +231,14 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             '---\nname: "kite-malformed-link"\n'
             'description: "Malformed link attempt"\n---\n\n'
             "Read [broken](//[invalid).\n",
+            encoding="utf-8",
+        )
+        malformed_angle_folder = root / "kite-malformed-angle-nested"
+        malformed_angle_folder.mkdir()
+        (malformed_angle_folder / "SKILL.md").write_text(
+            '---\nname: "kite-malformed-angle-nested"\n'
+            'description: "Malformed angle nested-link attempt"\n---\n\n'
+            "Read [outer](<broken [outside](../kite-outside.md)).\n",
             encoding="utf-8",
         )
         script_autolink_folder = root / "kite-script-autolink"
@@ -391,6 +408,27 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         discovered = {skill["name"] for skill in payload["skills"]}
         assert {name, code_example_name, commonmark_control_name} <= discovered
         assert all(rejected_name not in discovered for rejected_name in rejected_names)
+
+        tree = client.get(f"{base}/{name}/tree")
+        assert tree.status_code == 200, tree.text
+        tree_paths = {entry["path"] for entry in tree.json()["entries"]}
+        assert nested_resources.keys() <= tree_paths
+        for relative_path, content in nested_resources.items():
+            nested_read = client.get(
+                f"{base}/{name}/file", params={"path": relative_path}
+            )
+            assert nested_read.status_code == 200, nested_read.text
+            assert nested_read.json()["content"] == content
+        nested_tool_read = client.post(
+            f"{KITE_URL}/api/agents/kite/api/agent/invoke",
+            json={"input": f"!skill read {name} docs/.kestrel-provenance.json"},
+            timeout=180,
+        )
+        assert nested_tool_read.status_code == 200, nested_tool_read.text
+        assert (
+            nested_resources["docs/.kestrel-provenance.json"]
+            in (nested_tool_read.json()["response"])
+        )
 
         overlong_path = "a" * 1025
         overlong_write = client.put(

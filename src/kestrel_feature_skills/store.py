@@ -1031,8 +1031,9 @@ class SkillStore:
         entries: list[dict[str, object]] = []
         for path in sorted(folder.rglob("*"), key=lambda item: item.as_posix()):
             relative = path.relative_to(folder).as_posix()
-            if path.name == PROVENANCE_FILENAME or path.name.startswith(
-                _INTERNAL_PREFIXES
+            if path.parent == folder and (
+                path.name == PROVENANCE_FILENAME
+                or path.name.startswith(_INTERNAL_PREFIXES)
             ):
                 continue
             if path.is_symlink():
