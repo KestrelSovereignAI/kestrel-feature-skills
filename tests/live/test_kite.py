@@ -46,6 +46,8 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-list-reference",
         "kite-sibling-fence",
         "kite-tab-pseudo-fence",
+        "kite-cross-paragraph-code",
+        "kite-blockquote-tab-link",
     )
     code_example_name = "kite-code-examples"
     unapproved_install = "permission-sentinel"
@@ -236,6 +238,22 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             '---\nname: "kite-tab-pseudo-fence"\n'
             'description: "Tab-indented pseudo-fence escape attempt"\n---\n\n'
             "Example:\n\n\t```markdown\n[outside](../kite-outside.md)\n",
+            encoding="utf-8",
+        )
+        cross_paragraph_code_folder = root / "kite-cross-paragraph-code"
+        cross_paragraph_code_folder.mkdir()
+        (cross_paragraph_code_folder / "SKILL.md").write_text(
+            '---\nname: "kite-cross-paragraph-code"\n'
+            'description: "Cross-paragraph code delimiter attempt"\n---\n\n'
+            "`unclosed\n\n[outside](../kite-outside.md)\n\n`\n",
+            encoding="utf-8",
+        )
+        blockquote_tab_link_folder = root / "kite-blockquote-tab-link"
+        blockquote_tab_link_folder.mkdir()
+        (blockquote_tab_link_folder / "SKILL.md").write_text(
+            '---\nname: "kite-blockquote-tab-link"\n'
+            'description: "Blockquote tab-stop escape attempt"\n---\n\n'
+            "> \t[outside](../kite-outside.md)\n",
             encoding="utf-8",
         )
         code_example_folder = root / code_example_name

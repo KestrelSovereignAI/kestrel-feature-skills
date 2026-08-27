@@ -493,6 +493,52 @@ def test_markdown_links_inside_code_spans_and_fences_are_not_validated(tmp_path)
     assert validate_skill_folder(folder, source_root=tmp_path) == value
 
 
+def test_code_span_delimiters_cannot_pair_across_paragraphs(tmp_path):
+    value = SkillDocument(
+        "cross-paragraph-code",
+        "Cross-paragraph code delimiters",
+        "`unclosed\n\n[outside](../secret.md)\n\n`",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_multiline_code_span_within_one_paragraph_remains_literal(tmp_path):
+    value = SkillDocument(
+        "multiline-code",
+        "Multiline code span",
+        "Use `[literal]\n(../example.md)` as a wrapped example.",
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_blockquote_tab_stop_does_not_hide_live_link(tmp_path):
+    value = SkillDocument(
+        "quote-tab-link",
+        "Blockquote tab stop",
+        "> \t[outside](../secret.md)",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_blockquote_tabs_with_four_content_columns_remain_literal_code(tmp_path):
+    value = SkillDocument(
+        "quote-tab-code",
+        "Blockquote indented code",
+        ">\t\t[literal](../example.md)",
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
 def test_indented_live_autolink_is_not_mistaken_for_a_code_block(tmp_path):
     value = SkillDocument(
         "indented-autolink",

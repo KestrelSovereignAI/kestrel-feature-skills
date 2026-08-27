@@ -36,7 +36,6 @@ _MARKDOWN_AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*
 # code rather than a fence. Matching tabs here would mask live Markdown on the
 # following line when the pseudo-fence is left open.
 _MARKDOWN_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_MARKDOWN_BLOCKQUOTE_PREFIX = re.compile(r"^[ \t]{0,3}>[ \t]?")
 _MARKDOWN_LIST_PREFIX = re.compile(r"^([ ]{0,3})((?:[-+*]|\d{1,9}[.)]))([ \t]+)")
 _MARKDOWN_NONPARAGRAPH_BLOCK = re.compile(
     r"^(?:#{1,6}(?:[ \t]+|$)|(?:[*_-][ \t]*){3,}$|<[!/?A-Za-z])"
@@ -240,6 +239,40 @@ def _list_marker_prefix(line: str) -> tuple[int, int] | None:
     return consumed, marker_end + whitespace_columns
 
 
+def _strip_blockquote_prefix(line: str) -> str | None:
+    """Strip one CommonMark blockquote marker without losing tab columns."""
+
+    index = 0
+    while index < len(line) and index < 3 and line[index] == " ":
+        index += 1
+    if index >= len(line) or line[index] != ">":
+        return None
+
+    column = index + 1
+    index += 1
+    retained_indent = 0
+    if index < len(line) and line[index] == " ":
+        column += 1
+        index += 1
+    elif index < len(line) and line[index] == "\t":
+        width = 4 - (column % 4)
+        column += width
+        index += 1
+        # A tab expands before block parsing. Only its first column is the
+        # optional marker delimiter; the remaining columns indent the content.
+        retained_indent = width - 1
+
+    while index < len(line) and line[index] in " \t":
+        if line[index] == " ":
+            width = 1
+        else:
+            width = 4 - (column % 4)
+        retained_indent += width
+        column += width
+        index += 1
+    return f"{' ' * retained_indent}{line[index:]}"
+
+
 def _markdown_container_lines(
     body: str,
 ) -> tuple[
@@ -265,9 +298,9 @@ def _markdown_container_lines(
         ending = line[len(content) :]
         quote_depth = 0
         working = content
-        while match := _MARKDOWN_BLOCKQUOTE_PREFIX.match(working):
+        while (stripped := _strip_blockquote_prefix(working)) is not None:
             quote_depth += 1
-            working = working[match.end() :]
+            working = stripped
 
         if quote_depth != list_quote_depth:
             list_levels = []
@@ -339,6 +372,8 @@ def _mask_markdown_code(body: str) -> str:
     in_indented_code = False
     paragraph_container: tuple[int, tuple[int, ...]] | None = None
     paragraph_open = False
+    inline_blocks: list[list[int]] = []
+    active_inline_block: int | None = None
     for content, ending, container, continued_container in rows:
         line_length = len(content) + len(ending)
         if fence_character is not None and fence_container is not None:
@@ -368,10 +403,12 @@ def _mask_markdown_code(body: str) -> str:
                     fence_container = container
                     in_indented_code = False
                     paragraph_open = False
+                    active_inline_block = None
                     mask(offset, offset + line_length)
                     offset += line_length
                     continue
         else:
+            active_inline_block = None
             mask(offset, offset + line_length)
             if match:
                 run = match.group(1)
@@ -387,51 +424,78 @@ def _mask_markdown_code(body: str) -> str:
         if container != paragraph_container:
             paragraph_container = container
             paragraph_open = False
+            active_inline_block = None
         if container != indented_container:
             indented_container = container
             in_indented_code = False
         if not content.strip():
             paragraph_open = False
+            active_inline_block = None
         else:
             indented = _indent_prefix(content, 4) is not None
             if indented and (in_indented_code or not paragraph_open):
                 mask(offset, offset + line_length)
                 in_indented_code = True
                 paragraph_open = False
+                active_inline_block = None
             else:
                 in_indented_code = False
-                paragraph_open = not (
-                    _MARKDOWN_NONPARAGRAPH_BLOCK.match(content.lstrip(" \t"))
-                    or _MARKDOWN_REFERENCE_DEFINITION.match(content)
+                stripped_content = content.lstrip(" \t")
+                reference_definition = _MARKDOWN_REFERENCE_DEFINITION.match(content)
+                nonparagraph_block = _MARKDOWN_NONPARAGRAPH_BLOCK.match(
+                    stripped_content
                 )
+                if reference_definition is not None:
+                    paragraph_open = False
+                    active_inline_block = None
+                elif nonparagraph_block is not None:
+                    # ATX headings contain inline Markdown, but thematic breaks
+                    # and HTML blocks do not. They also cannot continue a span
+                    # into a neighboring block.
+                    if stripped_content.startswith("#"):
+                        inline_blocks.append([offset, offset + line_length])
+                    paragraph_open = False
+                    active_inline_block = None
+                elif paragraph_open and active_inline_block is not None:
+                    inline_blocks[active_inline_block][1] = offset + line_length
+                else:
+                    inline_blocks.append([offset, offset + line_length])
+                    active_inline_block = len(inline_blocks) - 1
+                    paragraph_open = True
         offset += line_length
 
     visible = "".join(masked)
 
-    def escaped(position: int) -> bool:
+    def escaped(position: int, lower_bound: int) -> bool:
         backslashes = 0
         position -= 1
-        while position >= 0 and visible[position] == "\\":
+        while position >= lower_bound and visible[position] == "\\":
             backslashes += 1
             position -= 1
         return backslashes % 2 == 1
 
-    runs = tuple(
-        match for match in re.finditer(r"`+", visible) if not escaped(match.start())
-    )
-    position = 0
-    while position < len(runs):
-        opening = runs[position]
-        closing_index = position + 1
-        while closing_index < len(runs):
-            closing = runs[closing_index]
-            if len(closing.group(0)) == len(opening.group(0)):
-                mask(opening.start(), closing.end())
-                position = closing_index + 1
-                break
-            closing_index += 1
-        else:
-            position += 1
+    for block_start, block_end in inline_blocks:
+        runs = tuple(
+            match
+            for match in re.finditer(r"`+", visible[block_start:block_end])
+            if not escaped(block_start + match.start(), block_start)
+        )
+        position = 0
+        while position < len(runs):
+            opening = runs[position]
+            closing_index = position + 1
+            while closing_index < len(runs):
+                closing = runs[closing_index]
+                if len(closing.group(0)) == len(opening.group(0)):
+                    mask(
+                        block_start + opening.start(),
+                        block_start + closing.end(),
+                    )
+                    position = closing_index + 1
+                    break
+                closing_index += 1
+            else:
+                position += 1
     return "".join(masked)
 
 
