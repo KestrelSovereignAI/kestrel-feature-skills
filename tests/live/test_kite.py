@@ -124,6 +124,43 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         )
         assert long_resource_read.status_code == 200, long_resource_read.text
         assert long_resource_read.json()["content"] == "LONG-RESOURCE-KITE-3018"
+
+        long_parts = tuple(character * 240 for character in "abcd")
+        long_nested_resource = "/".join((*long_parts, "notes.md"))
+        folder_descriptor = os.open(
+            root / name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            for part in long_parts:
+                os.mkdir(part, mode=0o700, dir_fd=folder_descriptor)
+                child_descriptor = os.open(
+                    part,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    dir_fd=folder_descriptor,
+                )
+                os.close(folder_descriptor)
+                folder_descriptor = child_descriptor
+            resource_descriptor = os.open(
+                "notes.md",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=folder_descriptor,
+            )
+            try:
+                os.write(resource_descriptor, b"LONG-NESTED-KITE-3018")
+            finally:
+                os.close(resource_descriptor)
+        finally:
+            os.close(folder_descriptor)
+        long_nested_reload = client.post(f"{base}/reload")
+        assert long_nested_reload.status_code == 200, long_nested_reload.text
+        long_nested_read = client.get(
+            f"{base}/{name}/file",
+            params={"path": long_nested_resource},
+        )
+        assert long_nested_read.status_code == 200, long_nested_read.text
+        assert long_nested_read.json()["content"] == "LONG-NESTED-KITE-3018"
         catalog = client.get(base).json()
         assert catalog["context"]["text"] == ""
 
