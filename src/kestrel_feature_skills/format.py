@@ -75,7 +75,12 @@ _DIRECTORY_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_CLOEXEC", 0)
 )
-_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
 
 
 def _utf8_bytes(value: str, *, label: str) -> bytes:
@@ -664,24 +669,25 @@ def _mask_markdown_code(body: str) -> str:
     return _analyze_markdown(body)[0]
 
 
-def _inline_link_suffix(body: str, cursor: int) -> int | None:
-    """Return the end of a complete link suffix after its destination."""
+def _inline_link_suffix(body: str, cursor: int) -> tuple[int | None, int]:
+    """Return a complete link suffix end and the characters examined."""
 
+    start = cursor
     if cursor >= len(body):
-        return None
+        return None, 0
     if body[cursor] == ")":
-        return cursor + 1
+        return cursor + 1, 1
     if not body[cursor].isspace():
-        return None
+        return None, 1
     while cursor < len(body) and body[cursor].isspace():
         cursor += 1
     if cursor >= len(body):
-        return None
+        return None, cursor - start
     if body[cursor] == ")":
-        return cursor + 1
+        return cursor + 1, cursor - start + 1
     opening = body[cursor]
     if opening not in {'"', "'", "("}:
-        return None
+        return None, cursor - start + 1
     closing = ")" if opening == "(" else opening
     cursor += 1
     while cursor < len(body):
@@ -693,19 +699,31 @@ def _inline_link_suffix(body: str, cursor: int) -> int | None:
             cursor += 1
             break
         if opening == "(" and character == "(":
-            return None
+            return None, cursor - start + 1
         cursor += 1
     else:
-        return None
+        return None, cursor - start
     while cursor < len(body) and body[cursor].isspace():
         cursor += 1
-    return cursor + 1 if cursor < len(body) and body[cursor] == ")" else None
+    end = cursor + 1 if cursor < len(body) and body[cursor] == ")" else None
+    return end, cursor - start + (1 if cursor < len(body) else 0)
 
 
 def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
     """Extract inline-link targets with balanced, escape-aware label parsing."""
 
     destinations: list[str] = []
+    scan_work = 0
+    max_scan_work = max(1, len(body)) * 4
+
+    def claim_scan_work(amount: int) -> None:
+        nonlocal scan_work
+        scan_work += amount
+        if scan_work > max_scan_work:
+            raise SkillFormatError(
+                "inline link structure exceeds validation complexity limit"
+            )
+
     bracket_depth = 0
     index = 0
     while index < len(body):
@@ -728,6 +746,7 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
         cursor = index + 2
         while cursor < len(body) and body[cursor].isspace():
             cursor += 1
+        claim_scan_work(cursor - (index + 2))
         if cursor >= len(body):
             break
         if body[cursor] == ")":
@@ -737,20 +756,25 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
             start = cursor
             cursor += 1
             completed = False
+            destination_work = 1
             while cursor < len(body):
                 if body[cursor] == "\\" and cursor + 1 < len(body):
+                    destination_work += 2
                     cursor += 2
                     continue
+                destination_work += 1
                 if body[cursor] in "\r\n<":
                     break
                 if body[cursor] == ">":
-                    suffix_end = _inline_link_suffix(body, cursor + 1)
+                    suffix_end, suffix_work = _inline_link_suffix(body, cursor + 1)
+                    claim_scan_work(suffix_work)
                     if suffix_end is not None:
                         destinations.append(body[start : cursor + 1])
                         cursor = suffix_end
                         completed = True
                     break
                 cursor += 1
+            claim_scan_work(destination_work)
             # An invalid outer destination is literal CommonMark, but content
             # inside it can still begin another live link. Resume immediately
             # after the rejected ``<`` instead of skipping nested markup.
@@ -760,10 +784,13 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
         start = cursor
         parenthesis_depth = 0
         completed = False
+        destination_work = 0
         while cursor < len(body):
             if body[cursor] == "\\" and cursor + 1 < len(body):
+                destination_work += 2
                 cursor += 2
                 continue
+            destination_work += 1
             if body[cursor] == "(":
                 parenthesis_depth += 1
                 cursor += 1
@@ -778,13 +805,15 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
                 cursor += 1
                 continue
             if body[cursor].isspace() and parenthesis_depth == 0:
-                suffix_end = _inline_link_suffix(body, cursor)
+                suffix_end, suffix_work = _inline_link_suffix(body, cursor)
+                claim_scan_work(suffix_work)
                 if suffix_end is not None:
                     destinations.append(body[start:cursor])
                     cursor = suffix_end
                     completed = True
                 break
             cursor += 1
+        claim_scan_work(destination_work)
         # A destination with unmatched parentheses is literal CommonMark, so a
         # nested label inside it can still form a live link. Re-enter the
         # rejected destination instead of skipping every nested candidate.
@@ -928,15 +957,19 @@ def _open_pinned_directory_at(
 def _read_regular_file_at(directory_fd: int, name: str, *, max_bytes: int) -> bytes:
     try:
         before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise SkillFormatError(f"could not read regular file: {name}") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise SkillPathError(f"skill resources must be regular files: {name}")
+    try:
         descriptor = os.open(name, _READ_FLAGS, dir_fd=directory_fd)
     except OSError as exc:
         raise SkillFormatError(f"could not read regular file: {name}") from exc
     try:
         opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or not stat.S_ISREG(opened.st_mode)
-            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            before.st_dev,
+            before.st_ino,
         ):
             raise SkillPathError(f"skill resources must be regular files: {name}")
         payload = bytearray()

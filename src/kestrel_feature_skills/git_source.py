@@ -213,7 +213,9 @@ def _validate_sparse_tree_listing(listing: str) -> None:
                 raise GitSourceError(
                     f"git source exceeded the {MAX_GIT_TRANSFER_BYTES}-byte transfer limit"
                 )
-        elif object_type not in {"tree", "commit"} or size_text != "-":
+        elif object_type == "commit":
+            raise GitSourceError("git source skill folders cannot contain submodules")
+        elif object_type != "tree" or size_text != "-":
             raise GitSourceError("git source returned malformed sparse tree metadata")
 
 

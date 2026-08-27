@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import threading
 
 import pytest
 
+import kestrel_feature_skills.format as format_module
 from kestrel_feature_skills.errors import SkillFormatError, SkillPathError
 from kestrel_feature_skills.format import (
     MAX_DESCRIPTION_BYTES,
@@ -604,6 +606,98 @@ def test_malformed_parenthesized_destination_cannot_hide_nested_live_link(
 
     with pytest.raises(SkillPathError, match=message):
         validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_many_incomplete_inline_links_fail_with_bounded_validation_work(tmp_path):
+    value = SkillDocument(
+        "bounded-links",
+        "Bounded malformed links",
+        "[x](" * 1024,
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillFormatError, match="complexity limit"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_regular_file_reader_rejects_fifo_before_open(tmp_path, monkeypatch):
+    resource = tmp_path / "resource"
+    os.mkfifo(resource)
+    directory_fd = os.open(
+        tmp_path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    opened = False
+
+    def unexpected_open(*_args, **_kwargs):
+        nonlocal opened
+        opened = True
+        raise AssertionError("FIFO must be rejected before open")
+
+    monkeypatch.setattr(format_module.os, "open", unexpected_open)
+    try:
+        with pytest.raises(SkillPathError, match="regular file"):
+            format_module._read_regular_file_at(
+                directory_fd,
+                resource.name,
+                max_bytes=1024,
+            )
+    finally:
+        os.close(directory_fd)
+
+    assert not opened
+
+
+def test_regular_file_reader_uses_nonblocking_open_across_fifo_swap(
+    tmp_path, monkeypatch
+):
+    resource = tmp_path / "resource"
+    resource.write_text("ordinary resource", encoding="utf-8")
+    directory_fd = os.open(
+        tmp_path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    real_open = os.open
+    swapped = False
+    completed = threading.Event()
+    errors = []
+
+    def swap_during_open(name, flags, *, dir_fd=None):
+        nonlocal swapped
+        if name == resource.name and dir_fd == directory_fd and not swapped:
+            resource.unlink()
+            os.mkfifo(resource)
+            swapped = True
+        return real_open(name, flags, dir_fd=dir_fd)
+
+    monkeypatch.setattr(format_module.os, "open", swap_during_open)
+
+    def read_swapped_resource():
+        try:
+            format_module._read_regular_file_at(
+                directory_fd,
+                resource.name,
+                max_bytes=1024,
+            )
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    reader = threading.Thread(target=read_swapped_resource)
+    reader.start()
+    finished_without_writer = completed.wait(timeout=0.5)
+    if not finished_without_writer:
+        writer = real_open(resource, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(writer)
+    reader.join(timeout=5)
+    os.close(directory_fd)
+
+    assert finished_without_writer, "resource read blocked while opening a FIFO"
+    assert not reader.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], SkillPathError)
+    assert "regular file" in str(errors[0])
 
 
 def test_escaped_angle_destination_terminator_is_part_of_path(tmp_path):

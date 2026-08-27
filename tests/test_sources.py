@@ -626,6 +626,30 @@ def test_git_checkout_rejects_oversized_sparse_blob_before_materialization(
     )
 
 
+def test_git_checkout_rejects_submodule_before_materialization(tmp_path, monkeypatch):
+    commands = []
+
+    def fake_git(argv, **_kwargs):
+        commands.append(argv)
+        if "ls-tree" in argv:
+            return f"160000 commit {'a' * 40} -\tremote/nested\x00"
+        return ""
+
+    monkeypatch.setattr(git_source_module, "_run_git", fake_git)
+
+    with pytest.raises(GitSourceError, match="submodule"):
+        GitSkillSource().checkout(
+            url="https://example.com/skills.git",
+            ref="main",
+            skill_name="remote",
+            target=tmp_path / "checkout",
+        )
+
+    assert not any(
+        "checkout" in command and "--detach" in command for command in commands
+    )
+
+
 def test_git_runner_rejects_a_checkout_that_crosses_its_disk_bound(tmp_path):
     target = tmp_path / "oversized-git-data"
 

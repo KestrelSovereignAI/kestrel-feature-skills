@@ -43,6 +43,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-nested-link",
         "kite-percent-link",
         "kite-malformed-link",
+        "kite-complex-links",
         "kite-malformed-angle-nested",
         "kite-malformed-paren-nested",
         "kite-script-autolink",
@@ -232,6 +233,15 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             '---\nname: "kite-malformed-link"\n'
             'description: "Malformed link attempt"\n---\n\n'
             "Read [broken](//[invalid).\n",
+            encoding="utf-8",
+        )
+        complex_links_folder = root / "kite-complex-links"
+        complex_links_folder.mkdir()
+        (complex_links_folder / "SKILL.md").write_text(
+            '---\nname: "kite-complex-links"\n'
+            'description: "Malformed link complexity attempt"\n---\n\n'
+            + "[x]("
+            * 64_000,
             encoding="utf-8",
         )
         malformed_angle_folder = root / "kite-malformed-angle-nested"
