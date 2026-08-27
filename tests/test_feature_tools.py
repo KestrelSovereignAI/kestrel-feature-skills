@@ -23,13 +23,14 @@ from kestrel_feature_skills.errors import (
 from kestrel_feature_skills.feature import PROCEDURAL_SKILL_NODE_TYPE
 from kestrel_feature_skills.format import serialize_skill_markdown
 from kestrel_feature_skills.git_source import GitCheckout
-from kestrel_feature_skills.models import SkillDocument, SkillState
+from kestrel_feature_skills.models import SkillDocument, SkillProvenance, SkillState
 from kestrel_feature_skills.sources import (
     AGENT_LOCAL_PRECEDENCE,
     HOST_SHARED_PRECEDENCE,
     PROVENANCE_FILENAME,
     DirectorySkillSource,
     SkillCatalog,
+    serialize_provenance,
 )
 
 EXPECTED_TOOLS = {
@@ -1558,6 +1559,63 @@ async def test_invalid_frontmatter_edit_is_rejected_before_replace(feature):
 
 
 @pytest.mark.asyncio
+async def test_edit_rejects_stale_git_local_record_when_host_source_wins(
+    feature, tmp_path, monkeypatch
+):
+    name = "host-wins-before-edit"
+    shared_root = tmp_path / "shared-edit-race"
+    shared_root.mkdir()
+    monkeypatch.setenv("KESTREL_SHARED_SKILLS_DIR", str(shared_root))
+    editor = ProceduralSkillsFeature(feature.agent)
+    await editor.initialize()
+    try:
+        await editor.create_skill(
+            name=name,
+            description="Git-local original",
+            body="Original local procedure.",
+        )
+        local_folder = feature.agent.procedural_skills_root / name
+        (local_folder / PROVENANCE_FILENAME).write_bytes(
+            serialize_provenance(
+                SkillProvenance(
+                    kind="git",
+                    source_id="https://example.com/origin.git",
+                    locator=f"main:{name}",
+                    revision="a" * 40,
+                    remote_url="https://example.com/origin.git",
+                )
+            )
+        )
+        await editor.refresh()
+        original = (local_folder / "SKILL.md").read_text(encoding="utf-8")
+        assert editor.snapshot.by_name()[name].provenance.kind == "git"
+
+        shared_folder = shared_root / name
+        shared_folder.mkdir()
+        (shared_folder / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(name, "New host winner", "Host procedure.")
+            ),
+            encoding="utf-8",
+        )
+        replacement = serialize_skill_markdown(
+            SkillDocument(name, "Stale local edit", "Edited local procedure.")
+        )
+
+        with pytest.raises(SkillConflictError, match="resolved source changed"):
+            await editor.edit_skill(
+                name=name,
+                relative_path="SKILL.md",
+                content=replacement,
+            )
+
+        assert (local_folder / "SKILL.md").read_text(encoding="utf-8") == original
+        assert editor.snapshot.by_name()[name].document.description == "New host winner"
+    finally:
+        await editor.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_post_publication_refresh_reconciles_catalog(
     feature, monkeypatch
 ):
@@ -1567,8 +1625,13 @@ async def test_cancelled_post_publication_refresh_reconciles_catalog(
     original_refresh = feature._refresh_locked
     refresh_started = asyncio.Event()
     release_refresh = asyncio.Event()
+    refresh_calls = 0
 
     async def paused_refresh():
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if refresh_calls == 1:
+            return await original_refresh()
         refresh_started.set()
         await release_refresh.wait()
         return await original_refresh()
@@ -1719,6 +1782,70 @@ async def test_git_install_rechecks_host_sources_after_checkout(
                 ref="main",
             )
         assert not (feature.agent.procedural_skills_root / name).exists()
+    finally:
+        await installer.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_git_install_rolls_back_when_host_source_wins_during_publication(
+    feature, tmp_path, monkeypatch
+):
+    name = "host-wins-during-install"
+    shared_root = tmp_path / "shared-install-race"
+    shared_root.mkdir()
+    monkeypatch.setenv("KESTREL_SHARED_SKILLS_DIR", str(shared_root))
+    installer = ProceduralSkillsFeature(feature.agent)
+    await installer.initialize()
+    checkout_root = tmp_path / "checkout-host-install-race"
+    source = checkout_root / "skills" / name
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Remote loser", "Remote procedure.")
+        ),
+        encoding="utf-8",
+    )
+
+    async def fake_checkout(*, source_url, ref, skill_name, target):
+        return GitCheckout(
+            root=checkout_root,
+            skill_folder=source,
+            revision="b" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    original_publish = installer._publish_installed_skill_with_state_claim
+
+    async def publish_then_host_wins(**kwargs):
+        operation = await original_publish(**kwargs)
+        shared_folder = shared_root / name
+        shared_folder.mkdir()
+        (shared_folder / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(name, "Host winner", "Host procedure.")
+            ),
+            encoding="utf-8",
+        )
+        return operation
+
+    monkeypatch.setattr(installer, "_checkout_git_until_stopped", fake_checkout)
+    monkeypatch.setattr(
+        installer,
+        "_publish_installed_skill_with_state_claim",
+        publish_then_host_wins,
+    )
+    try:
+        with pytest.raises(SkillConflictError, match="resolved source changed"):
+            await installer.install_skill(
+                source_url="https://example.com/repo.git",
+                skill_name=name,
+                ref="main",
+            )
+
+        assert not (feature.agent.procedural_skills_root / name).exists()
+        assert name not in await installer._enablement.load()
+        assert installer.snapshot.by_name()[name].document.description == "Host winner"
     finally:
         await installer.shutdown()
 

@@ -9,6 +9,7 @@ import os
 import tempfile
 import threading
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -56,12 +57,38 @@ from .sources import (
     DirectorySkillSource,
     SkillCatalog,
 )
-from .store import CreatedSkillPublication, SkillStore, has_python_execution_risk
+from .store import (
+    CreatedSkillPublication,
+    InstalledSkillPublication,
+    SkillStore,
+    has_python_execution_risk,
+)
 
 logger = logging.getLogger(__name__)
 
 PROCEDURAL_SKILL_NODE_TYPE = "procedural_skill"
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+@dataclass(frozen=True, slots=True)
+class _InstalledSkillOperation:
+    """One installed publication plus the state needed to compensate safely."""
+
+    folder: Path
+    publication: InstalledSkillPublication
+    previous_state: SkillState | None
+    disabled_state: SkillState | None
+    state_was_persisted: bool
+
+
+def _same_resolved_folder(left: SkillRecord, right: SkillRecord) -> bool:
+    """Return whether two snapshots prove the same resolved folder identity."""
+
+    return bool(
+        left.folder == right.folder
+        and left.folder_identity is not None
+        and left.folder_identity == right.folder_identity
+    )
 
 
 def _agent_id(agent: object) -> str:
@@ -769,10 +796,23 @@ class ProceduralSkillsFeature(Feature):
         self, *, name: str, relative_path: str, content: str
     ) -> dict[str, object]:
         store, _ = self._require_services()
-        record = SkillStore.get(self._snapshot, name)
-        store.write_file(record, relative_path, content)
-        await self._refresh_locked()
-        SkillStore.get(self._snapshot, name)
+        name = validate_skill_name(name)
+        cached = SkillStore.get(self._snapshot, name)
+        async with self._publication_state_claim(store, name):
+            await self._refresh_locked()
+            record = SkillStore.get(self._snapshot, name)
+            if not _same_resolved_folder(cached, record):
+                raise SkillConflictError(
+                    f"resolved source changed before editing {name}; reload and retry"
+                )
+            store.write_file(record, relative_path, content)
+            await self._refresh_locked()
+            resolved = SkillStore.get(self._snapshot, name)
+            if not _same_resolved_folder(record, resolved):
+                raise SkillConflictError(
+                    f"resolved source changed after editing {name}; reload before "
+                    "making another change"
+                )
         return {
             "name": name,
             "path": relative_path,
@@ -984,18 +1024,38 @@ class ProceduralSkillsFeature(Feature):
                     raise SkillConflictError(
                         f"skill already exists in the resolved catalog: {skill_name}"
                     )
-                folder = await self._publish_installed_skill_with_state_claim(
+                operation = await self._publish_installed_skill_with_state_claim(
                     store=store,
                     enablement=enablement,
                     source_folder=checkout.skill_folder,
                     provenance=provenance,
                     skill_name=skill_name,
                 )
-        await self._refresh_locked()
-        record = SkillStore.get(self._snapshot, skill_name)
+                try:
+                    await self._refresh_locked()
+                    record = SkillStore.get(self._snapshot, skill_name)
+                    if not (
+                        record.folder == operation.folder
+                        and record.folder_identity
+                        == operation.publication.folder_identity
+                        and record.provenance == provenance
+                    ):
+                        raise SkillConflictError(
+                            "resolved source changed during installation of "
+                            f"{skill_name}; the shadowed local publication was "
+                            "rolled back"
+                        )
+                except BaseException as finalization_error:
+                    await self._rollback_installed_publication(
+                        store=store,
+                        enablement=enablement,
+                        operation=operation,
+                        publication_error=finalization_error,
+                    )
+                    raise
         return {
             "name": skill_name,
-            "folder": str(folder),
+            "folder": str(operation.folder),
             "revision": checkout.revision,
             "remote_url": checkout.remote_url,
             "enabled": record.state.enabled,
@@ -1011,7 +1071,7 @@ class ProceduralSkillsFeature(Feature):
         source_folder: Path,
         provenance: SkillProvenance,
         skill_name: str,
-    ) -> Path:
+    ) -> _InstalledSkillOperation:
         previous_state: SkillState | None = None
         disabled_state: SkillState | None = None
         state_was_persisted = False
@@ -1025,7 +1085,10 @@ class ProceduralSkillsFeature(Feature):
             self._states[skill_name] = disabled_state
             state_was_persisted = True
         try:
-            return store.install_folder(source_folder, provenance=provenance)
+            folder, publication = store.install_folder_pinned(
+                source_folder,
+                provenance=provenance,
+            )
         except Exception as publication_error:
             if state_was_persisted:
                 restore_state = (
@@ -1041,6 +1104,62 @@ class ProceduralSkillsFeature(Feature):
                     operation="skill install publication",
                 )
             raise
+        return _InstalledSkillOperation(
+            folder=folder,
+            publication=publication,
+            previous_state=previous_state,
+            disabled_state=disabled_state,
+            state_was_persisted=state_was_persisted,
+        )
+
+    async def _rollback_installed_publication(
+        self,
+        *,
+        store: SkillStore,
+        enablement: SkillEnablementStore,
+        operation: _InstalledSkillOperation,
+        publication_error: BaseException,
+    ) -> None:
+        """Remove an unchanged shadowed install and restore its prior state."""
+
+        rollback_error: BaseException | None = None
+        try:
+            store.rollback_installed(
+                operation.folder,
+                identity=operation.publication,
+            )
+        except BaseException as exc:  # noqa: BLE001 - state must remain disabled
+            rollback_error = exc
+            exc.add_note(
+                f"skill install finalization originally failed: {publication_error}"
+            )
+        if operation.state_was_persisted:
+            restoration = asyncio.create_task(
+                self._restore_enablement_after_publication_failure(
+                    enablement,
+                    operation.folder.name,
+                    (
+                        operation.disabled_state
+                        if rollback_error is not None
+                        else operation.previous_state
+                    ),
+                    publication_error,
+                    operation="skill install finalization",
+                )
+            )
+            try:
+                await self._drain_shielded_task(restoration)
+            except BaseException as state_error:
+                if rollback_error is not None:
+                    state_error.add_note(
+                        f"filesystem rollback also reported: {rollback_error}"
+                    )
+                raise
+        if rollback_error is not None:
+            raise SkillPublicationCleanupError(
+                "skill install finalization cleanup could not confirm removal: "
+                f"{rollback_error}"
+            ) from rollback_error
 
     @staticmethod
     async def _checkout_git_until_stopped(

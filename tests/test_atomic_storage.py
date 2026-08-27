@@ -1606,6 +1606,34 @@ def test_install_copies_resources_then_publishes_primary(tmp_path):
     assert validate_skill_folder(folder, source_root=store.local_root) == document
 
 
+def test_install_rollback_preserves_a_changed_publication(tmp_path):
+    source_root = tmp_path / "rollback-source"
+    source = source_root / "rollback-install"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("rollback-install", "Remote", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+    (source / "notes.md").write_text("published", encoding="utf-8")
+    store = SkillStore(tmp_path / "rollback-local")
+    folder, publication = store.install_folder_pinned(
+        source,
+        provenance=SkillProvenance(
+            "git", "https://example.com/repo.git", "main:rollback-install"
+        ),
+    )
+    (folder / "notes.md").write_text("changed after publication", encoding="utf-8")
+
+    with pytest.raises(SkillPathError, match="contents changed"):
+        store.rollback_installed(folder, identity=publication)
+
+    assert (folder / "notes.md").read_text(encoding="utf-8") == (
+        "changed after publication"
+    )
+
+
 def test_install_rejects_generated_provenance_crossing_file_limit(tmp_path):
     source_root = tmp_path / "source"
     source_root.mkdir()

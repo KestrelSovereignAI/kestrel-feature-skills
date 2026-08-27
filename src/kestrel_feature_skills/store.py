@@ -82,6 +82,14 @@ class CreatedSkillPublication:
 
 
 @dataclass(frozen=True, slots=True)
+class InstalledSkillPublication:
+    """Inode and content evidence for one newly installed skill folder."""
+
+    folder_identity: tuple[int, int]
+    snapshot: ValidatedSkillFolder
+
+
+@dataclass(frozen=True, slots=True)
 class CreatedParentDirectory:
     """A pinned parent/name pair for one directory created during an edit."""
 
@@ -1317,6 +1325,51 @@ class SkillStore:
                 expected=folder_identity,
             )
 
+    def rollback_installed(
+        self,
+        folder: Path,
+        *,
+        identity: InstalledSkillPublication,
+    ) -> None:
+        """Remove an unchanged install without following or deleting a replacement."""
+
+        name = validate_skill_name(folder.name)
+        expected = self.local_root / name
+        if expected != folder:
+            raise SkillPathError(
+                "installed skill folder changed before publication rollback"
+            )
+        with _serialized_skill_mutation(
+            self.local_root,
+            self._internal_root,
+            name,
+            root_identity=self._local_root_identity,
+            internal_root_identity=self._internal_root_identity,
+        ) as (root_fd, _artifact_fd):
+            if _identity_at(root_fd, name) is None:
+                return
+            current = _inspect_child_at(
+                root_fd,
+                name,
+                expected=identity.folder_identity,
+            )
+            current_entries = tuple(sorted(current.entries, key=lambda item: item.path))
+            published_entries = tuple(
+                sorted(identity.snapshot.entries, key=lambda item: item.path)
+            )
+            if (
+                current.document != identity.snapshot.document
+                or current_entries != published_entries
+            ):
+                raise SkillPathError(
+                    "installed skill contents changed; rollback preserved them"
+                )
+            _remove_expected_directory_at(
+                root_fd,
+                name,
+                expected=identity.folder_identity,
+            )
+
     def read_file(self, record: SkillRecord, relative_path: str) -> str:
         validate_resource_path(relative_path)
         folder = self._require_real_folder(record)
@@ -1524,6 +1577,22 @@ class SkillStore:
         *,
         provenance: SkillProvenance,
     ) -> Path:
+        """Install a validated folder and return its local path."""
+
+        target, _publication = self.install_folder_pinned(
+            source_folder,
+            provenance=provenance,
+        )
+        return target
+
+    def install_folder_pinned(
+        self,
+        source_folder: Path,
+        *,
+        provenance: SkillProvenance,
+    ) -> tuple[Path, InstalledSkillPublication]:
+        """Install a folder and return evidence for safe compensating rollback."""
+
         source_snapshot = inspect_skill_folder(
             source_folder, source_root=source_folder.parent
         )
@@ -1558,6 +1627,7 @@ class SkillStore:
                     raise SkillConflictError(f"skill already exists: {document.name}")
                 staging_name = f".{document.name}.install.{uuid.uuid4().hex}"
                 created_identity: tuple[int, int] | None = None
+                publication: InstalledSkillPublication | None = None
                 cleanup_name = staging_name
                 publication_collision = False
                 try:
@@ -1618,9 +1688,13 @@ class SkillStore:
                             primary_payload,
                             overwrite=False,
                         )
-                        validate_skill_folder_descriptor(
+                        published_snapshot = inspect_skill_folder_descriptor(
                             target_fd,
                             folder_name=document.name,
+                        )
+                        publication = InstalledSkillPublication(
+                            folder_identity=created_identity,
+                            snapshot=published_snapshot,
                         )
                         try:
                             os.fsync(target_fd)
@@ -1691,7 +1765,11 @@ class SkillStore:
                             "folder appeared; its removal was not attempted"
                         ) from publication_error
                     raise
-        return target
+        if publication is None:
+            raise SkillPublicationCleanupError(
+                "skill installation completed without rollback evidence"
+            )
+        return target, publication
 
     def delete(self, record: SkillRecord) -> None:
         with _serialized_skill_mutation(
