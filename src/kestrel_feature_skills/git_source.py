@@ -7,6 +7,7 @@ import re
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -138,6 +139,7 @@ def _run_git(
     timeout: int = 120,
     size_limit_root: Path | None = None,
     max_bytes: int | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     if (size_limit_root is None) != (max_bytes is None) or (
         max_bytes is not None and max_bytes < 1
@@ -145,6 +147,8 @@ def _run_git(
         raise ValueError("git size limiting requires a root and a positive byte bound")
     command = ["git", *_GIT_CONFIG_PREFIX, *argv]
     environment = _git_environment()
+    if cancel_event is not None and cancel_event.is_set():
+        raise GitSourceError("git source operation was cancelled")
     with (
         tempfile.TemporaryFile() as stdout_file,
         tempfile.TemporaryFile() as stderr_file,
@@ -161,6 +165,10 @@ def _run_git(
             raise GitSourceError("git executable is unavailable") from exc
         deadline = time.monotonic() + timeout
         while process.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                _kill_process_group(process)
+                process.wait()
+                raise GitSourceError("git source operation was cancelled")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _kill_process_group(process)
@@ -217,7 +225,13 @@ class GitSkillSource:
     """Clone one immutable view of a remote repository into a caller-owned directory."""
 
     def checkout(
-        self, *, url: str, ref: str, skill_name: str, target: Path
+        self,
+        *,
+        url: str,
+        ref: str,
+        skill_name: str,
+        target: Path,
+        cancel_event: threading.Event | None = None,
     ) -> GitCheckout:
         url = validate_remote_url(url)
         ref = validate_ref(ref)
@@ -239,6 +253,7 @@ class GitSkillSource:
             clone,
             size_limit_root=target,
             max_bytes=MAX_GIT_TRANSFER_BYTES,
+            cancel_event=cancel_event,
         )
         sparse_paths = [f"/{skill_name}/", f"/skills/{skill_name}/"]
         _run_git(
@@ -253,13 +268,18 @@ class GitSkillSource:
             ],
             size_limit_root=target,
             max_bytes=MAX_GIT_TRANSFER_BYTES,
+            cancel_event=cancel_event,
         )
         _run_git(
             ["-C", str(target), "checkout", "--detach", "HEAD"],
             size_limit_root=target,
             max_bytes=MAX_GIT_TRANSFER_BYTES,
+            cancel_event=cancel_event,
         )
-        revision = _run_git(["-C", str(target), "rev-parse", "HEAD"])
+        revision = _run_git(
+            ["-C", str(target), "rev-parse", "HEAD"],
+            cancel_event=cancel_event,
+        )
         if not _COMMIT_RE.fullmatch(revision):
             raise GitSourceError("git checkout returned an invalid commit identity")
         candidates = (target / "skills" / skill_name, target / skill_name)

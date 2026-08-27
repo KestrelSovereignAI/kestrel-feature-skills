@@ -229,6 +229,23 @@ test.describe.serial('procedural skills contributed console', () => {
     await expect(tab).toBeVisible();
   });
 
+  test('successful capability refresh preserves the active unsaved editor', async ({ page }) => {
+    await openPanel(page);
+    await page.getByRole('button', { name: SKILL_NAME }).click();
+    await page.getByRole('button', { name: 'SKILL.md' }).click();
+    const editor = page.getByLabel('Skill file editor');
+    const unsaved = `${await editor.inputValue()}\nUNSAVED-CAPABILITY-SENTINEL\n`;
+    await editor.fill(unsaved);
+
+    await page.evaluate(() => {
+      globalThis.dispatchEvent(new CustomEvent('capabilities:changed'));
+    });
+
+    await expect(editor).toBeVisible();
+    await expect(editor).toHaveValue(unsaved);
+    await expect(page.locator('#panel-procedural-skills')).toBeVisible();
+  });
+
   test('Python editor exposes execution risk and has no run surface', async ({ page }) => {
     await openPanel(page);
     await page.getByRole('button', { name: SKILL_NAME }).click();

@@ -479,11 +479,12 @@ registerPanel(panelDefinition);
 async function reconcileAvailability() {
   const agent = currentAgent();
   const epoch = ++state.availabilityEpoch;
-  state.available = false;
-  syncNav();
   try {
     await request('');
   } catch (_) {
+    if (epoch !== state.availabilityEpoch || currentAgent() !== agent) return;
+    state.available = false;
+    syncNav();
     return;
   }
   if (epoch !== state.availabilityEpoch || currentAgent() !== agent) return;

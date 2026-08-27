@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import tempfile
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -33,9 +34,9 @@ from .context import (
     render_context_clause,
 )
 from .enablement import DEFAULT_PRIORITY, SkillEnablementStore, validate_priority
-from .errors import SkillConflictError, SkillError, SkillPrivacyError
+from .errors import SkillConflictError, SkillError, SkillPathError, SkillPrivacyError
 from .format import SKILL_FILENAME, validate_skill_name
-from .git_source import GitSkillSource
+from .git_source import GitCheckout, GitSkillSource
 from .models import (
     CatalogSnapshot,
     SkillDocument,
@@ -628,9 +629,8 @@ class ProceduralSkillsFeature(Feature):
             dir=store.local_root.parent,
         ) as temporary:
             target = Path(temporary) / "checkout"
-            checkout = await asyncio.to_thread(
-                GitSkillSource().checkout,
-                url=source_url,
+            checkout = await self._checkout_git_until_stopped(
+                source_url=source_url,
                 ref=ref,
                 skill_name=skill_name,
                 target=target,
@@ -676,6 +676,41 @@ class ProceduralSkillsFeature(Feature):
             "indexed": skill_name in self._indexed_names,
             "state_error": None,
         }
+
+    @staticmethod
+    async def _checkout_git_until_stopped(
+        *, source_url: str, ref: str, skill_name: str, target: Path
+    ) -> GitCheckout:
+        """Keep cancellation inside the privacy lock until Git has stopped."""
+
+        cancel_event = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                GitSkillSource().checkout,
+                url=source_url,
+                ref=ref,
+                skill_name=skill_name,
+                target=target,
+                cancel_event=cancel_event,
+            )
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            while True:
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    # Repeated cancellation must not release the privacy lock
+                    # while the same checkout thread is still active.
+                    cancel_event.set()
+                    continue
+                except Exception:  # noqa: BLE001 - preserve caller cancellation
+                    break
+                else:
+                    break
+            raise
 
     def read_skill(self, *, name: str) -> dict[str, object]:
         store, _ = self._require_services()
@@ -813,19 +848,34 @@ class ProceduralSkillsFeature(Feature):
 
     @tool(
         "skill_read",
-        "Read one procedural skill body and its resource inventory",
+        "Read one procedural skill body or one inventoried bundled resource",
         category=ToolCategory.UTILITY,
         command_prefix="!skill read",
     )
-    async def skill_read(self, name: str) -> ToolResult:
+    async def skill_read(self, name: str, path: str = SKILL_FILENAME) -> ToolResult:
         try:
-            payload = self.read_skill(name=name)
+            inventory = self.read_skill(name=name)
+            if path == SKILL_FILENAME:
+                payload = inventory
+                confirmation = f"Read procedural skill {name}:\n{payload['body']}"
+            else:
+                inventoried_files = {
+                    str(item["path"])
+                    for item in inventory["resources"]
+                    if item.get("type") == "file"
+                }
+                if path not in inventoried_files:
+                    raise SkillPathError(
+                        f"resource is not in the skill inventory: {path}"
+                    )
+                payload = self.read_file(name=name, relative_path=path)
+                confirmation = (
+                    f"Read procedural skill resource {name}/{path} as text; "
+                    f"no code was executed:\n{payload['content']}"
+                )
         except SkillError as exc:
             return ToolResult.failed(str(exc))
-        return ToolResult.ok(
-            f"Read procedural skill {name}:\n{payload['body']}",
-            data=payload,
-        )
+        return ToolResult.ok(confirmation, data=payload)
 
     @tool(
         "skill_search",

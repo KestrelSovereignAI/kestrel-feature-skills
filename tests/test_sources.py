@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -369,7 +371,14 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
     commands = []
     target = tmp_path / "checkout"
 
-    def fake_git(argv, *, timeout=120, size_limit_root=None, max_bytes=None):
+    def fake_git(
+        argv,
+        *,
+        timeout=120,
+        size_limit_root=None,
+        max_bytes=None,
+        cancel_event=None,
+    ):
         commands.append((argv, size_limit_root, max_bytes))
         if argv[0] == "clone":
             make_skill(target / "skills", "remote", "Remote default branch")
@@ -495,6 +504,48 @@ def test_git_runner_caps_subprocess_output(tmp_path, monkeypatch):
 
     with pytest.raises(GitSourceError, match="output limit"):
         git_source_module._run_git(["probe"], timeout=5)
+
+
+def test_git_runner_terminates_subprocess_when_cancelled(tmp_path, monkeypatch):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "git-started"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f"#!{sys.executable}\n"
+        "import pathlib, time\n"
+        f"pathlib.Path({str(marker)!r}).write_text('started')\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    cancel_event = threading.Event()
+    errors = []
+
+    def run_git():
+        try:
+            git_source_module._run_git(["probe"], timeout=1, cancel_event=cancel_event)
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_git)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists()
+        cancel_event.set()
+        worker.join(timeout=5)
+    finally:
+        cancel_event.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], GitSourceError)
+    assert "cancel" in str(errors[0])
 
 
 def test_git_checkout_materializes_only_the_requested_folder(tmp_path, monkeypatch):

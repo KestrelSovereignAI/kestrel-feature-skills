@@ -14,7 +14,8 @@
 ### skill_read
 
 - **Description:** Explicitly disclose one skill's procedure body and resource
-  inventory.
+  inventory, or pass an inventoried relative path to read that bundled resource
+  as text without executing it.
 - **Permission:** `ALLOW`
 
 ### skill_search

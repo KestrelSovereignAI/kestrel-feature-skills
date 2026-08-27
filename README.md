@@ -29,7 +29,9 @@ description: "Use when a complete branch diff needs an evidence-backed review."
 Only the enabled skill's name and one-line description are eligible for the
 system-prompt catalog. The procedure body appears only after `skill_read`.
 Resources and scripts are opened explicitly, and there is no script execution
-surface in this package.
+surface in this package. `skill_read <name> <relative-path>` opens a file from
+the resource inventory as text; omitting the path returns the primary procedure
+body and inventory.
 
 ## Sources and precedence
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from kestrel_sovereign.privacy import PrivacyConfig
 from kestrel_feature_skills import ProceduralSkillsFeature
 from kestrel_feature_skills.context import render_context_clause
 from kestrel_feature_skills.enablement import MAX_PRIORITY
+from kestrel_feature_skills.errors import GitSourceError
 from kestrel_feature_skills.feature import PROCEDURAL_SKILL_NODE_TYPE
 from kestrel_feature_skills.format import serialize_skill_markdown
 from kestrel_feature_skills.git_source import GitCheckout
@@ -203,6 +205,31 @@ async def test_progressive_disclosure_list_search_then_read(feature):
     assert read.status is ToolResultStatus.OK
     assert secret in read.confirmation
     assert read.data["body"] == secret
+
+
+@pytest.mark.asyncio
+async def test_skill_read_can_open_an_inventoried_resource(feature):
+    created = await feature.skill_create(
+        "resource-reader",
+        "Read a bundled reference on demand",
+        "Open the inventoried reference when needed.",
+    )
+    assert created.status is ToolResultStatus.OK
+    edited = await feature.skill_edit(
+        "resource-reader",
+        "RESOURCE-ONLY-SENTINEL-3018\n",
+        "references.md",
+    )
+    assert edited.status is ToolResultStatus.OK
+
+    inventory = await feature.skill_read("resource-reader")
+    assert any(item["path"] == "references.md" for item in inventory.data["resources"])
+
+    opened = await feature.skill_read("resource-reader", "references.md")
+    assert opened.status is ToolResultStatus.OK
+    assert opened.data["path"] == "references.md"
+    assert opened.data["content"] == "RESOURCE-ONLY-SENTINEL-3018\n"
+    assert "RESOURCE-ONLY-SENTINEL-3018" in opened.confirmation
 
 
 @pytest.mark.asyncio
@@ -566,7 +593,7 @@ async def test_git_install_records_revision_and_leaves_skill_disabled(
         encoding="utf-8",
     )
 
-    def fake_checkout(self, *, url, ref, skill_name, target):
+    def fake_checkout(self, *, url, ref, skill_name, target, cancel_event=None):
         assert url == "https://example.com/repo.git"
         assert ref == "main"
         assert skill_name == "remote"
@@ -595,6 +622,51 @@ async def test_git_install_records_revision_and_leaves_skill_disabled(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_git_install_waits_for_worker_before_releasing(
+    feature, monkeypatch
+):
+    worker_started = threading.Event()
+    release_legacy_worker = threading.Event()
+    worker_finished = threading.Event()
+
+    def blocked_checkout(self, **kwargs):
+        cancel_event = kwargs.get("cancel_event")
+        worker_started.set()
+        if cancel_event is None:
+            release_legacy_worker.wait(timeout=5)
+        else:
+            cancel_event.wait(timeout=5)
+        worker_finished.set()
+        raise GitSourceError("git checkout cancelled")
+
+    monkeypatch.setattr(
+        "kestrel_feature_skills.git_source.GitSkillSource.checkout",
+        blocked_checkout,
+    )
+    feature.agent._privacy_transition_lock = asyncio.Lock()
+    install = asyncio.create_task(
+        feature.install_skill(
+            source_url="https://example.com/repo.git",
+            skill_name="cancelled-install",
+            ref="main",
+        )
+    )
+    assert await asyncio.to_thread(worker_started.wait, 5)
+
+    install.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await install
+    finished_before_lock_release = worker_finished.is_set()
+    release_legacy_worker.set()
+    assert await asyncio.to_thread(worker_finished.wait, 5)
+
+    assert finished_before_lock_release, (
+        "install cancellation propagated and released the privacy lock while "
+        "the Git worker was still running"
+    )
+
+
+@pytest.mark.asyncio
 async def test_git_install_is_not_published_when_disabled_state_cannot_persist(
     feature, tmp_path, monkeypatch
 ):
@@ -616,7 +688,7 @@ async def test_git_install_is_not_published_when_disabled_state_cannot_persist(
         encoding="utf-8",
     )
 
-    def fake_checkout(self, *, url, ref, skill_name, target):
+    def fake_checkout(self, *, url, ref, skill_name, target, cancel_event=None):
         return GitCheckout(
             root=checkout_root,
             skill_folder=source,
@@ -668,7 +740,7 @@ async def test_failed_git_install_restores_prior_enablement_state(
         encoding="utf-8",
     )
 
-    def fake_checkout(self, *, url, ref, skill_name, target):
+    def fake_checkout(self, *, url, ref, skill_name, target, cancel_event=None):
         return GitCheckout(
             root=checkout_root,
             skill_folder=source,
