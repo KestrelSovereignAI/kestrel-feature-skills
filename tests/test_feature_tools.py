@@ -13,7 +13,7 @@ from kestrel_sovereign.privacy import PrivacyConfig
 
 from kestrel_feature_skills import ProceduralSkillsFeature
 from kestrel_feature_skills.context import render_context_clause
-from kestrel_feature_skills.enablement import MAX_PRIORITY
+from kestrel_feature_skills.enablement import DEFAULT_PRIORITY, MAX_PRIORITY
 from kestrel_feature_skills.errors import GitSourceError, SkillConflictError
 from kestrel_feature_skills.feature import PROCEDURAL_SKILL_NODE_TYPE
 from kestrel_feature_skills.format import serialize_skill_markdown
@@ -970,9 +970,73 @@ async def test_create_rollback_preserves_replacement_swapped_after_publication(
     assert result.status is ToolResultStatus.ERROR
     assert marker.read_text(encoding="utf-8") == "replacement"
     assert (displaced / "SKILL.md").is_file()
-    assert name not in await feature._enablement.load()
+    assert (await feature._enablement.load())[name] == SkillState(
+        False, DEFAULT_PRIORITY
+    )
     assert feature.snapshot.by_name()[name].state.enabled is False
     assert "Raced replacement must remain disabled" not in feature.context_clause_text
+
+
+@pytest.mark.asyncio
+async def test_create_rollback_keeps_raced_replacement_disabled_over_prior_state(
+    feature, tmp_path, monkeypatch
+):
+    name = "create-rollback-prior-enabled"
+    prior_state = await feature._enablement.set(name, enabled=True, priority=17)
+    feature._states[name] = prior_state
+    published = feature.agent.procedural_skills_root / name
+    displaced = tmp_path / "displaced-prior-enabled-skill"
+    marker = published / "replacement-must-stay-disabled.md"
+    real_create = feature._store.create_pinned
+
+    def create_then_swap(document):
+        folder, identity = real_create(document)
+        folder.rename(displaced)
+        folder.mkdir()
+        marker.write_text("replacement", encoding="utf-8")
+        (folder / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(
+                    name,
+                    "Raced replacement over prior enabled state",
+                    "Unapproved procedure.",
+                )
+            ),
+            encoding="utf-8",
+        )
+        return folder, identity
+
+    original_set = feature._enablement.set
+    enable_failure_injected = False
+
+    async def commit_enable_then_fail_once(*args, **kwargs):
+        nonlocal enable_failure_injected
+        state = await original_set(*args, **kwargs)
+        if kwargs["enabled"] is True and not enable_failure_injected:
+            enable_failure_injected = True
+            raise DatabaseError("connection lost after enabling commit")
+        return state
+
+    monkeypatch.setattr(feature._store, "create_pinned", create_then_swap)
+    monkeypatch.setattr(feature._enablement, "set", commit_enable_then_fail_once)
+
+    result = await feature.skill_create(
+        name,
+        "Rollback must not restore prior enablement",
+        "Procedure.",
+        enabled=True,
+    )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert marker.read_text(encoding="utf-8") == "replacement"
+    assert (displaced / "SKILL.md").is_file()
+    assert (await feature._enablement.load())[name] == SkillState(
+        False, DEFAULT_PRIORITY
+    )
+    assert feature.snapshot.by_name()[name].state == SkillState(False, DEFAULT_PRIORITY)
+    assert "Raced replacement over prior enabled state" not in (
+        feature.context_clause_text
+    )
 
 
 @pytest.mark.asyncio
@@ -1021,7 +1085,9 @@ async def test_create_rollback_preserves_concurrent_same_inode_resource(
     assert (folder / "notes.md").read_text(encoding="utf-8") == (
         "Concurrent resource.\n"
     )
-    assert name not in await feature._enablement.load()
+    assert (await feature._enablement.load())[name] == SkillState(
+        False, DEFAULT_PRIORITY
+    )
     assert feature.snapshot.by_name()[name].state.enabled is False
     assert "Concurrent resource must survive" not in feature.context_clause_text
 

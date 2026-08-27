@@ -556,6 +556,7 @@ class ProceduralSkillsFeature(Feature):
                         folder,
                         identity=created_identity,
                         previous_state=previous_state,
+                        disabled_state=SkillState(False, resolved_priority),
                         publication_error=load_error,
                     )
                     await self._refresh_locked()
@@ -568,6 +569,7 @@ class ProceduralSkillsFeature(Feature):
                         folder,
                         identity=created_identity,
                         previous_state=previous_state,
+                        disabled_state=SkillState(False, resolved_priority),
                         publication_error=exc,
                     )
                     await self._refresh_locked()
@@ -610,9 +612,10 @@ class ProceduralSkillsFeature(Feature):
         *,
         identity: CreatedSkillPublication,
         previous_state: SkillState | None,
+        disabled_state: SkillState,
         publication_error: BaseException,
     ) -> None:
-        """Restore enablement even when inode-pinned filesystem rollback refuses."""
+        """Restore prior state only after inode-pinned filesystem rollback succeeds."""
 
         rollback_error: BaseException | None = None
         try:
@@ -626,7 +629,7 @@ class ProceduralSkillsFeature(Feature):
             self._restore_enablement_after_publication_failure(
                 enablement,
                 folder.name,
-                previous_state,
+                disabled_state if rollback_error is not None else previous_state,
                 publication_error,
                 operation="skill create state update",
             )
