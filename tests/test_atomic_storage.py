@@ -70,6 +70,19 @@ def _write_resource_from_separate_process(root, lock_state, result):
         result.put(("ok", ""))
 
 
+def _try_publication_state_claim_from_separate_process(root, name, result):
+    """Report whether another process can acquire a publication-state claim."""
+
+    try:
+        store = SkillStore(Path(root))
+        claim = store.try_acquire_publication_state_claim(name)
+        result.put(claim is not None)
+        if claim is not None:
+            claim.release()
+    except Exception as exc:  # noqa: BLE001 - report child failures to parent
+        result.put(f"{type(exc).__name__}: {exc}")
+
+
 def test_atomic_create_leaves_no_temporary_or_claim_files(tmp_path):
     root = tmp_path / "skills"
     store = SkillStore(root)
@@ -77,6 +90,37 @@ def test_atomic_create_leaves_no_temporary_or_claim_files(tmp_path):
     assert (folder / "SKILL.md").is_file()
     assert not list(folder.glob(".SKILL.md.tmp.*"))
     assert not (folder / ".SKILL.md.claim").exists()
+
+
+def test_publication_state_claim_is_exclusive_across_processes(tmp_path):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    claim = store.try_acquire_publication_state_claim("cross-process-state")
+    assert claim is not None
+    context = multiprocessing.get_context("spawn")
+
+    blocked_result = context.Queue()
+    blocked = context.Process(
+        target=_try_publication_state_claim_from_separate_process,
+        args=(str(root), "cross-process-state", blocked_result),
+    )
+    blocked.start()
+    blocked.join(timeout=10)
+    assert not blocked.is_alive()
+    assert blocked.exitcode == 0
+    assert blocked_result.get(timeout=10) is False
+
+    claim.release()
+    acquired_result = context.Queue()
+    acquired = context.Process(
+        target=_try_publication_state_claim_from_separate_process,
+        args=(str(root), "cross-process-state", acquired_result),
+    )
+    acquired.start()
+    acquired.join(timeout=10)
+    assert not acquired.is_alive()
+    assert acquired.exitcode == 0
+    assert acquired_result.get(timeout=10) is True
 
 
 def test_create_serializes_post_publication_validation_across_processes(

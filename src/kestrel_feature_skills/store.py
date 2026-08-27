@@ -42,6 +42,8 @@ MAX_EDITOR_FILE_BYTES = 262_144
 _INTERNAL_PREFIXES = (".SKILL.md.tmp.", ".SKILL.md.claim")
 _MUTATION_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 _MUTATION_LOCKS_GUARD = threading.Lock()
+_PUBLICATION_STATE_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+_PUBLICATION_STATE_LOCKS_GUARD = threading.Lock()
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_DIRECTORY", 0)
@@ -59,6 +61,27 @@ class CreatedSkillPublication:
     primary_size: int
     primary_mtime_ns: int
     primary_ctime_ns: int
+
+
+@dataclass(slots=True)
+class PublicationStateClaim:
+    """An exclusive same-name claim spanning database guard and publication."""
+
+    descriptor: int
+    thread_lock: threading.Lock
+    released: bool = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        try:
+            try:
+                fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(self.descriptor)
+        finally:
+            self.thread_lock.release()
 
 
 @contextmanager
@@ -581,6 +604,75 @@ class SkillStore:
             os.close(descriptor)
         self.local_root = resolved_root
         self._local_root_identity = root_identity
+
+    @property
+    def local_root_identity(self) -> tuple[int, int]:
+        """Return the inode identity pinned when this store was constructed."""
+
+        return self._local_root_identity
+
+    def try_acquire_publication_state_claim(
+        self, name: str
+    ) -> PublicationStateClaim | None:
+        """Try to claim one name across state guards and filesystem publication."""
+
+        name = validate_skill_name(name)
+        key = (str(self.local_root), name)
+        with _PUBLICATION_STATE_LOCKS_GUARD:
+            thread_lock = _PUBLICATION_STATE_LOCKS.setdefault(key, threading.Lock())
+        if not thread_lock.acquire(blocking=False):
+            return None
+
+        root_fd: int | None = None
+        descriptor: int | None = None
+        locked = False
+        claimed = False
+        try:
+            root_fd = _open_directory(
+                self.local_root,
+                expected=self._local_root_identity,
+            )
+            lock_name = f".{name}.publication-state.lock"
+            flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            try:
+                descriptor = os.open(lock_name, flags, 0o600, dir_fd=root_fd)
+            except OSError as exc:
+                raise SkillPathError(
+                    "could not open the skill publication-state lock"
+                ) from exc
+            value = os.fstat(descriptor)
+            if not stat.S_ISREG(value.st_mode):
+                raise SkillPathError(
+                    "skill publication-state lock must be a regular file"
+                )
+            lock_identity = (value.st_dev, value.st_ino)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return None
+            locked = True
+            if _identity_at(root_fd, lock_name) != lock_identity:
+                raise SkillPathError(
+                    "skill publication-state lock changed while acquiring it"
+                )
+            claimed = True
+            return PublicationStateClaim(descriptor, thread_lock)
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
+            if not claimed:
+                if descriptor is not None:
+                    try:
+                        if locked:
+                            fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    finally:
+                        os.close(descriptor)
+                thread_lock.release()
 
     @staticmethod
     def get(snapshot: CatalogSnapshot, name: str) -> SkillRecord:

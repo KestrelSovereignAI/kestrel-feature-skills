@@ -337,13 +337,19 @@ class ProceduralSkillsFeature(Feature):
                 source_id="agent-local",
                 kind="agent-local",
                 precedence=AGENT_LOCAL_PRECEDENCE,
+                expected_root_identity=store.local_root_identity,
             )
         ]
         shared_root = _host_shared_root()
-        if (
-            shared_root is not None
-            and shared_root.resolve(strict=False) != local_root.resolve()
-        ):
+        include_shared = shared_root is not None
+        if shared_root is not None:
+            try:
+                include_shared = not shared_root.samefile(store.local_root)
+            except (OSError, RuntimeError):
+                # An optional malformed source belongs in catalog errors; it
+                # must not abort construction of the healthy local source.
+                include_shared = True
+        if shared_root is not None and include_shared:
             sources.append(
                 DirectorySkillSource(
                     root=shared_root,
@@ -378,6 +384,20 @@ class ProceduralSkillsFeature(Feature):
                 # subsequent reads never retain the pre-mutation snapshot.
                 await self._reconcile_interrupted_mutation(operation_error)
                 raise
+
+    @asynccontextmanager
+    async def _publication_state_claim(self, store: SkillStore, name: str):
+        """Hold a cross-process name claim without blocking the event loop."""
+
+        claim = None
+        while claim is None:
+            claim = store.try_acquire_publication_state_claim(name)
+            if claim is None:
+                await asyncio.sleep(0.025)
+        try:
+            yield
+        finally:
+            claim.release()
 
     async def _reconcile_interrupted_mutation(
         self, operation_error: BaseException
@@ -476,6 +496,25 @@ class ProceduralSkillsFeature(Feature):
 
         serialize_skill_markdown(document)
         resolved_priority = validate_priority(priority)
+        async with self._publication_state_claim(store, document.name):
+            return await self._create_skill_with_publication_claim(
+                store=store,
+                enablement=enablement,
+                document=document,
+                enabled=enabled,
+                resolved_priority=resolved_priority,
+            )
+
+    async def _create_skill_with_publication_claim(
+        self,
+        *,
+        store: SkillStore,
+        enablement: SkillEnablementStore,
+        document: SkillDocument,
+        enabled: bool,
+        resolved_priority: int,
+    ) -> dict[str, object]:
+        name = document.name
         previous_state: SkillState | None = None
         state_was_persisted = False
         if enablement.available:
@@ -853,31 +892,14 @@ class ProceduralSkillsFeature(Feature):
                 revision=checkout.revision,
                 remote_url=checkout.remote_url,
             )
-            previous_state: SkillState | None = None
-            state_was_persisted = False
-            if enablement.available:
-                previous_state, state = await self._prepare_disabled_state(
-                    enablement,
-                    skill_name,
-                    priority=DEFAULT_PRIORITY,
-                    operation="skill install disabled-state preparation",
+            async with self._publication_state_claim(store, skill_name):
+                folder = await self._publish_installed_skill_with_state_claim(
+                    store=store,
+                    enablement=enablement,
+                    source_folder=checkout.skill_folder,
+                    provenance=provenance,
+                    skill_name=skill_name,
                 )
-                self._states[skill_name] = state
-                state_was_persisted = True
-            try:
-                folder = store.install_folder(
-                    checkout.skill_folder, provenance=provenance
-                )
-            except Exception as publication_error:
-                if state_was_persisted:
-                    await self._restore_enablement_after_publication_failure(
-                        enablement,
-                        skill_name,
-                        previous_state,
-                        publication_error,
-                        operation="skill install publication",
-                    )
-                raise
         await self._refresh_locked()
         record = SkillStore.get(self._snapshot, skill_name)
         return {
@@ -889,6 +911,39 @@ class ProceduralSkillsFeature(Feature):
             "indexed": skill_name in self._indexed_names,
             "state_error": None,
         }
+
+    async def _publish_installed_skill_with_state_claim(
+        self,
+        *,
+        store: SkillStore,
+        enablement: SkillEnablementStore,
+        source_folder: Path,
+        provenance: SkillProvenance,
+        skill_name: str,
+    ) -> Path:
+        previous_state: SkillState | None = None
+        state_was_persisted = False
+        if enablement.available:
+            previous_state, state = await self._prepare_disabled_state(
+                enablement,
+                skill_name,
+                priority=DEFAULT_PRIORITY,
+                operation="skill install disabled-state preparation",
+            )
+            self._states[skill_name] = state
+            state_was_persisted = True
+        try:
+            return store.install_folder(source_folder, provenance=provenance)
+        except Exception as publication_error:
+            if state_was_persisted:
+                await self._restore_enablement_after_publication_failure(
+                    enablement,
+                    skill_name,
+                    previous_state,
+                    publication_error,
+                    operation="skill install publication",
+                )
+            raise
 
     @staticmethod
     async def _checkout_git_until_stopped(

@@ -192,17 +192,35 @@ def serialize_provenance(provenance: SkillProvenance) -> bytes:
 class DirectorySkillSource(SkillSource):
     """An immediate-child folder source with explicit precedence."""
 
-    def __init__(self, *, root: Path, source_id: str, kind: str, precedence: int):
+    def __init__(
+        self,
+        *,
+        root: Path,
+        source_id: str,
+        kind: str,
+        precedence: int,
+        expected_root_identity: tuple[int, int] | None = None,
+    ):
         self.root = root
         self.source_id = source_id
         self.kind = kind
         self.precedence = precedence
+        self.expected_root_identity = expected_root_identity
 
     def discover(self) -> tuple[tuple[SkillRecord, ...], tuple[DiscoveryError, ...]]:
         try:
             root_before = self.root.lstat()
-        except FileNotFoundError:
-            return (), ()
+        except FileNotFoundError as exc:
+            if self.expected_root_identity is None:
+                return (), ()
+            error = DiscoveryError(
+                source_id=_json_safe_text(self.source_id),
+                locator=_json_safe_text(self.root),
+                error=_json_safe_text(
+                    f"could not resolve skill source root: pinned root disappeared: {exc}"
+                ),
+            )
+            return (), (error,)
         except OSError as exc:
             error = DiscoveryError(
                 source_id=_json_safe_text(self.source_id),
@@ -212,7 +230,10 @@ class DirectorySkillSource(SkillSource):
             return (), (error,)
         root_fd: int | None = None
         try:
-            root_identity = (root_before.st_dev, root_before.st_ino)
+            observed_identity = (root_before.st_dev, root_before.st_ino)
+            root_identity = self.expected_root_identity or observed_identity
+            if observed_identity != root_identity:
+                raise SkillPathError("skill source root changed after configuration")
             if stat.S_ISLNK(root_before.st_mode) or not stat.S_ISDIR(
                 root_before.st_mode
             ):
@@ -230,7 +251,7 @@ class DirectorySkillSource(SkillSource):
                 or (opened_root.st_dev, opened_root.st_ino) != root_identity
             ):
                 raise SkillPathError("skill source root changed during discovery")
-        except (SkillError, OSError) as exc:
+        except (SkillError, OSError, RuntimeError) as exc:
             if root_fd is not None:
                 os.close(root_fd)
             error = DiscoveryError(

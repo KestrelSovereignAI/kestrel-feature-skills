@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,7 @@ from kestrel_sovereign.privacy import PrivacyConfig
 from kestrel_feature_skills import ProceduralSkillsFeature
 from kestrel_feature_skills.context import render_context_clause
 from kestrel_feature_skills.enablement import MAX_PRIORITY
-from kestrel_feature_skills.errors import GitSourceError
+from kestrel_feature_skills.errors import GitSourceError, SkillConflictError
 from kestrel_feature_skills.feature import PROCEDURAL_SKILL_NODE_TYPE
 from kestrel_feature_skills.format import serialize_skill_markdown
 from kestrel_feature_skills.git_source import GitCheckout
@@ -40,6 +41,182 @@ EXPECTED_TOOLS = {
 
 class UnexpectedGraphError(Exception):
     """A non-database graph failure used to prove best-effort containment."""
+
+
+@pytest.mark.asyncio
+async def test_same_name_creates_serialize_disabled_guard_with_publication(
+    feature, monkeypatch
+):
+    name = "serialized-create-guard"
+    prior = await feature._enablement.set(name, enabled=True, priority=17)
+    feature._states[name] = prior
+    rival = ProceduralSkillsFeature(feature.agent)
+    await rival.initialize()
+    guard_written = asyncio.Event()
+    release_first = asyncio.Event()
+    original_prepare = feature._prepare_disabled_state
+
+    async def pause_after_guard(*args, **kwargs):
+        prepared = await original_prepare(*args, **kwargs)
+        guard_written.set()
+        await release_first.wait()
+        return prepared
+
+    monkeypatch.setattr(feature, "_prepare_disabled_state", pause_after_guard)
+    first = asyncio.create_task(
+        feature.create_skill(
+            name=name,
+            description="First serialized creator",
+            body="Procedure.",
+            priority=7,
+        )
+    )
+    await asyncio.wait_for(guard_written.wait(), timeout=5)
+    second = asyncio.create_task(
+        rival.create_skill(
+            name=name,
+            description="Second serialized creator",
+            body="Procedure.",
+        )
+    )
+    await asyncio.sleep(0.1)
+    second_waited = not second.done()
+    release_first.set()
+    try:
+        outcomes = await asyncio.gather(first, second, return_exceptions=True)
+    finally:
+        release_first.set()
+        await rival.shutdown()
+
+    assert second_waited, "a rival publication passed the first creator's state guard"
+    assert sum(isinstance(outcome, dict) for outcome in outcomes) == 1
+    assert sum(isinstance(outcome, SkillConflictError) for outcome in outcomes) == 1
+    assert (await feature._enablement.load())[name] == SkillState(False, 7)
+    assert feature.snapshot.by_name()[name].state == SkillState(False, 7)
+
+
+@pytest.mark.asyncio
+async def test_same_name_install_waits_for_create_guard_and_publication(
+    feature, monkeypatch
+):
+    name = "serialized-install-guard"
+    prior = await feature._enablement.set(name, enabled=True, priority=17)
+    feature._states[name] = prior
+    rival = ProceduralSkillsFeature(feature.agent)
+    await rival.initialize()
+    guard_written = asyncio.Event()
+    release_first = asyncio.Event()
+    original_prepare = feature._prepare_disabled_state
+
+    async def pause_after_guard(*args, **kwargs):
+        prepared = await original_prepare(*args, **kwargs)
+        guard_written.set()
+        await release_first.wait()
+        return prepared
+
+    async def fake_checkout(*, source_url, ref, skill_name, target):
+        source = target / skill_name
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(skill_name, "Installing rival", "Procedure.")
+            ),
+            encoding="utf-8",
+        )
+        return GitCheckout(
+            root=target,
+            skill_folder=source,
+            revision="a" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    monkeypatch.setattr(feature, "_prepare_disabled_state", pause_after_guard)
+    monkeypatch.setattr(rival, "_checkout_git_until_stopped", fake_checkout)
+    first = asyncio.create_task(
+        feature.create_skill(
+            name=name,
+            description="First serialized creator",
+            body="Procedure.",
+            priority=7,
+        )
+    )
+    await asyncio.wait_for(guard_written.wait(), timeout=5)
+    second = asyncio.create_task(
+        rival.install_skill(
+            source_url="https://example.com/skills.git",
+            skill_name=name,
+            ref="main",
+        )
+    )
+    await asyncio.sleep(0.1)
+    second_waited = not second.done()
+    release_first.set()
+    try:
+        outcomes = await asyncio.gather(first, second, return_exceptions=True)
+    finally:
+        release_first.set()
+        await rival.shutdown()
+
+    assert second_waited, "an install passed the first creator's state guard"
+    assert sum(isinstance(outcome, dict) for outcome in outcomes) == 1
+    assert sum(isinstance(outcome, SkillConflictError) for outcome in outcomes) == 1
+    assert (await feature._enablement.load())[name] == SkillState(False, 7)
+
+
+@pytest.mark.asyncio
+async def test_feature_catalog_rejects_replacement_of_pinned_local_root(
+    feature, tmp_path
+):
+    await feature.skill_create("trusted-root", "Trusted original", "Procedure.")
+    local_root = feature._store.local_root
+    displaced = tmp_path / "displaced-skills-root"
+    local_root.rename(displaced)
+    local_root.mkdir()
+    attacker = local_root / "attacker-root"
+    attacker.mkdir()
+    (attacker / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("attacker-root", "Untrusted replacement", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+
+    await feature.refresh()
+
+    assert feature.snapshot.records == ()
+    assert any(
+        error.source_id == "agent-local" and "changed" in error.error
+        for error in feature.snapshot.errors
+    )
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_optional_shared_root_does_not_abort_local_catalog(
+    feature, tmp_path, monkeypatch
+):
+    await feature.skill_create("healthy-local", "Healthy local", "Procedure.")
+    shared_root = tmp_path / "unresolvable-shared"
+    shared_root.mkdir()
+    monkeypatch.setenv("KESTREL_SHARED_SKILLS_DIR", str(shared_root))
+    real_resolve = Path.resolve
+
+    def fail_shared_resolution(path, *args, **kwargs):
+        if path == shared_root:
+            raise RuntimeError("symlink loop while resolving optional shared root")
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_shared_resolution)
+    isolated = ProceduralSkillsFeature(feature.agent)
+    try:
+        await isolated.initialize()
+        assert "healthy-local" in isolated.snapshot.by_name()
+        assert any(
+            error.source_id == "host-shared" and "source root" in error.error
+            for error in isolated.snapshot.errors
+        )
+    finally:
+        await isolated.shutdown()
 
 
 @pytest.mark.asyncio
