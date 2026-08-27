@@ -698,6 +698,56 @@ async def test_invalid_frontmatter_edit_is_rejected_before_replace(feature):
 
 
 @pytest.mark.asyncio
+async def test_cancelled_post_publication_refresh_reconciles_catalog(
+    feature, monkeypatch
+):
+    name = "cancelled-edit-refresh"
+    await feature.skill_create(name, "Original description", "Original body")
+    await feature.skill_enable(name)
+    original_refresh = feature._refresh_locked
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    async def paused_refresh():
+        refresh_started.set()
+        await release_refresh.wait()
+        return await original_refresh()
+
+    monkeypatch.setattr(feature, "_refresh_locked", paused_refresh)
+    replacement = serialize_skill_markdown(
+        SkillDocument(name, "Replacement description", "Replacement body")
+    )
+    edit = asyncio.create_task(
+        feature.edit_skill(
+            name=name,
+            relative_path="SKILL.md",
+            content=replacement,
+        )
+    )
+    await asyncio.wait_for(refresh_started.wait(), timeout=5)
+    edit.cancel()
+    await asyncio.sleep(0)
+    try:
+        assert not edit.done(), (
+            "cancelled mutation returned before its committed filesystem state "
+            "was reconciled"
+        )
+        edit.cancel()
+        await asyncio.sleep(0)
+        assert not edit.done(), "repeated cancellation skipped catalog reconciliation"
+    finally:
+        release_refresh.set()
+    with pytest.raises(asyncio.CancelledError):
+        await edit
+
+    record = feature.snapshot.by_name()[name]
+    assert record.document.description == "Replacement description"
+    assert record.document.body == "Replacement body"
+    assert "Replacement description" in feature.context_clause_text
+    assert "Original description" not in feature.context_clause_text
+
+
+@pytest.mark.asyncio
 async def test_delete_refuses_host_shared_skill(feature, tmp_path, monkeypatch):
     shared = tmp_path / "shared"
     shared.mkdir()

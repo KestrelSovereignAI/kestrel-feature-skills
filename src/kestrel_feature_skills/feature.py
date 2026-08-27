@@ -366,7 +366,46 @@ class ProceduralSkillsFeature(Feature):
             self._ensure_persistent_services()
             if needs_refresh:
                 await self._refresh_locked()
-            yield
+            try:
+                yield
+            except BaseException as operation_error:
+                # A cancellation or failure can arrive after a filesystem or
+                # database mutation committed but before the ordinary refresh.
+                # Reconcile while the privacy-transition lock is still held so
+                # subsequent reads never retain the pre-mutation snapshot.
+                await self._reconcile_interrupted_mutation(operation_error)
+                raise
+
+    async def _reconcile_interrupted_mutation(
+        self, operation_error: BaseException
+    ) -> None:
+        """Finish one refresh despite repeated cancellation, then propagate."""
+
+        worker = asyncio.create_task(self._refresh_locked())
+        while True:
+            try:
+                await asyncio.shield(worker)
+                return
+            except asyncio.CancelledError:
+                if not worker.done():
+                    # A repeated cancellation belongs to the interrupted
+                    # caller. Keep draining the independently owned refresh.
+                    continue
+                try:
+                    worker.result()
+                except BaseException as refresh_error:
+                    refresh_error.add_note(
+                        "procedural skill mutation was already interrupted: "
+                        f"{operation_error}"
+                    )
+                    raise refresh_error from operation_error
+                raise
+            except BaseException as refresh_error:
+                refresh_error.add_note(
+                    "procedural skill mutation was already interrupted: "
+                    f"{operation_error}"
+                )
+                raise refresh_error from operation_error
 
     def _record_payload(
         self, record: SkillRecord, included: set[str]

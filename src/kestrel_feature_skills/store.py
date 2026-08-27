@@ -373,14 +373,33 @@ def _remove_expected_directory_at(
     """Remove exactly one pinned child, preserving any raced replacement."""
 
     quarantine = _quarantine_directory_at(root_fd, name, expected=expected)
+    descriptor: int | None = None
     try:
-        shutil.rmtree(quarantine, dir_fd=root_fd)
+        # Pin the quarantined inode before traversing it. Resolving the
+        # quarantine name again through ``shutil.rmtree`` would let a raced
+        # replacement become the recursive-deletion target.
+        descriptor = _open_directory_at(root_fd, quarantine, expected=expected)
+        for entry in os.listdir(descriptor):
+            value = os.stat(entry, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(value.st_mode):
+                shutil.rmtree(entry, dir_fd=descriptor)
+            else:
+                os.unlink(entry, dir_fd=descriptor)
+        if _identity_at(root_fd, quarantine) != expected:
+            raise SkillPathError(
+                "quarantined skill folder changed during deletion; "
+                "its replacement was preserved"
+            )
+        os.rmdir(quarantine, dir_fd=root_fd)
     except BaseException as exc:
         exc.add_note(
             "skill removal did not complete; remaining data, if any, "
             f"is preserved as {quarantine}"
         )
         raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _open_parent_at(

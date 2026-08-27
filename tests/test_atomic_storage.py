@@ -1258,6 +1258,56 @@ def test_delete_preserves_replacement_swapped_during_atomic_quarantine(
     assert not original.exists()
 
 
+def test_delete_pins_quarantined_folder_during_recursive_removal(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(
+        SkillDocument("delete-recursive-race", "Original", "Procedure.")
+    )
+    (folder / "resources").mkdir()
+    (folder / "resources" / "notes.md").write_text("notes", encoding="utf-8")
+    source = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    )
+    record = source.discover()[0][0]
+    displaced = tmp_path / "displaced-recursive-original"
+    replacement_marker = None
+    real_rmtree = shutil.rmtree
+    swapped = False
+
+    def swap_quarantine_before_recursive_removal(path, *args, **kwargs):
+        nonlocal replacement_marker, swapped
+        if not swapped:
+            swapped = True
+            quarantines = list(store.local_root.glob(".delete-recursive-race.delete.*"))
+            assert len(quarantines) == 1
+            quarantine = quarantines[0]
+            quarantine.rename(displaced)
+            quarantine.mkdir()
+            replacement_marker = quarantine / "replacement-must-survive.md"
+            replacement_marker.write_text("replacement", encoding="utf-8")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        store_module.shutil,
+        "rmtree",
+        swap_quarantine_before_recursive_removal,
+    )
+    try:
+        with pytest.raises(SkillPathError, match="changed during deletion"):
+            store.delete(record)
+
+        assert replacement_marker is not None
+        assert replacement_marker.read_text(encoding="utf-8") == "replacement"
+        assert displaced.is_dir()
+    finally:
+        real_rmtree(displaced, ignore_errors=True)
+        for quarantine in store.local_root.glob(".delete-recursive-race.delete.*"):
+            real_rmtree(quarantine, ignore_errors=True)
+
+
 def test_delete_preserves_quarantined_folder_if_recursive_removal_fails(
     tmp_path, monkeypatch
 ):
@@ -1265,6 +1315,8 @@ def test_delete_preserves_quarantined_folder_if_recursive_removal_fails(
     original = store.create(
         SkillDocument("delete-restore", "Restore on failure", "Procedure.")
     )
+    (original / "resources").mkdir()
+    (original / "resources" / "notes.md").write_text("notes", encoding="utf-8")
     source = DirectorySkillSource(
         root=store.local_root,
         source_id="agent-local",
