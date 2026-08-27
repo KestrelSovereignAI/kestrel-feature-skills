@@ -15,11 +15,27 @@ const state = {
   catalogEpoch: 0,
   availabilityEpoch: 0,
   available: true,
+  restoreOnAvailability: false,
   ui: null,
 };
 
 function currentAgent() {
   return typeof API.getHostAgent === 'function' ? API.getHostAgent() : null;
+}
+
+function panelIsSelected() {
+  if (state.active) return true;
+  const tab = document.querySelector(`.nav-tab[data-panel="${PANEL_ID}"]`);
+  const panel = document.getElementById(`panel-${PANEL_ID}`);
+  return Boolean(tab?.classList.contains('active') || panel?.classList.contains('active'));
+}
+
+function restoreSelectedPanel() {
+  if (!state.restoreOnAvailability) return;
+  state.restoreOnAvailability = false;
+  const tab = document.querySelector(`.nav-tab[data-panel="${PANEL_ID}"]`);
+  const activeTab = document.querySelector('.nav-tab.active');
+  if (tab && (!activeTab || activeTab === tab)) tab.click();
 }
 
 function el(tag, className, text) {
@@ -483,6 +499,7 @@ async function reconcileAvailability() {
     await request('');
   } catch (_) {
     if (epoch !== state.availabilityEpoch || currentAgent() !== agent) return;
+    state.restoreOnAvailability ||= panelIsSelected();
     state.available = false;
     syncNav();
     return;
@@ -490,12 +507,18 @@ async function reconcileAvailability() {
   if (epoch !== state.availabilityEpoch || currentAgent() !== agent) return;
   state.available = true;
   syncNav();
+  restoreSelectedPanel();
 }
 
 bus.on('panel:shown', (payload) => {
   if (payload?.panelId === PANEL_ID) {
     state.active = true;
-    loadCatalog();
+    const panel = document.getElementById(`panel-${PANEL_ID}`);
+    if (!panel || (state.ui && panel.contains(state.ui.status))) {
+      loadCatalog();
+      return;
+    }
+    mount(panel.querySelector('.panel-content') || panel);
   }
 });
 
@@ -505,6 +528,7 @@ bus.on('panel:hidden', (payload) => {
 
 bus.on('agent:switch', () => {
   state.availabilityEpoch += 1;
+  state.restoreOnAvailability ||= panelIsSelected();
   state.available = false;
   state.catalogEpoch += 1;
   state.catalog = null;

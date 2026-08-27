@@ -227,6 +227,23 @@ test.describe.serial('procedural skills contributed console', () => {
       globalThis.dispatchEvent(new CustomEvent('capabilities:changed'));
     });
     await expect(tab).toBeVisible();
+    await tab.click();
+    await expect(tab).toHaveClass(/active/);
+    await expect(page.locator('#panel-procedural-skills')).toBeVisible();
+    await expect(page.getByRole('button', { name: SKILL_NAME })).toBeVisible();
+  });
+
+  test('recreated active panel container remounts its feature body', async ({ page }) => {
+    await openPanel(page);
+    await page.evaluate(async () => {
+      document.getElementById('panel-procedural-skills')?.remove();
+      const panels = await import('/js/ui-ext/panels.js');
+      panels.syncNav();
+      document.querySelector('.nav-tab[data-panel="procedural-skills"]')?.click();
+    });
+
+    await expect(page.locator('#panel-procedural-skills')).toBeVisible();
+    await expect(page.getByRole('button', { name: SKILL_NAME })).toBeVisible();
   });
 
   test('successful capability refresh preserves the active unsaved editor', async ({ page }) => {

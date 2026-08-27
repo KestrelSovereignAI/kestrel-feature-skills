@@ -265,3 +265,66 @@ def test_executable_link_scheme_rejected(tmp_path):
     folder = write_skill(tmp_path, value)
     with pytest.raises(SkillPathError, match="unsupported link scheme"):
         validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_malformed_link_url_is_a_visible_path_error(tmp_path):
+    value = SkillDocument("bad-url", "Bad URL", "[broken](//[invalid)")
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="malformed link URL"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_executable_commonmark_autolink_scheme_rejected(tmp_path):
+    value = SkillDocument(
+        "bad-autolink", "Bad autolink", "Do not open <javascript:alert(1)>."
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="unsupported link scheme"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_https_commonmark_autolink_is_accepted(tmp_path):
+    value = SkillDocument(
+        "safe-autolink", "Safe autolink", "Read <https://example.com/docs>."
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_markdown_links_inside_code_spans_and_fences_are_not_validated(tmp_path):
+    value = SkillDocument(
+        "code-links",
+        "Code link examples",
+        "Use `[inline](../example.md)` as a literal.\n\n"
+        "```markdown\n[fenced](../example.md)\n```",
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_indented_live_autolink_is_not_mistaken_for_a_code_block(tmp_path):
+    value = SkillDocument(
+        "indented-autolink",
+        "Indented autolink",
+        "Paragraph continuation.\n    <javascript:alert(1)>",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="unsupported link scheme"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_escaped_backtick_does_not_hide_a_live_markdown_link(tmp_path):
+    value = SkillDocument(
+        "escaped-code",
+        "Escaped code delimiter",
+        r"\` [outside](../example.md) `",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)

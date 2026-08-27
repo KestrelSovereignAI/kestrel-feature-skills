@@ -217,6 +217,15 @@ class ProceduralSkillsFeature(Feature):
         else:
             self._states = dict(states)
             self._enablement_error = None
+        return await self._rebuild_snapshot_locked(states)
+
+    async def _rebuild_snapshot_locked(
+        self, states: dict[str, SkillState]
+    ) -> CatalogSnapshot:
+        """Rebuild catalog, prompt clause, and graph index from observed state."""
+
+        if self._catalog is None:
+            raise RuntimeError("ProceduralSkillsFeature is not initialized")
         self._snapshot = self._catalog.refresh(states)
         self._context_render = render_context_clause(
             self._snapshot,
@@ -568,7 +577,16 @@ class ProceduralSkillsFeature(Feature):
         resolved_priority = (
             record.state.priority if priority is None else validate_priority(priority)
         )
-        state = await enablement.set(name, enabled=enabled, priority=resolved_priority)
+        try:
+            state = await enablement.set(
+                name, enabled=enabled, priority=resolved_priority
+            )
+        except DatabaseError as exc:
+            self._enablement_error = str(exc)
+            observed_states = await enablement.load()
+            self._states = dict(observed_states)
+            await self._rebuild_snapshot_locked(self._states)
+            raise
         self._states[name] = state
         await self._refresh_locked()
         refreshed = SkillStore.get(self._snapshot, name)

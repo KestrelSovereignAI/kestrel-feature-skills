@@ -248,6 +248,45 @@ async def test_enable_disable_updates_bootstrap_and_cached_context(feature):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "initial_enabled, requested_enabled",
+    ((False, True), (True, False)),
+)
+async def test_ambiguous_state_write_reconciles_cached_context(
+    feature, monkeypatch, initial_enabled, requested_enabled
+):
+    name = "ambiguous-state"
+    await feature.skill_create(name, "Ambiguous state description", "body")
+    if initial_enabled:
+        await feature.skill_enable(name, priority=13)
+    original_set = feature._enablement.set
+    failure_injected = False
+
+    async def commit_then_fail(*args, **kwargs):
+        nonlocal failure_injected
+        state = await original_set(*args, **kwargs)
+        if not failure_injected:
+            failure_injected = True
+            raise DatabaseError("connection lost after state commit")
+        return state
+
+    monkeypatch.setattr(feature._enablement, "set", commit_then_fail)
+
+    result = (
+        await feature.skill_enable(name, priority=13)
+        if requested_enabled
+        else await feature.skill_disable(name)
+    )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert (await feature._enablement.load())[name].enabled is requested_enabled
+    assert feature.snapshot.by_name()[name].state.enabled is requested_enabled
+    assert (
+        "Ambiguous state description" in feature.context_clause_text
+    ) is requested_enabled
+
+
+@pytest.mark.asyncio
 async def test_create_writes_procedural_skill_graph_node(feature):
     result = await feature.skill_create("indexed", "Graph indexed", "body")
     assert result.status is ToolResultStatus.OK

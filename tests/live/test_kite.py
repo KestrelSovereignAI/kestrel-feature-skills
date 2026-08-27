@@ -37,14 +37,25 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-no-frontmatter",
         "kite-symlink",
         "kite-nested-link",
+        "kite-malformed-link",
+        "kite-script-autolink",
     )
+    code_example_name = "kite-code-examples"
     unapproved_install = "permission-sentinel"
     for rejected_name in rejected_names:
         shutil.rmtree(root / rejected_name, ignore_errors=True)
+    shutil.rmtree(root / code_example_name, ignore_errors=True)
     shutil.rmtree(root / unapproved_install, ignore_errors=True)
     (root.parent / "kite-outside.md").unlink(missing_ok=True)
 
     with httpx.Client(timeout=30, headers=headers) as client:
+        onboarding = client.post(
+            f"{KITE_URL}/api/agents/kite/api/agent/invoke",
+            json={"input": "!skip-discovery"},
+            timeout=180,
+        )
+        assert onboarding.status_code == 200, onboarding.text
+        assert "GENESIS AUDIT PENDING" not in onboarding.json()["response"]
         client.delete(
             f"{base}/{name}",
             headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
@@ -136,16 +147,40 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             "Read [outer [inner]](../kite-outside.md).\n",
             encoding="utf-8",
         )
+        malformed_link_folder = root / "kite-malformed-link"
+        malformed_link_folder.mkdir()
+        (malformed_link_folder / "SKILL.md").write_text(
+            '---\nname: "kite-malformed-link"\n'
+            'description: "Malformed link attempt"\n---\n\n'
+            "Read [broken](//[invalid).\n",
+            encoding="utf-8",
+        )
+        script_autolink_folder = root / "kite-script-autolink"
+        script_autolink_folder.mkdir()
+        (script_autolink_folder / "SKILL.md").write_text(
+            '---\nname: "kite-script-autolink"\n'
+            'description: "Unsafe autolink attempt"\n---\n\n'
+            "Open <javascript:alert(1)>.\n",
+            encoding="utf-8",
+        )
+        code_example_folder = root / code_example_name
+        code_example_folder.mkdir()
+        (code_example_folder / "SKILL.md").write_text(
+            f'---\nname: "{code_example_name}"\n'
+            'description: "Markdown code examples"\n---\n\n'
+            "Use `[inline](missing-inline.md)` when documenting a link.\n\n"
+            "```markdown\n[fenced](missing-fenced.md)\n```\n",
+            encoding="utf-8",
+        )
 
         reloaded = client.post(f"{base}/reload")
         assert reloaded.status_code == 200, reloaded.text
         payload = reloaded.json()
         errors = {item["locator"]: item["error"] for item in payload["errors"]}
         assert set(rejected_names) <= errors.keys()
-        assert all(
-            name not in {skill["name"] for skill in payload["skills"]}
-            for name in rejected_names
-        )
+        discovered = {skill["name"] for skill in payload["skills"]}
+        assert {name, code_example_name} <= discovered
+        assert all(rejected_name not in discovered for rejected_name in rejected_names)
 
         disabled = client.patch(
             f"{base}/{name}/state",
@@ -189,6 +224,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert deleted.status_code == 200, deleted.text
         for rejected_name in rejected_names:
             shutil.rmtree(root / rejected_name, ignore_errors=True)
+        shutil.rmtree(root / code_example_name, ignore_errors=True)
         shutil.rmtree(root / unapproved_install, ignore_errors=True)
         escape_target.unlink(missing_ok=True)
         cleaned = client.post(f"{base}/reload")

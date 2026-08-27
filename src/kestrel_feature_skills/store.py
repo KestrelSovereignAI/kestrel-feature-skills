@@ -42,6 +42,12 @@ MAX_EDITOR_FILE_BYTES = 262_144
 _INTERNAL_PREFIXES = (".SKILL.md.tmp.", ".SKILL.md.claim")
 _MUTATION_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 _MUTATION_LOCKS_GUARD = threading.Lock()
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
 
 
 @contextmanager
@@ -70,50 +76,6 @@ def _serialized_skill_mutation(root: Path, name: str):
                 os.close(descriptor)
 
 
-def _claim_is_stale(path: Path) -> bool:
-    try:
-        age = time.time() - path.stat().st_mtime
-    except OSError:
-        return False
-    return age > CLAIM_STALENESS_SECONDS
-
-
-def _claim_identity(path: Path) -> tuple[int, int] | None:
-    try:
-        value = path.stat()
-    except OSError:
-        return None
-    return value.st_dev, value.st_ino
-
-
-def _lock_claim(path: Path, *, expected: tuple[int, int] | None = None) -> int | None:
-    """Lock the current claim inode without following a substituted symlink."""
-
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError:
-        return None
-    try:
-        value = os.fstat(descriptor)
-        identity = (value.st_dev, value.st_ino)
-        # A stale owner can resume after its claim path was unlinked and
-        # recreated by a replacement writer. Never lock that replacement inode:
-        # doing so can make both writers lose their nonblocking lock attempt.
-        if expected is not None and identity != expected:
-            os.close(descriptor)
-            return None
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if _claim_identity(path) != identity:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
-            return None
-    except (BlockingIOError, OSError):
-        os.close(descriptor)
-        return None
-    return descriptor
-
-
 def _unlock_claim(descriptor: int | None) -> None:
     if descriptor is None:
         return
@@ -134,6 +96,240 @@ def _write_tmp(path: Path, payload: bytes) -> None:
         os.close(descriptor)
 
 
+def _write_tmp_at(directory_fd: int, name: str, payload: bytes) -> None:
+    descriptor = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(descriptor)
+
+
+def _identity_at(directory_fd: int, name: str) -> tuple[int, int] | None:
+    try:
+        value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return value.st_dev, value.st_ino
+
+
+def _claim_is_stale_at(directory_fd: int, name: str) -> bool:
+    try:
+        value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return time.time() - value.st_mtime > CLAIM_STALENESS_SECONDS
+
+
+def _lock_claim_at(
+    directory_fd: int, name: str, *, expected: tuple[int, int] | None
+) -> int | None:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+    except OSError:
+        return None
+    try:
+        value = os.fstat(descriptor)
+        identity = (value.st_dev, value.st_ino)
+        if expected is not None and identity != expected:
+            os.close(descriptor)
+            return None
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if _identity_at(directory_fd, name) != identity:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+            return None
+    except (BlockingIOError, OSError):
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
+def _unlink_at(directory_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
+
+
+def _atomic_write_primary_at(
+    directory_fd: int, folder_name: str, payload: bytes, *, overwrite: bool
+) -> None:
+    """Apply the primary hardlink-claim protocol inside one pinned directory."""
+
+    if len(payload) > MAX_SKILL_FILE_BYTES:
+        raise SkillFormatError(f"{SKILL_FILENAME} exceeds {MAX_SKILL_FILE_BYTES} bytes")
+    if not overwrite and _identity_at(directory_fd, SKILL_FILENAME) is not None:
+        raise SkillConflictError(f"skill already exists: {folder_name}")
+    temporary = f".SKILL.md.tmp.{uuid.uuid4().hex}"
+    claim = ".SKILL.md.claim"
+    owned_claim: tuple[int, int] | None = None
+    claim_lock: int | None = None
+    _write_tmp_at(directory_fd, temporary, payload)
+    temporary_identity = _identity_at(directory_fd, temporary)
+    if temporary_identity is None:  # pragma: no cover - fsync'd file vanished
+        _unlink_at(directory_fd, temporary)
+        raise OSError("skill writer temporary file vanished before claiming")
+    try:
+        try:
+            os.link(
+                temporary,
+                claim,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            owned_claim = temporary_identity
+            claim_lock = _lock_claim_at(directory_fd, claim, expected=owned_claim)
+            if claim_lock is None:
+                raise SkillConflictError(
+                    f"skill write could not lock its claim for {folder_name}"
+                )
+        except FileExistsError:
+            if not _claim_is_stale_at(directory_fd, claim):
+                raise SkillConflictError(
+                    f"concurrent skill write is already in progress for {folder_name}"
+                ) from None
+            stale_identity = _identity_at(directory_fd, claim)
+            stale_lock = _lock_claim_at(directory_fd, claim, expected=stale_identity)
+            if stale_lock is None:
+                raise SkillConflictError(
+                    f"active skill writer still owns the stale claim for {folder_name}"
+                ) from None
+            try:
+                if (
+                    stale_identity is None
+                    or _identity_at(directory_fd, claim) != stale_identity
+                    or not _claim_is_stale_at(directory_fd, claim)
+                ):
+                    raise SkillConflictError(
+                        f"stale skill claim changed during recovery for {folder_name}"
+                    )
+                os.unlink(claim, dir_fd=directory_fd)
+                try:
+                    os.link(
+                        temporary,
+                        claim,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    owned_claim = temporary_identity
+                except FileExistsError as exc:
+                    raise SkillConflictError(
+                        f"concurrent skill write won stale-claim recovery for {folder_name}"
+                    ) from exc
+                claim_lock = _lock_claim_at(directory_fd, claim, expected=owned_claim)
+                if claim_lock is None:
+                    raise SkillConflictError(
+                        f"skill write could not lock its reclaimed claim for {folder_name}"
+                    )
+            finally:
+                _unlock_claim(stale_lock)
+        if owned_claim is None or _identity_at(directory_fd, claim) != owned_claim:
+            raise SkillConflictError(
+                f"skill write lost its reclaimed claim for {folder_name}"
+            )
+        if overwrite:
+            os.replace(
+                temporary,
+                SKILL_FILENAME,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        else:
+            try:
+                os.link(
+                    temporary,
+                    SKILL_FILENAME,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise SkillConflictError(
+                    f"skill already exists: {folder_name}"
+                ) from exc
+    finally:
+        _unlink_at(directory_fd, temporary)
+        if owned_claim is not None and _identity_at(directory_fd, claim) == owned_claim:
+            _unlink_at(directory_fd, claim)
+        _unlock_claim(claim_lock)
+
+
+def _open_directory(path: Path, *, expected: tuple[int, int] | None = None) -> int:
+    try:
+        descriptor = os.open(path, _DIRECTORY_FLAGS)
+    except OSError as exc:
+        raise SkillPathError("skill directory must be a real directory") from exc
+    value = os.fstat(descriptor)
+    identity = (value.st_dev, value.st_ino)
+    if not stat.S_ISDIR(value.st_mode) or (
+        expected is not None and identity != expected
+    ):
+        os.close(descriptor)
+        raise SkillPathError("skill directory changed after validation")
+    return descriptor
+
+
+def _open_parent_at(
+    root_fd: int, relative: Path, *, create: bool = False
+) -> tuple[int, str]:
+    """Traverse a relative parent chain without following mutable symlinks."""
+
+    descriptor = os.dup(root_fd)
+    try:
+        for part in relative.parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            try:
+                child = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            except OSError as exc:
+                raise SkillPathError(
+                    "skill path parents must be real directories without symlinks"
+                ) from exc
+            value = os.fstat(child)
+            if not stat.S_ISDIR(value.st_mode):
+                os.close(child)
+                raise SkillPathError("skill path parent is not a directory")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor, relative.name
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _atomic_replace_file_at(directory_fd: int, name: str, payload: bytes) -> None:
+    if len(payload) > MAX_EDITOR_FILE_BYTES:
+        raise SkillFormatError(f"editor file exceeds {MAX_EDITOR_FILE_BYTES} bytes")
+    temporary = f".{name}.tmp.{uuid.uuid4().hex}"
+    _write_tmp_at(directory_fd, temporary, payload)
+    try:
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+    finally:
+        _unlink_at(directory_fd, temporary)
+
+
 def atomic_write_primary(folder: Path, payload: bytes, *, overwrite: bool) -> None:
     """Write ``SKILL.md`` with the inherited hardlink claim protocol.
 
@@ -144,82 +340,16 @@ def atomic_write_primary(folder: Path, payload: bytes, *, overwrite: bool) -> No
     ``os.replace`` only after obtaining the same exclusive claim.
     """
 
-    if len(payload) > MAX_SKILL_FILE_BYTES:
-        raise SkillFormatError(f"{SKILL_FILENAME} exceeds {MAX_SKILL_FILE_BYTES} bytes")
-    target = folder / SKILL_FILENAME
-    if not overwrite and target.exists():
-        raise SkillConflictError(f"skill already exists: {folder.name}")
-    tmp = folder / f".SKILL.md.tmp.{uuid.uuid4().hex}"
-    claim = folder / ".SKILL.md.claim"
-    owned_claim: tuple[int, int] | None = None
-    claim_lock: int | None = None
-    _write_tmp(tmp, payload)
-    tmp_identity = _claim_identity(tmp)
-    if tmp_identity is None:  # pragma: no cover - fsync'd file vanished externally
-        tmp.unlink(missing_ok=True)
-        raise OSError("skill writer temporary file vanished before claiming")
+    descriptor = _open_directory(folder)
     try:
-        try:
-            os.link(tmp, claim)
-            owned_claim = tmp_identity
-            claim_lock = _lock_claim(claim, expected=owned_claim)
-            if claim_lock is None:
-                raise SkillConflictError(
-                    f"skill write could not lock its claim for {folder.name}"
-                )
-        except FileExistsError:
-            if not _claim_is_stale(claim):
-                raise SkillConflictError(
-                    f"concurrent skill write is already in progress for {folder.name}"
-                ) from None
-            stale_identity = _claim_identity(claim)
-            stale_lock = _lock_claim(claim, expected=stale_identity)
-            if stale_lock is None:
-                raise SkillConflictError(
-                    f"active skill writer still owns the stale claim for {folder.name}"
-                ) from None
-            try:
-                if (
-                    stale_identity is None
-                    or _claim_identity(claim) != stale_identity
-                    or not _claim_is_stale(claim)
-                ):
-                    raise SkillConflictError(
-                        f"stale skill claim changed during recovery for {folder.name}"
-                    )
-                claim.unlink()
-                try:
-                    os.link(tmp, claim)
-                    owned_claim = tmp_identity
-                except FileExistsError as exc:
-                    raise SkillConflictError(
-                        f"concurrent skill write won stale-claim recovery for {folder.name}"
-                    ) from exc
-                claim_lock = _lock_claim(claim, expected=owned_claim)
-                if claim_lock is None:
-                    raise SkillConflictError(
-                        f"skill write could not lock its reclaimed claim for {folder.name}"
-                    )
-            finally:
-                _unlock_claim(stale_lock)
-        if owned_claim is None or _claim_identity(claim) != owned_claim:
-            raise SkillConflictError(
-                f"skill write lost its reclaimed claim for {folder.name}"
-            )
-        if overwrite:
-            os.replace(tmp, target)
-        else:
-            try:
-                os.link(tmp, target)
-            except FileExistsError as exc:
-                raise SkillConflictError(
-                    f"skill already exists: {folder.name}"
-                ) from exc
+        _atomic_write_primary_at(
+            descriptor,
+            folder.name,
+            payload,
+            overwrite=overwrite,
+        )
     finally:
-        tmp.unlink(missing_ok=True)
-        if owned_claim is not None and _claim_identity(claim) == owned_claim:
-            claim.unlink(missing_ok=True)
-        _unlock_claim(claim_lock)
+        os.close(descriptor)
 
 
 def atomic_replace_file(path: Path, payload: bytes) -> None:
@@ -301,7 +431,19 @@ class SkillStore:
             # Validation and publication share the per-skill lock, so every
             # candidate includes the preceding resource/primary mutation.
             folder = self._require_local(record)
-            atomic_write_primary(folder, payload, overwrite=True)
+            descriptor = _open_directory(
+                folder,
+                expected=record.folder_identity,
+            )
+            try:
+                _atomic_write_primary_at(
+                    descriptor,
+                    record.name,
+                    payload,
+                    overwrite=True,
+                )
+            finally:
+                os.close(descriptor)
         return candidate
 
     def rollback_created(self, folder: Path, *, identity: tuple[int, int]) -> None:
@@ -327,25 +469,43 @@ class SkillStore:
         folder = self._require_real_folder(record)
         path = lexical_contained_path(folder, relative_path, must_exist=True)
         reject_symlink_chain(folder, path)
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        folder_fd = _open_directory(folder, expected=record.folder_identity)
         try:
-            descriptor = os.open(path, flags)
-        except OSError as exc:
-            raise SkillPathError(
-                "requested skill path must be a regular file without symlinks"
-            ) from exc
-        try:
-            value = os.fstat(descriptor)
-            if not stat.S_ISREG(value.st_mode):
-                raise SkillPathError("requested skill path must be a regular file")
-            if value.st_size > MAX_EDITOR_FILE_BYTES:
-                raise SkillFormatError(f"file exceeds {MAX_EDITOR_FILE_BYTES} bytes")
-            with os.fdopen(descriptor, "rb", closefd=False) as handle:
-                payload = handle.read(MAX_EDITOR_FILE_BYTES + 1)
-            if len(payload) > MAX_EDITOR_FILE_BYTES:
-                raise SkillFormatError(f"file exceeds {MAX_EDITOR_FILE_BYTES} bytes")
+            parent_fd, filename = _open_parent_at(folder_fd, path.relative_to(folder))
+            try:
+                flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0)
+                )
+                try:
+                    descriptor = os.open(filename, flags, dir_fd=parent_fd)
+                except OSError as exc:
+                    raise SkillPathError(
+                        "requested skill path must be a regular file without symlinks"
+                    ) from exc
+                try:
+                    value = os.fstat(descriptor)
+                    if not stat.S_ISREG(value.st_mode):
+                        raise SkillPathError(
+                            "requested skill path must be a regular file"
+                        )
+                    if value.st_size > MAX_EDITOR_FILE_BYTES:
+                        raise SkillFormatError(
+                            f"file exceeds {MAX_EDITOR_FILE_BYTES} bytes"
+                        )
+                    with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                        payload = handle.read(MAX_EDITOR_FILE_BYTES + 1)
+                    if len(payload) > MAX_EDITOR_FILE_BYTES:
+                        raise SkillFormatError(
+                            f"file exceeds {MAX_EDITOR_FILE_BYTES} bytes"
+                        )
+                finally:
+                    os.close(descriptor)
+            finally:
+                os.close(parent_fd)
         finally:
-            os.close(descriptor)
+            os.close(folder_fd)
         try:
             return payload.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -396,9 +556,20 @@ class SkillStore:
             folder = self._require_local(record)
             path = lexical_contained_path(folder, relative.as_posix(), must_exist=False)
             reject_symlink_chain(folder, path)
-            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             reject_symlink_chain(folder, path)
-            atomic_replace_file(path, payload)
+            folder_fd = _open_directory(folder, expected=record.folder_identity)
+            try:
+                parent_fd, filename = _open_parent_at(
+                    folder_fd,
+                    path.relative_to(folder),
+                    create=True,
+                )
+                try:
+                    _atomic_replace_file_at(parent_fd, filename, payload)
+                finally:
+                    os.close(parent_fd)
+            finally:
+                os.close(folder_fd)
 
     @staticmethod
     def file_is_editable(record: SkillRecord, relative_path: str) -> bool:

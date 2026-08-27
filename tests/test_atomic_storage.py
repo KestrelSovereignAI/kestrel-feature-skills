@@ -44,6 +44,15 @@ def test_atomic_create_leaves_no_temporary_or_claim_files(tmp_path):
     assert not (folder / ".SKILL.md.claim").exists()
 
 
+def test_create_cleans_folder_after_malformed_link_url(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+
+    with pytest.raises(SkillPathError, match="malformed link URL"):
+        store.create(SkillDocument("bad-url", "Bad URL", "[broken](//[invalid)"))
+
+    assert not (store.local_root / "bad-url").exists()
+
+
 def test_collision_refuses_to_overwrite_existing_primary(tmp_path):
     folder = tmp_path / "atomic"
     folder.mkdir()
@@ -64,12 +73,12 @@ def test_crash_during_non_overwriting_finalization_cleans_owned_files(
     real_link = os.link
     calls = 0
 
-    def fail_second_link(source, destination):
+    def fail_second_link(source, destination, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 2:
             raise OSError("simulated finalization crash")
-        return real_link(source, destination)
+        return real_link(source, destination, **kwargs)
 
     monkeypatch.setattr(module.os, "link", fail_second_link)
     with pytest.raises(OSError, match="simulated"):
@@ -167,23 +176,28 @@ def test_reclaimed_claim_fences_the_expired_writer(tmp_path, monkeypatch):
     real_replace = os.replace
     results = {}
 
-    def coordinated_link(source, destination):
-        result = real_link(source, destination)
+    def coordinated_link(source, destination, **kwargs):
+        result = real_link(source, destination, **kwargs)
         if Path(destination).name != ".SKILL.md.claim":
             return result
         if threading.current_thread().name == "expired-writer":
             stale = time.time() - CLAIM_STALENESS_SECONDS - 5
-            os.utime(destination, (stale, stale))
+            os.utime(
+                destination,
+                (stale, stale),
+                dir_fd=kwargs.get("dst_dir_fd"),
+                follow_symlinks=False,
+            )
             first_claimed.set()
             assert second_claimed.wait(timeout=5)
         else:
             second_claimed.set()
         return result
 
-    def coordinated_replace(source, destination):
+    def coordinated_replace(source, destination, **kwargs):
         if threading.current_thread().name == "replacement-writer":
             assert allow_second_finalize.wait(timeout=5)
-        return real_replace(source, destination)
+        return real_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(os, "link", coordinated_link)
     monkeypatch.setattr(os, "replace", coordinated_replace)
@@ -241,7 +255,14 @@ def test_unexpected_claim_inode_is_rejected_before_locking(tmp_path, monkeypatch
 
     monkeypatch.setattr(store_module.fcntl, "flock", tracked_flock)
 
-    assert store_module._lock_claim(claim, expected=expected) is None
+    directory_fd = store_module._open_directory(tmp_path)
+    try:
+        assert (
+            store_module._lock_claim_at(directory_fd, claim.name, expected=expected)
+            is None
+        )
+    finally:
+        os.close(directory_fd)
     assert lock_operations == []
 
 
@@ -256,7 +277,7 @@ def test_active_writer_claim_cannot_be_stolen_during_final_publication(
     real_replace = os.replace
     results = {}
 
-    def pause_first_publish(source, destination):
+    def pause_first_publish(source, destination, **kwargs):
         if (
             threading.current_thread().name == "first-writer"
             and Path(destination).name == "SKILL.md"
@@ -265,7 +286,7 @@ def test_active_writer_claim_cannot_be_stolen_during_final_publication(
             os.utime(folder / ".SKILL.md.claim", (stale, stale))
             first_at_publish.set()
             assert allow_first_publish.wait(timeout=5)
-        return real_replace(source, destination)
+        return real_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(os, "replace", pause_first_publish)
 
@@ -440,6 +461,120 @@ def test_resource_edit_rejects_symlink_swap_to_primary_after_staging(
 
     assert primary.read_bytes() == original_primary
     assert notes.is_symlink()
+
+
+def test_read_pins_intermediate_directories_against_symlink_swap(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("read-race", "Read race", "Procedure."))
+    references = folder / "references"
+    references.mkdir()
+    (references / "notes.md").write_text("inside", encoding="utf-8")
+    source = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    )
+    record = source.discover()[0][0]
+    outside = tmp_path / "outside-read"
+    outside.mkdir()
+    (outside / "notes.md").write_text("OUTSIDE-SECRET", encoding="utf-8")
+    real_reject = store_module.reject_symlink_chain
+    swapped = False
+
+    def swap_after_check(root, path):
+        nonlocal swapped
+        real_reject(root, path)
+        if root == folder and path == references / "notes.md" and not swapped:
+            shutil.rmtree(references)
+            references.symlink_to(outside, target_is_directory=True)
+            swapped = True
+
+    monkeypatch.setattr(store_module, "reject_symlink_chain", swap_after_check)
+
+    with pytest.raises(SkillPathError, match="symlink|directory"):
+        store.read_file(record, "references/notes.md")
+
+    assert (outside / "notes.md").read_text(encoding="utf-8") == "OUTSIDE-SECRET"
+
+
+def test_write_pins_intermediate_directories_against_symlink_swap(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("write-race", "Write race", "Procedure."))
+    references = folder / "references"
+    references.mkdir()
+    (references / "notes.md").write_text("inside", encoding="utf-8")
+    source = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    )
+    record = source.discover()[0][0]
+    outside = tmp_path / "outside-write"
+    outside.mkdir()
+    outside_notes = outside / "notes.md"
+    outside_notes.write_text("OUTSIDE-ORIGINAL", encoding="utf-8")
+    displaced = tmp_path / "displaced-references"
+    real_reject = store_module.reject_symlink_chain
+    checked = 0
+
+    def swap_after_final_check(root, path):
+        nonlocal checked
+        real_reject(root, path)
+        if root == folder and path == references / "notes.md":
+            checked += 1
+            if checked == 4:
+                references.rename(displaced)
+                references.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(store_module, "reject_symlink_chain", swap_after_final_check)
+
+    with pytest.raises(SkillPathError, match="symlink|directory"):
+        store.write_file(record, "references/notes.md", "replacement")
+
+    assert outside_notes.read_text(encoding="utf-8") == "OUTSIDE-ORIGINAL"
+
+
+def test_primary_edit_pins_skill_folder_against_replacement(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(
+        SkillDocument("primary-race", "Primary race", "Original procedure.")
+    )
+    source = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    )
+    record = source.discover()[0][0]
+    outside = tmp_path / "outside-primary"
+    outside.mkdir()
+    outside_primary = outside / "SKILL.md"
+    outside_primary.write_text("OUTSIDE-PRIMARY", encoding="utf-8")
+    displaced = tmp_path / "displaced-primary"
+    real_open_directory = store_module._open_directory
+    swapped = False
+
+    def swap_before_pinned_open(path, *, expected=None):
+        nonlocal swapped
+        if path == folder and not swapped:
+            folder.rename(displaced)
+            outside.rename(folder)
+            swapped = True
+        return real_open_directory(path, expected=expected)
+
+    monkeypatch.setattr(store_module, "_open_directory", swap_before_pinned_open)
+    replacement = serialize_skill_markdown(
+        SkillDocument("primary-race", "Replacement", "Changed procedure.")
+    )
+
+    with pytest.raises(SkillPathError, match="directory"):
+        store.edit_primary(record, replacement)
+
+    assert (folder / "SKILL.md").read_text(encoding="utf-8") == "OUTSIDE-PRIMARY"
 
 
 def test_limit_crossing_primary_edit_preserves_the_original(tmp_path):

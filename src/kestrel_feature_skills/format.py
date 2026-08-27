@@ -27,6 +27,8 @@ _MARKDOWN_REFERENCE_DEFINITION = re.compile(
     r"(?:\r?\n[ \t]{0,3})?(?:<([^>\r\n]+)>|(\S+))"
 )
 _MARKDOWN_BACKSLASH_ESCAPE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
+_MARKDOWN_AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*)>")
+_MARKDOWN_FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 _REMOTE_SCHEMES = frozenset({"http", "https", "mailto"})
 
 
@@ -171,6 +173,70 @@ def serialize_skill_markdown(document: SkillDocument) -> str:
     )
 
 
+def _mask_markdown_code(body: str) -> str:
+    """Mask fenced blocks and code spans while preserving offsets and newlines."""
+
+    masked = list(body)
+
+    def mask(start: int, end: int) -> None:
+        for position in range(start, end):
+            if masked[position] not in "\r\n":
+                masked[position] = " "
+
+    offset = 0
+    fence_character: str | None = None
+    fence_length = 0
+    for line in body.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        match = _MARKDOWN_FENCE.match(content)
+        if fence_character is None:
+            if match:
+                run = match.group(1)
+                tail = content[match.end() :]
+                if run[0] != "`" or "`" not in tail:
+                    fence_character = run[0]
+                    fence_length = len(run)
+                    mask(offset, offset + len(line))
+        else:
+            mask(offset, offset + len(line))
+            if match:
+                run = match.group(1)
+                if run[0] == fence_character and len(run) >= fence_length:
+                    tail = content[match.end() :]
+                    if not tail.strip():
+                        fence_character = None
+                        fence_length = 0
+        offset += len(line)
+
+    visible = "".join(masked)
+
+    def escaped(position: int) -> bool:
+        backslashes = 0
+        position -= 1
+        while position >= 0 and visible[position] == "\\":
+            backslashes += 1
+            position -= 1
+        return backslashes % 2 == 1
+
+    runs = tuple(
+        match for match in re.finditer(r"`+", visible) if not escaped(match.start())
+    )
+    position = 0
+    while position < len(runs):
+        opening = runs[position]
+        closing_index = position + 1
+        while closing_index < len(runs):
+            closing = runs[closing_index]
+            if len(closing.group(0)) == len(opening.group(0)):
+                mask(opening.start(), closing.end())
+                position = closing_index + 1
+                break
+            closing_index += 1
+        else:
+            position += 1
+    return "".join(masked)
+
+
 def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
     """Extract inline-link targets with balanced, escape-aware label parsing."""
 
@@ -247,10 +313,14 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
 
 def _local_markdown_destinations(body: str) -> tuple[str, ...]:
     destinations: list[str] = []
-    raw_destinations = list(_inline_markdown_destinations(body))
+    visible_body = _mask_markdown_code(body)
+    raw_destinations = list(_inline_markdown_destinations(visible_body))
     raw_destinations.extend(
         match.group(1) or match.group(2)
-        for match in _MARKDOWN_REFERENCE_DEFINITION.finditer(body)
+        for match in _MARKDOWN_REFERENCE_DEFINITION.finditer(visible_body)
+    )
+    raw_destinations.extend(
+        match.group(1) for match in _MARKDOWN_AUTOLINK.finditer(visible_body)
     )
     for candidate in raw_destinations:
         raw = candidate.strip()
@@ -262,7 +332,10 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
         if not raw or raw.startswith("#"):
             continue
         decoded = unquote(raw)
-        split = urlsplit(decoded)
+        try:
+            split = urlsplit(decoded)
+        except ValueError as exc:
+            raise SkillPathError("malformed link URL in SKILL.md") from exc
         if split.scheme:
             if split.scheme.lower() not in _REMOTE_SCHEMES:
                 raise SkillPathError(

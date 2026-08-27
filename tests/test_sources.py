@@ -148,6 +148,28 @@ def test_malformed_folder_is_reported_not_loaded(tmp_path):
     assert "empty" in snapshot.errors[0].error
 
 
+def test_malformed_link_url_is_quarantined_without_aborting_catalog(tmp_path):
+    local = tmp_path / "local"
+    shared = tmp_path / "shared"
+    local.mkdir()
+    shared.mkdir()
+    make_skill(local, "healthy", "Healthy skill")
+    broken = local / "broken-url"
+    broken.mkdir()
+    (broken / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("broken-url", "Broken URL", "[broken](//[invalid)")
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = catalog(local, shared).refresh()
+
+    assert [record.name for record in snapshot.records] == ["healthy"]
+    assert len(snapshot.errors) == 1
+    assert "malformed link URL" in snapshot.errors[0].error
+
+
 def test_discovery_rejects_folder_moved_outside_root_then_replaced_by_symlink(
     tmp_path, monkeypatch
 ):
