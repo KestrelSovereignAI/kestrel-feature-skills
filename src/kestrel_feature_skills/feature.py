@@ -1032,6 +1032,7 @@ class ProceduralSkillsFeature(Feature):
                 if (
                     node is not None
                     and getattr(node, "node_type", None) == PROCEDURAL_SKILL_NODE_TYPE
+                    and getattr(node, "label", None) == name
                 ):
                     await storage.delete_node(node_id)
             except Exception as exc:  # noqa: BLE001 - graph is a recoverable index
@@ -1092,23 +1093,23 @@ class ProceduralSkillsFeature(Feature):
                 f"skill already exists in the resolved catalog: {skill_name}"
             )
         operation: _InstalledSkillOperation | None = None
-        try:
-            with store.git_checkout_workspace() as temporary:
-                target = Path(temporary) / "checkout"
-                checkout = await self._checkout_git_until_stopped(
-                    source_url=source_url,
-                    ref=ref,
-                    skill_name=skill_name,
-                    target=target,
-                )
-                provenance = SkillProvenance(
-                    kind="git",
-                    source_id=checkout.remote_url,
-                    locator=f"{checkout.ref}:{skill_name}",
-                    revision=checkout.revision,
-                    remote_url=checkout.remote_url,
-                )
-                async with self._publication_state_claim(store, skill_name):
+        async with self._publication_state_claim(store, skill_name):
+            try:
+                with store.git_checkout_workspace() as temporary:
+                    target = Path(temporary) / "checkout"
+                    checkout = await self._checkout_git_until_stopped(
+                        source_url=source_url,
+                        ref=ref,
+                        skill_name=skill_name,
+                        target=target,
+                    )
+                    provenance = SkillProvenance(
+                        kind="git",
+                        source_id=checkout.remote_url,
+                        locator=f"{checkout.ref}:{skill_name}",
+                        revision=checkout.revision,
+                        remote_url=checkout.remote_url,
+                    )
                     # Checkout can be slow enough for a host-shared skill with the
                     # same name to appear after the initial catalog check. Refresh
                     # while holding the publication claim so that local install
@@ -1138,18 +1139,18 @@ class ProceduralSkillsFeature(Feature):
                             f"{skill_name}; the shadowed local publication was "
                             "rolled back"
                         )
-        except BaseException as installation_error:
-            # Context-manager exit is part of installation finalization. A
-            # workspace cleanup error after publication must compensate the
-            # committed folder and disabled-state row before reporting failure.
-            if operation is not None:
-                await self._rollback_installed_publication(
-                    store=store,
-                    enablement=enablement,
-                    operation=operation,
-                    publication_error=installation_error,
-                )
-            raise
+            except BaseException as installation_error:
+                # Context-manager exit is part of installation finalization. Keep
+                # the same-name claim through compensation so another feature
+                # instance cannot mutate the publication that is being rolled back.
+                if operation is not None:
+                    await self._rollback_installed_publication(
+                        store=store,
+                        enablement=enablement,
+                        operation=operation,
+                        publication_error=installation_error,
+                    )
+                raise
         assert operation is not None
         return {
             "name": skill_name,
@@ -1425,9 +1426,12 @@ class ProceduralSkillsFeature(Feature):
             node = await storage.get_node(node_id)
             if node is None:
                 return True
-            if getattr(node, "node_type", None) != PROCEDURAL_SKILL_NODE_TYPE:
+            if (
+                getattr(node, "node_type", None) != PROCEDURAL_SKILL_NODE_TYPE
+                or getattr(node, "label", None) != name
+            ):
                 logger.warning(
-                    "Refusing to delete non-procedural node at expected skill index id %s",
+                    "Refusing to delete non-matching node at expected skill index id %s",
                     node_id,
                 )
                 return True

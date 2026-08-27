@@ -999,6 +999,33 @@ async def test_refresh_removes_index_for_authoritative_folder_removed_outside_to
 
 
 @pytest.mark.asyncio
+async def test_refresh_preserves_different_label_at_stale_skill_index_id(feature):
+    name = "vanished-label-collision"
+    await feature.skill_create(name, "Vanishing graph index", "body")
+    node_id = feature._node_id(name)
+    collision = GraphNode(
+        node_id=node_id,
+        node_type=PROCEDURAL_SKILL_NODE_TYPE,
+        label="different-owner",
+        properties={"name": name, "sentinel": "must survive"},
+    )
+    feature.agent.storage.nodes[node_id] = collision
+    folder = feature.agent.procedural_skills_root / name
+    for path in folder.iterdir():
+        path.unlink()
+    folder.rmdir()
+
+    await feature.refresh()
+
+    assert feature.agent.storage.nodes[node_id] is collision
+    assert feature.agent.storage.nodes[node_id].properties == {
+        "name": name,
+        "sentinel": "must survive",
+    }
+    assert node_id not in feature.agent.storage.deleted
+
+
+@pytest.mark.asyncio
 async def test_initialize_removes_persisted_stale_index_from_previous_process(feature):
     await feature.skill_create("restart-stale", "Stale across restart", "body")
     node_id = feature._node_id("restart-stale")
@@ -1584,6 +1611,31 @@ async def test_delete_reports_partial_after_authoritative_folder_removal(
     assert result.data["removed_file"] is True
     assert result.data["graph_deleted"] is False
     assert "graph index cleanup failed" in result.error
+
+
+@pytest.mark.asyncio
+async def test_delete_preserves_different_label_at_skill_index_id(feature):
+    name = "delete-label-collision"
+    await feature.skill_create(name, "Delete graph collision", "body")
+    node_id = feature._node_id(name)
+    collision = GraphNode(
+        node_id=node_id,
+        node_type=PROCEDURAL_SKILL_NODE_TYPE,
+        label="different-owner",
+        properties={"name": name, "sentinel": "must survive"},
+    )
+    feature.agent.storage.nodes[node_id] = collision
+
+    result = await feature.skill_delete(name)
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["graph_deleted"] is True
+    assert feature.agent.storage.nodes[node_id] is collision
+    assert feature.agent.storage.nodes[node_id].properties == {
+        "name": name,
+        "sentinel": "must survive",
+    }
+    assert node_id not in feature.agent.storage.deleted
 
 
 @pytest.mark.asyncio
@@ -2214,6 +2266,86 @@ async def test_git_install_compensates_when_checkout_workspace_cleanup_fails(
     store_module.SkillStore(feature.agent.procedural_skills_root)
 
     assert not observed_workspaces[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_git_install_holds_name_claim_through_cleanup_compensation(
+    feature, monkeypatch
+):
+    name = "cleanup-claim-install"
+    rollback_started = asyncio.Event()
+    release_rollback = asyncio.Event()
+    rival = ProceduralSkillsFeature(feature.agent)
+    await rival.initialize()
+    original_rollback = feature._rollback_installed_publication
+
+    def cleanup_fails_after_publication(_name, *, expected):
+        assert expected
+        raise OSError("simulated checkout workspace cleanup failure")
+
+    async def pause_before_rollback(**kwargs):
+        rollback_started.set()
+        await release_rollback.wait()
+        return await original_rollback(**kwargs)
+
+    async def fake_checkout(*, source_url, ref, skill_name, target):
+        source = target / skill_name
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(skill_name, "Cleanup claim", "Procedure.")
+            ),
+            encoding="utf-8",
+        )
+        return GitCheckout(
+            root=target,
+            skill_folder=source,
+            revision="a" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    monkeypatch.setattr(
+        feature._store,
+        "_remove_git_checkout_workspace",
+        cleanup_fails_after_publication,
+    )
+    monkeypatch.setattr(feature, "_checkout_git_until_stopped", fake_checkout)
+    monkeypatch.setattr(
+        feature, "_rollback_installed_publication", pause_before_rollback
+    )
+
+    installation = asyncio.create_task(
+        feature.install_skill(
+            source_url="https://example.com/repo.git",
+            skill_name=name,
+            ref="main",
+        )
+    )
+    await asyncio.wait_for(rollback_started.wait(), timeout=5)
+    state_update = asyncio.create_task(
+        rival.set_skill_state(name=name, enabled=True, priority=23)
+    )
+    await asyncio.sleep(0.1)
+    state_update_waited = not state_update.done()
+    release_rollback.set()
+    try:
+        with pytest.raises(OSError, match="checkout workspace cleanup failure"):
+            await installation
+        if state_update_waited:
+            with pytest.raises(SkillNotFoundError):
+                await state_update
+        else:
+            await state_update
+    finally:
+        release_rollback.set()
+        await asyncio.gather(installation, state_update, return_exceptions=True)
+        await rival.shutdown()
+        store_module.SkillStore(feature.agent.procedural_skills_root)
+
+    assert state_update_waited, "state update passed install cleanup compensation"
+    assert not (feature.agent.procedural_skills_root / name).exists()
+    assert name not in await feature._enablement.load()
 
 
 @pytest.mark.asyncio
