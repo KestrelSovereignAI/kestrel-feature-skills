@@ -44,6 +44,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-percent-link",
         "kite-malformed-link",
         "kite-complex-links",
+        "kite-deep-containers",
         "kite-malformed-angle-nested",
         "kite-malformed-paren-nested",
         "kite-script-autolink",
@@ -242,6 +243,15 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             'description: "Malformed link complexity attempt"\n---\n\n'
             + "[x]("
             * 64_000,
+            encoding="utf-8",
+        )
+        deep_containers_folder = root / "kite-deep-containers"
+        deep_containers_folder.mkdir()
+        (deep_containers_folder / "SKILL.md").write_text(
+            '---\nname: "kite-deep-containers"\n'
+            'description: "Excessive Markdown containers"\n---\n\n'
+            + "- " * 16_000
+            + "item\n",
             encoding="utf-8",
         )
         malformed_angle_folder = root / "kite-malformed-angle-nested"
@@ -465,6 +475,16 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             json={"enabled": True},
         )
         assert invalid_state.status_code == 422, invalid_state.text
+
+        unknown_name = "kite-never-published-state"
+        unknown_claim = root / f".{unknown_name}.publication-state.lock"
+        unknown_claim.unlink(missing_ok=True)
+        unknown_state = client.patch(
+            f"{base}/{unknown_name}/state",
+            json={"enabled": True},
+        )
+        assert unknown_state.status_code == 404, unknown_state.text
+        assert not unknown_claim.exists()
 
         invalid_git_url = client.post(
             f"{base}/install",
