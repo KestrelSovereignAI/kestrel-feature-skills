@@ -16,7 +16,10 @@ def direct_child(root: Path, name: str) -> Path:
 
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise SkillPathError("skill name must identify one direct child folder")
-    return contained_path(root, name, must_exist=False)
+    candidate = root.resolve(strict=True) / name
+    if candidate.is_symlink():
+        raise SkillPathError("skill direct child must not be a symlink")
+    return candidate
 
 
 def contained_path(root: Path, relative: str, *, must_exist: bool = True) -> Path:

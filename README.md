@@ -43,9 +43,9 @@ Resolution is deterministic:
 
 An agent-local skill shadows a same-named host skill. Every resolved record
 reports provenance, and a git install records the full source commit in
-`.kestrel-provenance.json`. Remote installs use a partial sparse checkout of only
-the requested skill paths and abort if checkout data crosses 32 MiB; the validated
-skill folder itself remains capped at 2 MiB.
+`.kestrel-provenance.json`. Remote installs refuse redirects and use a partial
+sparse checkout of only the requested skill paths. They abort if checkout data
+crosses 32 MiB; the validated skill folder itself remains capped at 2 MiB.
 
 ## Permission rails
 

@@ -477,7 +477,7 @@ def test_git_runner_rejects_host_transport_rewrites(tmp_path, monkeypatch):
         )
 
 
-def test_git_runner_uses_sanitized_config_and_https_only_protocols(
+def test_git_runner_uses_sanitized_config_https_only_protocols_and_no_redirects(
     tmp_path, monkeypatch
 ):
     fake_bin = tmp_path / "bin"
@@ -500,13 +500,15 @@ def test_git_runner_uses_sanitized_config_and_https_only_protocols(
 
     assert payload["global"] == os.devnull
     assert payload["nosystem"] == "1"
-    assert payload["argv"][:6] == [
+    assert payload["argv"][:8] == [
         "-c",
         "protocol.allow=never",
         "-c",
         "protocol.https.allow=always",
         "-c",
         "protocol.file.allow=never",
+        "-c",
+        "http.followRedirects=false",
     ]
 
 

@@ -283,6 +283,45 @@ def _open_directory(path: Path, *, expected: tuple[int, int] | None = None) -> i
     return descriptor
 
 
+def _quarantine_directory_at(
+    root_fd: int,
+    name: str,
+    *,
+    expected: tuple[int, int],
+) -> str:
+    """Atomically detach one expected directory before recursive deletion."""
+
+    try:
+        before = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise SkillPathError("local skill folder changed during deletion") from exc
+    if not stat.S_ISDIR(before.st_mode) or (before.st_dev, before.st_ino) != expected:
+        raise SkillPathError("local skill folder changed during deletion")
+
+    quarantine = f".{name}.delete.{uuid.uuid4().hex}"
+    try:
+        os.rename(
+            name,
+            quarantine,
+            src_dir_fd=root_fd,
+            dst_dir_fd=root_fd,
+        )
+    except OSError as exc:
+        raise SkillPathError("local skill folder changed during deletion") from exc
+
+    moved = _identity_at(root_fd, quarantine)
+    if moved == expected:
+        return quarantine
+
+    # A filesystem actor won the race between the identity check and rename.
+    # Never delete the moved replacement, and do not attempt a check-then-rename
+    # restoration that could itself overwrite a newly raced destination.
+    raise SkillPathError(
+        "local skill folder changed during deletion; "
+        f"unexpected folder preserved as {quarantine}"
+    )
+
+
 def _open_parent_at(
     root_fd: int, relative: Path, *, create: bool = False
 ) -> tuple[int, str]:
@@ -373,6 +412,8 @@ class SkillStore:
         if local_root.is_symlink():
             raise SkillPathError("agent-local skill root must not be a symlink")
         self.local_root = local_root.resolve(strict=True)
+        root_stat = self.local_root.stat()
+        self._local_root_identity = (root_stat.st_dev, root_stat.st_ino)
 
     @staticmethod
     def get(snapshot: CatalogSnapshot, name: str) -> SkillRecord:
@@ -663,7 +704,37 @@ class SkillStore:
     def delete(self, record: SkillRecord) -> None:
         with _serialized_skill_mutation(self.local_root, record.name):
             expected = self._require_local(record)
-            shutil.rmtree(expected)
+            try:
+                current = expected.lstat()
+            except OSError as exc:
+                raise SkillPathError(
+                    "local skill folder changed during deletion"
+                ) from exc
+            expected_identity = record.folder_identity or (
+                current.st_dev,
+                current.st_ino,
+            )
+            root_fd = _open_directory(
+                self.local_root,
+                expected=self._local_root_identity,
+            )
+            quarantine: str | None = None
+            try:
+                quarantine = _quarantine_directory_at(
+                    root_fd,
+                    record.name,
+                    expected=expected_identity,
+                )
+                shutil.rmtree(quarantine, dir_fd=root_fd)
+            except BaseException as exc:
+                if quarantine is not None:
+                    exc.add_note(
+                        "skill deletion did not complete; remaining data, if any, "
+                        f"is preserved as {quarantine}"
+                    )
+                raise
+            finally:
+                os.close(root_fd)
 
     @staticmethod
     def search(snapshot: CatalogSnapshot, query: str) -> tuple[SkillRecord, ...]:

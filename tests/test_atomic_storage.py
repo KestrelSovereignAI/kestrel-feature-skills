@@ -53,6 +53,19 @@ def test_create_cleans_folder_after_malformed_link_url(tmp_path):
     assert not (store.local_root / "bad-url").exists()
 
 
+def test_create_rejects_dangling_direct_child_symlink_without_orphan(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    alternate = store.local_root / "alternate-target"
+    lexical = store.local_root / "dangling"
+    lexical.symlink_to(alternate, target_is_directory=True)
+
+    with pytest.raises(SkillPathError, match="symlink"):
+        store.create(SkillDocument("dangling", "Dangling", "Procedure."))
+
+    assert lexical.is_symlink()
+    assert not alternate.exists()
+
+
 def test_collision_refuses_to_overwrite_existing_primary(tmp_path):
     folder = tmp_path / "atomic"
     folder.mkdir()
@@ -741,3 +754,110 @@ def test_mutation_rejects_real_folder_replacement_after_discovery(tmp_path, oper
             store.delete(record)
 
     assert marker.read_text(encoding="utf-8") == "replacement must survive"
+
+
+def test_delete_refuses_replacement_swapped_in_after_identity_verification(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    original = store.create(SkillDocument("delete-race", "Original", "Procedure."))
+    source = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    )
+    record = source.discover()[0][0]
+    displaced = tmp_path / "displaced-original"
+    replacement_marker = original / "replacement-must-survive.md"
+    real_require = store._require_local
+
+    def swap_after_verification(candidate):
+        verified = real_require(candidate)
+        verified.rename(displaced)
+        verified.mkdir()
+        replacement_marker.write_text("replacement", encoding="utf-8")
+        return verified
+
+    monkeypatch.setattr(store, "_require_local", swap_after_verification)
+
+    with pytest.raises(SkillPathError, match="changed during deletion"):
+        store.delete(record)
+
+    assert replacement_marker.read_text(encoding="utf-8") == "replacement"
+    assert (displaced / "SKILL.md").is_file()
+
+
+def test_delete_preserves_replacement_swapped_during_atomic_quarantine(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    original = store.create(
+        SkillDocument("delete-quarantine-race", "Original", "Procedure.")
+    )
+    source = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    )
+    record = source.discover()[0][0]
+    displaced = tmp_path / "displaced-quarantine-original"
+    replacement_marker = original / "replacement-must-return.md"
+    real_rename = os.rename
+    swapped = False
+
+    def swap_as_quarantine_starts(source_name, destination_name, **kwargs):
+        nonlocal swapped
+        if source_name == record.name and not swapped:
+            swapped = True
+            real_rename(original, displaced)
+            original.mkdir()
+            replacement_marker.write_text("replacement", encoding="utf-8")
+        return real_rename(source_name, destination_name, **kwargs)
+
+    monkeypatch.setattr(store_module.os, "rename", swap_as_quarantine_starts)
+
+    with pytest.raises(SkillPathError, match="changed during deletion"):
+        store.delete(record)
+
+    quarantines = list(store.local_root.glob(".delete-quarantine-race.delete.*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / replacement_marker.name).read_text(
+        encoding="utf-8"
+    ) == "replacement"
+    assert (displaced / "SKILL.md").is_file()
+    assert not original.exists()
+
+
+def test_delete_preserves_quarantined_folder_if_recursive_removal_fails(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    original = store.create(
+        SkillDocument("delete-restore", "Restore on failure", "Procedure.")
+    )
+    source = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    )
+    record = source.discover()[0][0]
+
+    def fail_removal(*_args, **_kwargs):
+        raise OSError("simulated recursive removal failure")
+
+    monkeypatch.setattr(store_module.shutil, "rmtree", fail_removal)
+
+    with pytest.raises(OSError, match="simulated recursive removal failure") as caught:
+        store.delete(record)
+
+    quarantines = list(store.local_root.glob(".delete-restore.delete.*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "SKILL.md").is_file()
+    assert not original.exists()
+    assert any(
+        "preserved as .delete-restore.delete." in note
+        for note in caught.value.__notes__
+    )

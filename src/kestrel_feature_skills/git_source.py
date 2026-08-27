@@ -30,6 +30,8 @@ _GIT_CONFIG_PREFIX = (
     "protocol.https.allow=always",
     "-c",
     "protocol.file.allow=never",
+    "-c",
+    "http.followRedirects=false",
 )
 
 

@@ -526,7 +526,7 @@ bus.on('panel:hidden', (payload) => {
   if (payload?.panelId === PANEL_ID) state.active = false;
 });
 
-bus.on('agent:switch', () => {
+bus.on('agent:switch', (payload) => {
   state.availabilityEpoch += 1;
   state.restoreOnAvailability ||= panelIsSelected();
   state.available = false;
@@ -538,7 +538,12 @@ bus.on('agent:switch', () => {
   clearSelection();
   renderCatalog();
   syncNav();
-  void reconcileAvailability();
+  // A synthetic or superseded switch event must not probe the previous
+  // agent's route and remount its editor after the panel was torn down.
+  // Core pins API routing before emitting the real switch event.
+  if (!payload?.next || currentAgent() === payload.next) {
+    void reconcileAvailability();
+  }
 });
 
 if (typeof globalThis.addEventListener === 'function') {

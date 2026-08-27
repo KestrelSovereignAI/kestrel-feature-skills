@@ -242,6 +242,7 @@ def test_ui_bundle_contains_required_rails_and_no_run_control(feature):
     assert "Save rejected:" in source
     assert "showModal" in source
     assert "agent:switch" in source
+    assert "currentAgent() === payload.next" in source
     assert "capabilities:changed" in source
     assert "reconcileAvailability" in source
     assert "editorOwner" in source
