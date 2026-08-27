@@ -38,6 +38,7 @@ from .enablement import DEFAULT_PRIORITY, SkillEnablementStore, validate_priorit
 from .errors import (
     SkillConflictError,
     SkillError,
+    SkillFormatError,
     SkillPathError,
     SkillPrivacyError,
     SkillPublicationCleanupError,
@@ -800,14 +801,24 @@ class ProceduralSkillsFeature(Feature):
         cached = SkillStore.get(self._snapshot, name)
         async with self._publication_state_claim(store, name):
             await self._refresh_locked()
-            record = SkillStore.get(self._snapshot, name)
+            record = self._snapshot.by_name().get(name)
+            if record is None:
+                raise SkillFormatError(
+                    f"skill {name!r} changed or became invalid before editing; "
+                    "reload and repair its folder"
+                )
             if not _same_resolved_folder(cached, record):
                 raise SkillConflictError(
                     f"resolved source changed before editing {name}; reload and retry"
                 )
             store.write_file(record, relative_path, content)
             await self._refresh_locked()
-            resolved = SkillStore.get(self._snapshot, name)
+            resolved = self._snapshot.by_name().get(name)
+            if resolved is None:
+                raise SkillFormatError(
+                    f"skill {name!r} changed or became invalid after editing; "
+                    "reload and repair its folder"
+                )
             if not _same_resolved_folder(record, resolved):
                 raise SkillConflictError(
                     f"resolved source changed after editing {name}; reload before "

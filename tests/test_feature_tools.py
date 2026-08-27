@@ -18,6 +18,7 @@ from kestrel_feature_skills.enablement import DEFAULT_PRIORITY, MAX_PRIORITY
 from kestrel_feature_skills.errors import (
     GitSourceError,
     SkillConflictError,
+    SkillFormatError,
     SkillNotFoundError,
 )
 from kestrel_feature_skills.feature import PROCEDURAL_SKILL_NODE_TYPE
@@ -1613,6 +1614,28 @@ async def test_edit_rejects_stale_git_local_record_when_host_source_wins(
         assert editor.snapshot.by_name()[name].document.description == "New host winner"
     finally:
         await editor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_edit_reports_cached_skill_that_became_invalid(feature):
+    name = "invalid-before-edit"
+    await feature.create_skill(
+        name=name,
+        description="Valid before external growth",
+        body="Procedure.",
+    )
+    folder = feature.agent.procedural_skills_root / name
+    for index in range(256):
+        (folder / f"external-{index:03}.md").write_text("x", encoding="utf-8")
+
+    with pytest.raises(SkillFormatError, match="changed or became invalid"):
+        await feature.edit_skill(
+            name=name,
+            relative_path="notes.md",
+            content="must not publish",
+        )
+
+    assert not (folder / "notes.md").exists()
 
 
 @pytest.mark.asyncio
