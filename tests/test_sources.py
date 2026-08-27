@@ -399,9 +399,10 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
         timeout=120,
         size_limit_root=None,
         max_bytes=None,
+        max_entries=None,
         cancel_event=None,
     ):
-        commands.append((argv, size_limit_root, max_bytes))
+        commands.append((argv, size_limit_root, max_bytes, max_entries))
         if argv[0] == "clone":
             make_skill(target / "skills", "remote", "Remote default branch")
             return ""
@@ -416,7 +417,7 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
         target=target,
     )
 
-    clone, size_limit_root, max_bytes = commands[0]
+    clone, size_limit_root, max_bytes, max_entries = commands[0]
     assert clone[:3] == ["clone", "--depth", "1"]
     assert "--filter=blob:none" in clone
     assert "--sparse" in clone
@@ -425,7 +426,8 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
     assert "--single-branch" not in clone
     assert size_limit_root == target
     assert max_bytes is not None and 0 < max_bytes <= 64 * 1024 * 1024
-    sparse, sparse_root, sparse_max = commands[1]
+    assert max_entries is not None and 512 < max_entries <= 8192
+    sparse, sparse_root, sparse_max, sparse_entries = commands[1]
     assert sparse[:5] == [
         "-C",
         str(target),
@@ -434,8 +436,12 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
         "--no-cone",
     ]
     assert sparse[-2:] == ["/remote/", "/skills/remote/"]
-    assert (sparse_root, sparse_max) == (size_limit_root, max_bytes)
-    checkout_command, checkout_root, checkout_max = commands[2]
+    assert (sparse_root, sparse_max, sparse_entries) == (
+        size_limit_root,
+        max_bytes,
+        max_entries,
+    )
+    checkout_command, checkout_root, checkout_max, checkout_entries = commands[2]
     assert checkout_command == [
         "-C",
         str(target),
@@ -443,7 +449,11 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
         "--detach",
         "HEAD",
     ]
-    assert (checkout_root, checkout_max) == (size_limit_root, max_bytes)
+    assert (checkout_root, checkout_max, checkout_entries) == (
+        size_limit_root,
+        max_bytes,
+        max_entries,
+    )
     assert checkout.ref == "HEAD"
 
 
@@ -455,6 +465,37 @@ def test_git_runner_rejects_a_checkout_that_crosses_its_disk_bound(tmp_path):
             ["init", str(target)],
             size_limit_root=target,
             max_bytes=1,
+            max_entries=4096,
+        )
+
+
+def test_git_runner_rejects_checkout_with_too_many_zero_byte_entries(
+    tmp_path, monkeypatch
+):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f"#!{sys.executable}\n"
+        "import pathlib, sys, time\n"
+        "root = pathlib.Path(sys.argv[-1])\n"
+        "root.mkdir()\n"
+        "for index in range(17):\n"
+        "    (root / f'empty-{index}').touch()\n"
+        "time.sleep(5)\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    target = tmp_path / "entry-heavy-checkout"
+
+    with pytest.raises(GitSourceError, match="entry limit"):
+        git_source_module._run_git(
+            ["probe", str(target)],
+            timeout=5,
+            size_limit_root=target,
+            max_bytes=1024,
+            max_entries=16,
         )
 
 

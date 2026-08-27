@@ -299,16 +299,32 @@ def test_live_link_after_unclosed_list_fence_is_validated(tmp_path):
 @pytest.mark.parametrize(
     "body",
     (
-        "> ```markdown\n> literal example\n[literal](../example.md)",
-        "- ```markdown\n  literal example\n[literal](../example.md)",
         "- ```markdown\n  literal example\n  - [literal](../example.md)",
+        "> ```markdown\n> literal example\n> > [literal](../example.md)",
     ),
 )
-def test_lazy_container_lines_inside_unclosed_fence_remain_literal(tmp_path, body):
-    value = SkillDocument("lazy-fence", "Lazy fence continuation", body)
+def test_nested_container_lines_inside_unclosed_fence_remain_literal(tmp_path, body):
+    value = SkillDocument("nested-fence", "Nested fence continuation", body)
     folder = write_skill(tmp_path, value)
 
     assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "> ```markdown\n> literal example\nSee [outside](../secret.md)",
+        "- ```markdown\n  literal example\nSee [outside](../secret.md)",
+        "> ```markdown\n> literal example\n[outside](../secret.md)",
+        "- ```markdown\n  literal example\n[outside](../secret.md)",
+    ),
+)
+def test_outdented_line_ends_container_fence_and_validates_live_link(tmp_path, body):
+    value = SkillDocument("outdented-fence", "Outdented fence exit", body)
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
 
 
 def test_new_list_item_ends_unclosed_fence_and_validates_live_link(tmp_path):

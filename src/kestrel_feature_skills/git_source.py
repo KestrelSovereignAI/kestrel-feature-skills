@@ -21,6 +21,7 @@ _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _URL_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 MAX_GIT_TRANSFER_BYTES = 32 * 1024 * 1024
+MAX_GIT_TRANSFER_ENTRIES = 4096
 MAX_GIT_OUTPUT_BYTES = 1024 * 1024
 _TRANSFER_POLL_SECONDS = 0.05
 _GIT_CONFIG_PREFIX = (
@@ -70,24 +71,55 @@ def validate_ref(ref: object) -> str:
     return ref
 
 
-def _tree_exceeds(root: Path, limit: int) -> bool:
-    """Return as soon as checkout data below ``root`` crosses ``limit``."""
+def _tree_limit_exceeded(root: Path, *, max_bytes: int, max_entries: int) -> str | None:
+    """Return the first checkout resource limit crossed below ``root``."""
 
-    if not root.exists():
-        return False
-    total = 0
     try:
-        for current, directories, files in os.walk(root, followlinks=False):
-            for name in (*directories, *files):
-                try:
-                    total += (Path(current) / name).lstat().st_size
-                except FileNotFoundError:
-                    continue
-                if total > limit:
-                    return True
+        root.lstat()
+    except FileNotFoundError:
+        return None
     except OSError as exc:
         raise GitSourceError("could not measure bounded git checkout data") from exc
-    return False
+    total_bytes = 0
+    total_entries = 0
+    pending = [root]
+    try:
+        while pending:
+            current = pending.pop()
+            try:
+                iterator = os.scandir(current)
+            except FileNotFoundError:
+                continue
+            with iterator:
+                for entry in iterator:
+                    total_entries += 1
+                    if total_entries > max_entries:
+                        return "entries"
+                    try:
+                        metadata = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    total_bytes += metadata.st_size
+                    if total_bytes > max_bytes:
+                        return "bytes"
+                    try:
+                        is_directory = entry.is_dir(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if is_directory:
+                        pending.append(Path(entry.path))
+    except OSError as exc:
+        raise GitSourceError("could not measure bounded git checkout data") from exc
+    return None
+
+
+def _tree_limit_error(root: Path, *, max_bytes: int, max_entries: int) -> str | None:
+    exceeded = _tree_limit_exceeded(root, max_bytes=max_bytes, max_entries=max_entries)
+    if exceeded == "bytes":
+        return f"git source exceeded the {max_bytes}-byte transfer limit"
+    if exceeded == "entries":
+        return f"git source exceeded the transfer entry limit of {max_entries}"
+    return None
 
 
 def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -141,12 +173,18 @@ def _run_git(
     timeout: int = 120,
     size_limit_root: Path | None = None,
     max_bytes: int | None = None,
+    max_entries: int | None = None,
     cancel_event: threading.Event | None = None,
 ) -> str:
-    if (size_limit_root is None) != (max_bytes is None) or (
-        max_bytes is not None and max_bytes < 1
+    limits = (max_bytes, max_entries)
+    if size_limit_root is None:
+        if any(limit is not None for limit in limits):
+            raise ValueError("git limiting requires a root and positive bounds")
+    elif any(
+        isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+        for limit in limits
     ):
-        raise ValueError("git size limiting requires a root and a positive byte bound")
+        raise ValueError("git limiting requires a root and positive bounds")
     command = ["git", *_GIT_CONFIG_PREFIX, *argv]
     environment = _git_environment()
     if cancel_event is not None and cancel_event.is_set():
@@ -182,29 +220,39 @@ def _run_git(
                 raise GitSourceError(
                     f"git source exceeded the {MAX_GIT_OUTPUT_BYTES}-byte output limit"
                 )
-            if (
-                size_limit_root is not None
+            limit_error = (
+                _tree_limit_error(
+                    size_limit_root,
+                    max_bytes=max_bytes,
+                    max_entries=max_entries,
+                )
+                if size_limit_root is not None
                 and max_bytes is not None
-                and _tree_exceeds(size_limit_root, max_bytes)
-            ):
+                and max_entries is not None
+                else None
+            )
+            if limit_error is not None:
                 _kill_process_group(process)
                 process.wait()
-                raise GitSourceError(
-                    f"git source exceeded the {max_bytes}-byte transfer limit"
-                )
+                raise GitSourceError(limit_error)
             time.sleep(min(_TRANSFER_POLL_SECONDS, max(remaining, 0)))
         if _bounded_output_size(stdout_file, stderr_file) > MAX_GIT_OUTPUT_BYTES:
             raise GitSourceError(
                 f"git source exceeded the {MAX_GIT_OUTPUT_BYTES}-byte output limit"
             )
-        if (
-            size_limit_root is not None
-            and max_bytes is not None
-            and _tree_exceeds(size_limit_root, max_bytes)
-        ):
-            raise GitSourceError(
-                f"git source exceeded the {max_bytes}-byte transfer limit"
+        limit_error = (
+            _tree_limit_error(
+                size_limit_root,
+                max_bytes=max_bytes,
+                max_entries=max_entries,
             )
+            if size_limit_root is not None
+            and max_bytes is not None
+            and max_entries is not None
+            else None
+        )
+        if limit_error is not None:
+            raise GitSourceError(limit_error)
         stdout = _read_git_output(stdout_file)
         stderr = _read_git_output(stderr_file)
         if process.returncode:
@@ -255,6 +303,7 @@ class GitSkillSource:
             clone,
             size_limit_root=target,
             max_bytes=MAX_GIT_TRANSFER_BYTES,
+            max_entries=MAX_GIT_TRANSFER_ENTRIES,
             cancel_event=cancel_event,
         )
         sparse_paths = [f"/{skill_name}/", f"/skills/{skill_name}/"]
@@ -270,12 +319,14 @@ class GitSkillSource:
             ],
             size_limit_root=target,
             max_bytes=MAX_GIT_TRANSFER_BYTES,
+            max_entries=MAX_GIT_TRANSFER_ENTRIES,
             cancel_event=cancel_event,
         )
         _run_git(
             ["-C", str(target), "checkout", "--detach", "HEAD"],
             size_limit_root=target,
             max_bytes=MAX_GIT_TRANSFER_BYTES,
+            max_entries=MAX_GIT_TRANSFER_ENTRIES,
             cancel_event=cancel_event,
         )
         revision = _run_git(
@@ -331,6 +382,7 @@ class GitSkillSource:
 __all__ = [
     "MAX_GIT_OUTPUT_BYTES",
     "MAX_GIT_TRANSFER_BYTES",
+    "MAX_GIT_TRANSFER_ENTRIES",
     "GitCheckout",
     "GitSkillSource",
     "validate_ref",

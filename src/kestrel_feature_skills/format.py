@@ -336,15 +336,12 @@ def _mask_markdown_code(body: str) -> str:
                 current_quote_depth >= opening_quote_depth
                 and continued_list_ids[: len(opening_list_ids)] == opening_list_ids
             )
-            current_list_ids = container[1]
-            starts_outside_block = bool(
-                not content.strip()
-                or current_quote_depth > opening_quote_depth
-                or current_list_ids
-                or _MARKDOWN_NONPARAGRAPH_BLOCK.match(content.lstrip(" \t"))
-                or _MARKDOWN_REFERENCE_DEFINITION.match(content)
-            )
-            if not continues_container and starts_outside_block:
+            # Fenced code blocks cannot use lazy continuation lines to escape
+            # their blockquote or list item in CommonMark. Some renderers keep
+            # outdented prose inside such a fence, but containment validation
+            # follows the stricter reference grammar and treats the line as
+            # live Markdown as soon as the opening container ends.
+            if not continues_container:
                 fence_character = None
                 fence_length = 0
                 fence_container = None

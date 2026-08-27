@@ -210,7 +210,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         (fence_exit_folder / "SKILL.md").write_text(
             '---\nname: "kite-fence-exit"\n'
             'description: "Fence container escape attempt"\n---\n\n'
-            "> ```markdown\n> literal\n\n[outside](../kite-outside.md)\n",
+            "> ```markdown\n> literal\nSee [outside](../kite-outside.md)\n",
             encoding="utf-8",
         )
         list_reference_folder = root / "kite-list-reference"
@@ -238,7 +238,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             "```markdown\n[fenced](missing-fenced.md)\n```\n\n"
             "> ```markdown\n> [bad]: javascript:alert(1)\n> [click][bad]\n> ````\n"
             "Indented code stays literal:\n\n    [indented](missing-indented.md)\n\n"
-            "> ```markdown\n> literal\n[lazy](missing-lazy.md)\n",
+            "> ```markdown\n> literal\n> > [nested](missing-nested.md)\n",
             encoding="utf-8",
         )
 

@@ -45,7 +45,8 @@ An agent-local skill shadows a same-named host skill. Every resolved record
 reports provenance, and a git install records the full source commit in
 `.kestrel-provenance.json`. Remote installs refuse redirects and use a partial
 sparse checkout of only the requested skill paths. They abort if checkout data
-crosses 32 MiB; the validated skill folder itself remains capped at 2 MiB.
+crosses 32 MiB or 4,096 filesystem entries; the validated skill folder itself
+remains capped at 2 MiB and 512 entries.
 
 ## Permission rails
 
