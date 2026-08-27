@@ -296,6 +296,18 @@ def test_live_link_after_unclosed_list_fence_is_validated(tmp_path):
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+def test_tab_indented_pseudo_fence_does_not_hide_following_live_link(tmp_path):
+    value = SkillDocument(
+        "tab-pseudo-fence",
+        "Tab-indented pseudo-fence",
+        "Example:\n\n\t```markdown\n[outside](../secret.md)",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 @pytest.mark.parametrize(
     "body",
     (

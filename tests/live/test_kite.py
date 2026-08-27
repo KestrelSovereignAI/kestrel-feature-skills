@@ -45,6 +45,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-fence-exit",
         "kite-list-reference",
         "kite-sibling-fence",
+        "kite-tab-pseudo-fence",
     )
     code_example_name = "kite-code-examples"
     unapproved_install = "permission-sentinel"
@@ -229,6 +230,14 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             "- ```markdown\n  literal\n- [outside](../kite-outside.md)\n",
             encoding="utf-8",
         )
+        tab_pseudo_fence_folder = root / "kite-tab-pseudo-fence"
+        tab_pseudo_fence_folder.mkdir()
+        (tab_pseudo_fence_folder / "SKILL.md").write_text(
+            '---\nname: "kite-tab-pseudo-fence"\n'
+            'description: "Tab-indented pseudo-fence escape attempt"\n---\n\n'
+            "Example:\n\n\t```markdown\n[outside](../kite-outside.md)\n",
+            encoding="utf-8",
+        )
         code_example_folder = root / code_example_name
         code_example_folder.mkdir()
         (code_example_folder / "SKILL.md").write_text(
@@ -256,6 +265,25 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             json={"enabled": True},
         )
         assert invalid_state.status_code == 422, invalid_state.text
+
+        invalid_git_url = client.post(
+            f"{base}/install",
+            json={
+                "source_url": "http://example.com/skills.git",
+                "skill_name": "invalid-git-url",
+                "ref": "HEAD",
+            },
+        )
+        assert invalid_git_url.status_code == 422, invalid_git_url.text
+        invalid_git_ref = client.post(
+            f"{base}/install",
+            json={
+                "source_url": "https://example.com/skills.git",
+                "skill_name": "invalid-git-ref",
+                "ref": "bad..ref",
+            },
+        )
+        assert invalid_git_ref.status_code == 422, invalid_git_ref.text
 
         disabled = client.patch(
             f"{base}/{name}/state",

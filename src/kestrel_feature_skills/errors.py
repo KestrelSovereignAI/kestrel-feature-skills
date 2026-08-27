@@ -37,8 +37,13 @@ class GitSourceError(SkillError):
     """A git-backed source could not be validated or read."""
 
 
+class GitInputError(GitSourceError, ValueError):
+    """A caller supplied an invalid Git URL or ref."""
+
+
 __all__ = [
     "EnablementUnavailableError",
+    "GitInputError",
     "GitSourceError",
     "SkillConflictError",
     "SkillError",

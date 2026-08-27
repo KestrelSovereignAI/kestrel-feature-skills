@@ -31,7 +31,11 @@ _MARKDOWN_REFERENCE_DEFINITION = re.compile(
 )
 _MARKDOWN_BACKSLASH_ESCAPE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
 _MARKDOWN_AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*)>")
-_MARKDOWN_FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+# A CommonMark fence may be indented by at most three *columns*. Any tab in
+# the leading whitespace reaches at least column four, so it starts indented
+# code rather than a fence. Matching tabs here would mask live Markdown on the
+# following line when the pseudo-fence is left open.
+_MARKDOWN_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _MARKDOWN_BLOCKQUOTE_PREFIX = re.compile(r"^[ \t]{0,3}>[ \t]?")
 _MARKDOWN_LIST_PREFIX = re.compile(r"^([ ]{0,3})((?:[-+*]|\d{1,9}[.)]))([ \t]+)")
 _MARKDOWN_NONPARAGRAPH_BLOCK = re.compile(

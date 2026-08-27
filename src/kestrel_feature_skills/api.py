@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from .enablement import DEFAULT_PRIORITY
 from .errors import (
     EnablementUnavailableError,
+    GitInputError,
     GitSourceError,
     SkillConflictError,
     SkillFormatError,
@@ -62,6 +63,8 @@ def _http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, EnablementUnavailableError):
         return HTTPException(status_code=503, detail=str(exc))
+    if isinstance(exc, GitInputError):
+        return HTTPException(status_code=422, detail=str(exc))
     if isinstance(exc, GitSourceError):
         return HTTPException(status_code=502, detail=str(exc))
     if isinstance(exc, (SkillFormatError, SkillPathError, ValueError)):

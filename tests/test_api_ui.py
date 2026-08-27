@@ -7,6 +7,8 @@ import pytest
 from fastapi import FastAPI
 from kestrel_sovereign.privacy import PrivacyConfig
 
+from kestrel_feature_skills.errors import GitSourceError
+
 
 @pytest.fixture
 def app(feature):
@@ -89,6 +91,44 @@ async def test_create_api_rejects_non_integer_priority_before_writing(
 
     assert response.status_code == 422
     assert not (feature.agent.procedural_skills_root / "invalid-priority").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_url, ref",
+    (
+        ("http://example.com/skills.git", "HEAD"),
+        ("https://example.com/skills.git", "bad..ref"),
+    ),
+)
+async def test_install_api_maps_invalid_git_input_to_422(client, source_url, ref):
+    response = await client.post(
+        "/api/procedural-skills/install",
+        json={"source_url": source_url, "skill_name": "example", "ref": ref},
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_install_api_keeps_upstream_git_failures_as_502(
+    client, feature, monkeypatch
+):
+    async def fail_install(**_kwargs):
+        raise GitSourceError("remote unavailable")
+
+    monkeypatch.setattr(feature, "install_skill", fail_install)
+
+    response = await client.post(
+        "/api/procedural-skills/install",
+        json={
+            "source_url": "https://example.com/skills.git",
+            "skill_name": "example",
+            "ref": "HEAD",
+        },
+    )
+
+    assert response.status_code == 502
 
 
 @pytest.mark.asyncio

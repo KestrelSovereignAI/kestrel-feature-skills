@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import urlsplit
 
-from .errors import GitSourceError, SkillNotFoundError
+from .errors import GitInputError, GitSourceError, SkillNotFoundError
 from .format import validate_skill_folder, validate_skill_name
 
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
@@ -38,19 +38,19 @@ _GIT_CONFIG_PREFIX = (
 
 def validate_remote_url(url: object) -> str:
     if not isinstance(url, str):
-        raise GitSourceError("git source URL must be a bounded HTTPS URL")
+        raise GitInputError("git source URL must be a bounded HTTPS URL")
     try:
         encoded = url.encode("utf-8")
     except UnicodeEncodeError as exc:
-        raise GitSourceError("git source URL must be valid UTF-8 text") from exc
+        raise GitInputError("git source URL must be valid UTF-8 text") from exc
     if len(encoded) > 2048 or _URL_CONTROL_RE.search(url):
-        raise GitSourceError(
+        raise GitInputError(
             "git source URL must be bounded text without control characters"
         )
     try:
         parsed = urlsplit(url)
     except ValueError as exc:
-        raise GitSourceError("git source URL is malformed") from exc
+        raise GitInputError("git source URL is malformed") from exc
     if (
         parsed.scheme.lower() != "https"
         or not parsed.hostname
@@ -59,7 +59,7 @@ def validate_remote_url(url: object) -> str:
         or parsed.query
         or parsed.fragment
     ):
-        raise GitSourceError(
+        raise GitInputError(
             "git source must use HTTPS without credentials, query parameters, or fragments"
         )
     return url
@@ -67,7 +67,7 @@ def validate_remote_url(url: object) -> str:
 
 def validate_ref(ref: object) -> str:
     if not isinstance(ref, str) or not _REF_RE.fullmatch(ref) or ".." in ref:
-        raise GitSourceError("git ref contains unsupported characters")
+        raise GitInputError("git ref contains unsupported characters")
     return ref
 
 
