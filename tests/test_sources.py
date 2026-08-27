@@ -92,6 +92,24 @@ def test_discovery_rejects_resources_that_skill_read_cannot_open(
     assert message in snapshot.errors[0].error
 
 
+@pytest.mark.parametrize("filename", (r"notes\draft.md", "C:notes.md"))
+def test_discovery_rejects_resource_paths_that_readers_cannot_address(
+    tmp_path, filename
+):
+    local = tmp_path / "local"
+    shared = tmp_path / "shared"
+    local.mkdir()
+    shared.mkdir()
+    folder = make_skill(local, "unaddressable-resource", "Invalid resource path")
+    (folder / filename).write_text("notes", encoding="utf-8")
+
+    snapshot = catalog(local, shared).refresh()
+
+    assert snapshot.records == ()
+    assert len(snapshot.errors) == 1
+    assert "absolute and backslash" in snapshot.errors[0].error
+
+
 def test_enablement_and_priority_survive_catalog_reload(tmp_path):
     local = tmp_path / "local"
     shared = tmp_path / "shared"

@@ -26,6 +26,7 @@ from .format import (
     SKILL_FILENAME,
     parse_skill_markdown,
     serialize_skill_markdown,
+    validate_resource_path,
     validate_skill_folder,
     validate_skill_name,
 )
@@ -892,6 +893,7 @@ class SkillStore:
             )
 
     def read_file(self, record: SkillRecord, relative_path: str) -> str:
+        validate_resource_path(relative_path)
         folder = self._require_real_folder(record)
         path = lexical_contained_path(folder, relative_path, must_exist=True)
         reject_symlink_chain(folder, path)
@@ -938,6 +940,7 @@ class SkillStore:
             raise SkillFormatError("the editor only opens UTF-8 text files") from exc
 
     def write_file(self, record: SkillRecord, relative_path: str, content: str) -> None:
+        validate_resource_path(relative_path)
         folder = self._require_local(record)
         if not isinstance(content, str):
             raise SkillFormatError("editor content must be text")

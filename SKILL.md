@@ -65,6 +65,7 @@
 
 - Absolute paths, `..`, backslashes, and symlink escapes are rejected.
 - Every inventoried file is bounded to 256 KiB of valid UTF-8 text.
+- Resource paths use portable POSIX spelling and at most 1024 UTF-8 bytes.
 - Local Markdown links must resolve inside their skill folder.
 - Frontmatter accepts a strict scalar subset and exactly `name` + `description`.
 - Remote installs require HTTPS with no embedded credentials.

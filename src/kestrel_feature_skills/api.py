@@ -21,6 +21,7 @@ from .errors import (
     SkillPrivacyError,
     SkillReadOnlyError,
 )
+from .format import MAX_RESOURCE_PATH_BYTES
 
 if TYPE_CHECKING:
     from .feature import ProceduralSkillsFeature
@@ -164,7 +165,7 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
     @router.get("/{name}/file")
     async def read_file(
         name: str,
-        path: str = Query(..., min_length=1, max_length=1024),
+        path: str = Query(..., min_length=1, max_length=MAX_RESOURCE_PATH_BYTES),
     ) -> dict[str, object]:
         try:
             await feature.ensure_catalog_ready()

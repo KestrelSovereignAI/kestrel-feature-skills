@@ -34,6 +34,9 @@ the resource inventory as text; omitting the path returns the primary procedure
 body and inventory. Every inventoried file must be UTF-8 text and is capped at
 256 KiB so every successfully discovered resource remains readable through the
 advertised tool and Console surfaces.
+Resource paths use portable POSIX spelling (no backslashes or drive prefixes)
+and are capped at 1024 UTF-8 bytes so every discovered path fits the HTTP read
+contract.
 
 ## Sources and precedence
 

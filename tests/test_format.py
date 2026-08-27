@@ -155,6 +155,36 @@ def test_folder_rejects_resource_path_that_is_not_strict_utf8(tmp_path, monkeypa
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+def test_folder_rejects_path_longer_than_http_read_contract(tmp_path, monkeypatch):
+    folder = write_skill(tmp_path)
+    part = "a" * 200
+    rows = [(str(folder), [part], ["SKILL.md"])]
+    current = folder
+    for _ in range(5):
+        current /= part
+        rows.append((str(current), [part], []))
+
+    def walk_with_long_relative_path(root, *, followlinks, onerror=None):
+        assert root == folder
+        assert followlinks is False
+        return iter(rows)
+
+    real_is_symlink = type(folder).is_symlink
+
+    def synthetic_paths_are_not_symlinks(path):
+        if part in path.parts:
+            return False
+        return real_is_symlink(path)
+
+    monkeypatch.setattr(
+        "kestrel_feature_skills.format.os.walk", walk_with_long_relative_path
+    )
+    monkeypatch.setattr(type(folder), "is_symlink", synthetic_paths_are_not_symlinks)
+
+    with pytest.raises(SkillFormatError, match="path exceeds 1024 UTF-8 bytes"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 @pytest.mark.parametrize(
     "payload, message",
     (

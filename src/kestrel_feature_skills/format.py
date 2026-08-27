@@ -21,6 +21,7 @@ MAX_FOLDER_FILES = 256
 MAX_FOLDER_ENTRIES = 512
 MAX_FOLDER_DEPTH = 32
 MAX_FOLDER_BYTES = 2_097_152
+MAX_RESOURCE_PATH_BYTES = 1024
 SKILL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
 _FRONTMATTER_KEYS = frozenset({"name", "description"})
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
@@ -860,15 +861,34 @@ def validate_document_references(document: SkillDocument, folder: Path) -> None:
         contained_path(folder, destination, must_exist=True)
 
 
-def _direct_relative_parts(relative: str) -> tuple[str, ...]:
+def _direct_relative_parts(relative: object) -> tuple[str, ...]:
     if not isinstance(relative, str) or not relative or "\x00" in relative:
         raise SkillPathError("path must be a non-empty string without NUL bytes")
     if "\\" in relative or relative.startswith("/") or _WINDOWS_DRIVE.match(relative):
         raise SkillPathError("absolute and backslash paths are not allowed")
     pure = PurePosixPath(relative)
-    if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+    if (
+        not pure.parts
+        or pure.is_absolute()
+        or any(part in {"", ".", ".."} for part in pure.parts)
+    ):
         raise SkillPathError("path traversal is not allowed")
     return pure.parts
+
+
+def validate_resource_path(relative: object) -> str:
+    """Validate one portable, HTTP-addressable path inside a skill folder."""
+
+    _direct_relative_parts(relative)
+    assert isinstance(relative, str)  # established above
+    if (
+        len(_utf8_bytes(relative, label="skill resource path"))
+        > MAX_RESOURCE_PATH_BYTES
+    ):
+        raise SkillFormatError(
+            f"skill resource path exceeds {MAX_RESOURCE_PATH_BYTES} UTF-8 bytes"
+        )
+    return relative
 
 
 def _open_pinned_directory_at(
@@ -985,7 +1005,7 @@ def validate_skill_folder_descriptor(
                 raise SkillFormatError(
                     f"skill folder exceeds maximum depth {MAX_FOLDER_DEPTH}"
                 )
-            _utf8_bytes(relative, label="skill resource path")
+            validate_resource_path(relative)
             try:
                 value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except OSError as exc:
@@ -1072,7 +1092,7 @@ def validate_skill_folder(folder: Path, *, source_root: Path) -> SkillDocument:
                 raise SkillFormatError(
                     f"skill folder exceeds maximum depth {MAX_FOLDER_DEPTH}"
                 )
-            _utf8_bytes(relative, label="skill resource path")
+            validate_resource_path(relative)
             if path.is_symlink():
                 raise SkillPathError(
                     f"symlinks are not allowed in skill folders: {path.name}"
@@ -1120,11 +1140,13 @@ __all__ = [
     "MAX_FOLDER_DEPTH",
     "MAX_FOLDER_ENTRIES",
     "MAX_FOLDER_FILES",
+    "MAX_RESOURCE_PATH_BYTES",
     "MAX_SKILL_FILE_BYTES",
     "SKILL_FILENAME",
     "parse_skill_markdown",
     "serialize_skill_markdown",
     "validate_document_references",
+    "validate_resource_path",
     "validate_skill_folder",
     "validate_skill_folder_descriptor",
     "validate_skill_name",

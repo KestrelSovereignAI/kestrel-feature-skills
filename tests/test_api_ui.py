@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from kestrel_sovereign.privacy import PrivacyConfig
 
 from kestrel_feature_skills.errors import GitSourceError
+from kestrel_feature_skills.format import MAX_RESOURCE_PATH_BYTES
 
 
 @pytest.fixture
@@ -146,6 +147,28 @@ async def test_api_refuses_path_escape(path, client):
         params={"path": path},
     )
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_api_read_and_write_share_the_validated_resource_path_cap(client):
+    await client.post(
+        "/api/procedural-skills",
+        json={"name": "bounded-path", "description": "Bounded", "body": "body"},
+    )
+    overlong = "a" * (MAX_RESOURCE_PATH_BYTES + 1)
+
+    written = await client.put(
+        "/api/procedural-skills/bounded-path/file",
+        json={"path": overlong, "content": "notes"},
+    )
+    opened = await client.get(
+        "/api/procedural-skills/bounded-path/file",
+        params={"path": overlong},
+    )
+
+    assert written.status_code == 422
+    assert f"exceeds {MAX_RESOURCE_PATH_BYTES}" in written.json()["detail"]
+    assert opened.status_code == 422
 
 
 @pytest.mark.asyncio

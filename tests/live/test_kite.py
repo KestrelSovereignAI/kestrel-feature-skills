@@ -36,6 +36,8 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-oversized",
         "kite-oversized-resource",
         "kite-binary-resource",
+        "kite-backslash-resource",
+        "kite-drive-resource",
         "kite-no-frontmatter",
         "kite-symlink",
         "kite-nested-link",
@@ -173,6 +175,20 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
                 encoding="utf-8",
             )
             (folder / "reference.txt").write_bytes(content)
+
+        invalid_resource_names = {
+            "kite-backslash-resource": "notes\\draft.md",
+            "kite-drive-resource": "C:notes.md",
+        }
+        for folder_name, resource_name in invalid_resource_names.items():
+            folder = root / folder_name
+            folder.mkdir()
+            (folder / "SKILL.md").write_text(
+                f'---\nname: "{folder_name}"\n'
+                'description: "Unaddressable bundled resource"\n---\n\nProcedure.\n',
+                encoding="utf-8",
+            )
+            (folder / resource_name).write_text("unaddressable\n", encoding="utf-8")
 
         escape_target = root.parent / "kite-outside.md"
         escape_target.write_text("outside\n", encoding="utf-8")
@@ -375,6 +391,17 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         discovered = {skill["name"] for skill in payload["skills"]}
         assert {name, code_example_name, commonmark_control_name} <= discovered
         assert all(rejected_name not in discovered for rejected_name in rejected_names)
+
+        overlong_path = "a" * 1025
+        overlong_write = client.put(
+            f"{base}/{name}/file",
+            json={"path": overlong_path, "content": "must not be written"},
+        )
+        overlong_read = client.get(
+            f"{base}/{name}/file", params={"path": overlong_path}
+        )
+        assert overlong_write.status_code == 422, overlong_write.text
+        assert overlong_read.status_code == 422, overlong_read.text
 
         invalid_state = client.patch(
             f"{base}/INVALID!/state",
