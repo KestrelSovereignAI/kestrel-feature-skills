@@ -1,3 +1,8 @@
+---
+name: "kestrel-feature-skills"
+description: "Author, discover, enable, and safely disclose folder-shaped procedural skills for Kestrel Sovereign."
+---
+
 # ProceduralSkillsFeature
 
 > Folder-shaped procedural knowledge with progressive disclosure, provenance,

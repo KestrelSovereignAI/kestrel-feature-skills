@@ -64,6 +64,12 @@ _DIRECTORY_FLAGS = (
 )
 
 
+def has_python_execution_risk(relative_path: str) -> bool:
+    """Return whether a resource suffix can conventionally denote Python code."""
+
+    return Path(relative_path).suffix.casefold() == ".py"
+
+
 @dataclass(frozen=True, slots=True)
 class CreatedSkillPublication:
     """Inode evidence proving a new folder still has its published contents."""
@@ -73,6 +79,15 @@ class CreatedSkillPublication:
     primary_size: int
     primary_mtime_ns: int
     primary_ctime_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class CreatedParentDirectory:
+    """A pinned parent/name pair for one directory created during an edit."""
+
+    parent_descriptor: int
+    name: str
+    identity: tuple[int, int]
 
 
 @dataclass(slots=True)
@@ -645,18 +660,41 @@ def _remove_expected_directory_at(
 
 
 def _open_parent_at(
-    root_fd: int, relative: Path, *, create: bool = False
+    root_fd: int,
+    relative: Path,
+    *,
+    create: bool = False,
+    created_parents: list[CreatedParentDirectory] | None = None,
 ) -> tuple[int, str]:
     """Traverse a relative parent chain without following mutable symlinks."""
 
     descriptor = os.dup(root_fd)
     try:
         for part in relative.parts[:-1]:
+            created_identity: tuple[int, int] | None = None
             if create:
                 try:
                     os.mkdir(part, mode=0o700, dir_fd=descriptor)
                 except FileExistsError:
                     pass
+                else:
+                    try:
+                        created = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+                    except OSError as exc:
+                        raise SkillPathError(
+                            "new skill path parent could not be inspected"
+                        ) from exc
+                    if not stat.S_ISDIR(created.st_mode):
+                        raise SkillPathError("new skill path parent is not a directory")
+                    created_identity = (created.st_dev, created.st_ino)
+                    if created_parents is not None:
+                        created_parents.append(
+                            CreatedParentDirectory(
+                                parent_descriptor=os.dup(descriptor),
+                                name=part,
+                                identity=created_identity,
+                            )
+                        )
             try:
                 child = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
             except OSError as exc:
@@ -667,12 +705,49 @@ def _open_parent_at(
             if not stat.S_ISDIR(value.st_mode):
                 os.close(child)
                 raise SkillPathError("skill path parent is not a directory")
+            if created_identity is not None and (
+                value.st_dev,
+                value.st_ino,
+            ) != created_identity:
+                os.close(child)
+                raise SkillPathError("new skill path parent changed during creation")
             os.close(descriptor)
             descriptor = child
         return descriptor, relative.name
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _release_created_parent_directories(
+    claims: list[CreatedParentDirectory],
+    *,
+    rollback: bool,
+) -> None:
+    """Close creation claims, removing only unchanged empty parents on rollback."""
+
+    cleanup_error: OSError | None = None
+    for claim in reversed(claims):
+        try:
+            if rollback and _identity_at(claim.parent_descriptor, claim.name) == (
+                claim.identity
+            ):
+                try:
+                    os.rmdir(claim.name, dir_fd=claim.parent_descriptor)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    # A raced writer may have populated the new directory. Keep
+                    # that content instead of turning rollback into deletion.
+                    if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                        cleanup_error = cleanup_error or exc
+        finally:
+            os.close(claim.parent_descriptor)
+    claims.clear()
+    if cleanup_error is not None:
+        raise SkillPublicationCleanupError(
+            "failed resource edit left a newly created parent directory"
+        ) from cleanup_error
 
 
 def _atomic_replace_file_at(
@@ -1352,22 +1427,42 @@ class SkillStore:
                 record.name,
                 expected=record.folder_identity,
             )
+            created_parents: list[CreatedParentDirectory] = []
             try:
-                parent_fd, filename = _open_parent_at(
-                    folder_fd,
-                    path.relative_to(folder),
-                    create=True,
-                )
                 try:
-                    _atomic_replace_file_at(
-                        parent_fd,
-                        filename,
-                        payload,
-                        artifact_directory_fd=artifact_fd,
-                        artifact_label=record.name,
+                    parent_fd, filename = _open_parent_at(
+                        folder_fd,
+                        path.relative_to(folder),
+                        create=True,
+                        created_parents=created_parents,
                     )
-                finally:
-                    os.close(parent_fd)
+                    try:
+                        _atomic_replace_file_at(
+                            parent_fd,
+                            filename,
+                            payload,
+                            artifact_directory_fd=artifact_fd,
+                            artifact_label=record.name,
+                        )
+                    finally:
+                        os.close(parent_fd)
+                except BaseException as exc:
+                    try:
+                        _release_created_parent_directories(
+                            created_parents,
+                            rollback=True,
+                        )
+                    except SkillPublicationCleanupError as cleanup_exc:
+                        cleanup_exc.add_note(
+                            f"original resource edit failure: {type(exc).__name__}: {exc}"
+                        )
+                        raise cleanup_exc from exc
+                    raise
+                else:
+                    _release_created_parent_directories(
+                        created_parents,
+                        rollback=False,
+                    )
             finally:
                 os.close(folder_fd)
 
@@ -1416,7 +1511,9 @@ class SkillStore:
                     "type": "file" if is_file else "directory",
                     "bytes": len(entry.payload) if entry.payload is not None else None,
                     "editable": editable,
-                    "execution_risk": bool(is_file and path.suffix == ".py"),
+                    "execution_risk": bool(
+                        is_file and has_python_execution_risk(entry.path)
+                    ),
                 }
             )
         return tuple(entries)

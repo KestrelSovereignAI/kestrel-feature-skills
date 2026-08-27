@@ -937,6 +937,102 @@ def test_resource_write_failure_does_not_inventory_public_temporary(
     assert errors == ()
 
 
+def test_nested_resource_write_failure_removes_new_empty_parent_directories(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(
+        SkillDocument("nested-write-failure", "Original", "Procedure.")
+    )
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+
+    def fail_publication(*args, **kwargs):
+        raise OSError("simulated nested resource publication failure")
+
+    monkeypatch.setattr(store_module, "_atomic_replace_file_at", fail_publication)
+
+    with pytest.raises(OSError, match="nested resource publication failure"):
+        store.write_file(record, "docs/new/note.md", "replacement")
+
+    assert not (folder / "docs").exists()
+    records, errors = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()
+    assert [item.name for item in records] == ["nested-write-failure"]
+    assert [entry["path"] for entry in store.tree(records[0])] == ["SKILL.md"]
+    assert errors == ()
+
+
+def test_nested_resource_write_failure_preserves_preexisting_parent(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(
+        SkillDocument("existing-parent-failure", "Original", "Procedure.")
+    )
+    (folder / "docs").mkdir()
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+
+    def fail_publication(*args, **kwargs):
+        raise OSError("simulated nested resource publication failure")
+
+    monkeypatch.setattr(store_module, "_atomic_replace_file_at", fail_publication)
+
+    with pytest.raises(OSError, match="nested resource publication failure"):
+        store.write_file(record, "docs/new/note.md", "replacement")
+
+    assert (folder / "docs").is_dir()
+    assert list((folder / "docs").iterdir()) == []
+
+
+def test_nested_resource_write_rollback_preserves_replaced_parent(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(
+        SkillDocument("replaced-parent-failure", "Original", "Procedure.")
+    )
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    displaced = tmp_path / "displaced-created-parent"
+    marker = folder / "docs" / "new" / "replacement-survived.md"
+
+    def replace_parent_then_fail(*args, **kwargs):
+        (folder / "docs" / "new").rename(displaced)
+        (folder / "docs" / "new").mkdir()
+        marker.write_text("replacement", encoding="utf-8")
+        raise OSError("simulated raced parent replacement")
+
+    monkeypatch.setattr(
+        store_module,
+        "_atomic_replace_file_at",
+        replace_parent_then_fail,
+    )
+
+    with pytest.raises(OSError, match="raced parent replacement"):
+        store.write_file(record, "docs/new/note.md", "replacement")
+
+    assert marker.read_text(encoding="utf-8") == "replacement"
+    assert displaced.is_dir()
+
+
 def test_normal_lock_accumulation_does_not_consume_source_entry_budget(tmp_path):
     store = SkillStore(tmp_path / "skills")
     survivor = store.create(

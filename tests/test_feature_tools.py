@@ -1998,6 +1998,26 @@ async def test_python_editor_has_no_execution_effect(feature, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_mixed_case_python_suffix_keeps_execution_risk_warning(feature):
+    await feature.skill_create("mixed-python", "Mixed Python", "body")
+    folder = feature.agent.procedural_skills_root / "mixed-python" / "scripts"
+    folder.mkdir()
+    (folder / "check.PY").write_text("print('still executable')\n", encoding="utf-8")
+    await feature.refresh()
+
+    tree = feature.tree(name="mixed-python")
+    python = next(item for item in tree if item["path"] == "scripts/check.PY")
+    response = feature.read_file(
+        name="mixed-python",
+        relative_path="scripts/check.PY",
+    )
+
+    assert python["execution_risk"] is True
+    assert response["language"] == "python"
+    assert response["execution_risk"] is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("relative_path", ("notes.txt", "tool.py"))
 async def test_read_file_editability_matches_write_policy(feature, relative_path):
     await feature.skill_create("read-policy", "Read policy", "body")

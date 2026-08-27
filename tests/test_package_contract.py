@@ -5,6 +5,7 @@ from importlib import metadata
 from pathlib import Path
 
 from kestrel_feature_skills import ProceduralSkillsFeature
+from kestrel_feature_skills.format import parse_skill_markdown
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,6 +20,16 @@ def test_scaffold_shape_and_entry_point_contract():
     assert (ROOT / "tests").is_dir()
     assert (ROOT / "SKILL.md").is_file()
     assert (ROOT / "README.md").is_file()
+
+
+def test_repository_skill_manifest_is_a_valid_packaged_skill():
+    document = parse_skill_markdown(
+        (ROOT / "SKILL.md").read_bytes(),
+        source="repository SKILL.md",
+    )
+
+    assert document.name == "kestrel-feature-skills"
+    assert document.description
 
 
 def test_installed_entry_point_when_distribution_metadata_is_available():

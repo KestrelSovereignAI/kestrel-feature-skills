@@ -56,7 +56,7 @@ from .sources import (
     DirectorySkillSource,
     SkillCatalog,
 )
-from .store import CreatedSkillPublication, SkillStore
+from .store import CreatedSkillPublication, SkillStore, has_python_execution_risk
 
 logger = logging.getLogger(__name__)
 
@@ -1094,13 +1094,14 @@ class ProceduralSkillsFeature(Feature):
         store, _ = self._require_services()
         record = SkillStore.get(self._snapshot, name)
         content = store.read_file(record, relative_path)
+        execution_risk = has_python_execution_risk(relative_path)
         return {
             "name": name,
             "path": relative_path,
             "content": content,
             "editable": store.file_is_editable(record, relative_path),
-            "language": "python" if relative_path.endswith(".py") else "markdown",
-            "execution_risk": relative_path.endswith(".py"),
+            "language": "python" if execution_risk else "markdown",
+            "execution_risk": execution_risk,
         }
 
     def tree(self, *, name: str) -> tuple[dict[str, object], ...]:
