@@ -36,6 +36,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-oversized",
         "kite-no-frontmatter",
         "kite-symlink",
+        "kite-nested-link",
     )
     unapproved_install = "permission-sentinel"
     for rejected_name in rejected_names:
@@ -127,18 +128,24 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             encoding="utf-8",
         )
         (symlink_folder / "outside.md").symlink_to(escape_target)
+        nested_link_folder = root / "kite-nested-link"
+        nested_link_folder.mkdir()
+        (nested_link_folder / "SKILL.md").write_text(
+            '---\nname: "kite-nested-link"\n'
+            'description: "Nested link escape attempt"\n---\n\n'
+            "Read [outer [inner]](../kite-outside.md).\n",
+            encoding="utf-8",
+        )
 
         reloaded = client.post(f"{base}/reload")
         assert reloaded.status_code == 200, reloaded.text
         payload = reloaded.json()
         errors = {item["locator"]: item["error"] for item in payload["errors"]}
-        assert set(invalid) <= errors.keys()
-        assert "kite-symlink" in errors
+        assert set(rejected_names) <= errors.keys()
         assert all(
             name not in {skill["name"] for skill in payload["skills"]}
-            for name in invalid
+            for name in rejected_names
         )
-        assert "kite-symlink" not in {skill["name"] for skill in payload["skills"]}
 
         disabled = client.patch(
             f"{base}/{name}/state",
