@@ -14,7 +14,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .errors import (
     SkillConflictError,
@@ -49,6 +49,8 @@ from .sources import MAX_SOURCE_ENTRIES, PROVENANCE_FILENAME, serialize_provenan
 
 CLAIM_STALENESS_SECONDS = 60
 INTERNAL_DIRECTORY = ".kestrel-internal"
+GIT_CHECKOUT_PREFIX = ".kestrel-skill-git-"
+GIT_CHECKOUT_LOCK = ".checkout-owner.lock"
 MAX_EDITOR_FILE_BYTES = 262_144
 _MUTATION_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 _MUTATION_LOCKS_GUARD = threading.Lock()
@@ -1021,6 +1023,209 @@ class SkillStore:
         self._local_root_identity = root_identity
         self._internal_root = internal_root
         self._internal_root_identity = internal_identity
+        self._reap_git_checkout_workspaces()
+
+    @staticmethod
+    def _lock_git_checkout_workspace(workspace_fd: int) -> int | None:
+        """Lock one checkout workspace, returning ``None`` when it is active."""
+
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            descriptor = os.open(
+                GIT_CHECKOUT_LOCK,
+                flags,
+                0o600,
+                dir_fd=workspace_fd,
+            )
+        except OSError as exc:
+            raise SkillPathError("could not open the Git checkout owner lock") from exc
+        try:
+            value = os.fstat(descriptor)
+            if not stat.S_ISREG(value.st_mode):
+                raise SkillPathError("Git checkout owner lock must be a regular file")
+            identity = (value.st_dev, value.st_ino)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(descriptor)
+                return None
+        except BaseException:
+            os.close(descriptor)
+            raise
+        try:
+            if _identity_at(workspace_fd, GIT_CHECKOUT_LOCK) != identity:
+                raise SkillPathError(
+                    "Git checkout owner lock changed while acquiring it"
+                )
+            return descriptor
+        except BaseException:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+            raise
+
+    def _git_checkout_workspace_names(self) -> tuple[str, ...]:
+        internal_fd = _open_directory(
+            self._internal_root,
+            expected=self._internal_root_identity,
+        )
+        try:
+            with os.scandir(internal_fd) as entries:
+                return tuple(
+                    entry.name
+                    for entry in entries
+                    if entry.name.startswith(GIT_CHECKOUT_PREFIX)
+                )
+        finally:
+            os.close(internal_fd)
+
+    def _reap_git_checkout_workspaces(self) -> None:
+        """Remove crash-orphaned checkouts while preserving live processes."""
+
+        # Avoid creating the shared publication lock in an otherwise pristine
+        # store. If a candidate appears after this advisory scan, its owner lock
+        # still protects it and a later initialization will reconcile it.
+        if not self._git_checkout_workspace_names():
+            return
+        internal_fd = _open_directory(
+            self._internal_root,
+            expected=self._internal_root_identity,
+        )
+        try:
+            with _serialized_source_publication(
+                self.local_root,
+                internal_fd,
+                enabled=True,
+            ):
+                with os.scandir(internal_fd) as entries:
+                    candidates = tuple(
+                        (entry.name, entry.stat(follow_symlinks=False))
+                        for entry in entries
+                        if entry.name.startswith(GIT_CHECKOUT_PREFIX)
+                    )
+                for name, value in candidates:
+                    if not stat.S_ISDIR(value.st_mode):
+                        continue
+                    identity = (value.st_dev, value.st_ino)
+                    workspace_fd = _open_directory_at(
+                        internal_fd,
+                        name,
+                        expected=identity,
+                    )
+                    try:
+                        owner_lock = self._lock_git_checkout_workspace(workspace_fd)
+                    finally:
+                        os.close(workspace_fd)
+                    if owner_lock is None:
+                        continue
+                    try:
+                        _remove_quarantined_directory_at(
+                            internal_fd,
+                            name,
+                            expected=identity,
+                        )
+                    finally:
+                        fcntl.flock(owner_lock, fcntl.LOCK_UN)
+                        os.close(owner_lock)
+        finally:
+            os.close(internal_fd)
+
+    def _remove_git_checkout_workspace(
+        self,
+        name: str,
+        *,
+        expected: tuple[int, int],
+    ) -> None:
+        """Remove one owned checkout workspace under the cross-process lock."""
+
+        internal_fd = _open_directory(
+            self._internal_root,
+            expected=self._internal_root_identity,
+        )
+        try:
+            with _serialized_source_publication(
+                self.local_root,
+                internal_fd,
+                enabled=True,
+            ):
+                if _identity_at(internal_fd, name) is not None:
+                    # The private workspace name is stable recovery state, not
+                    # a public record. Remove it in place so a kill during
+                    # cleanup leaves the same prefix for the next reaper pass.
+                    _remove_quarantined_directory_at(
+                        internal_fd,
+                        name,
+                        expected=expected,
+                    )
+        finally:
+            os.close(internal_fd)
+
+    @contextmanager
+    def git_checkout_workspace(self):
+        """Yield a crash-recoverable, exclusively owned Git staging folder."""
+
+        name = f"{GIT_CHECKOUT_PREFIX}{uuid.uuid4().hex}"
+        identity: tuple[int, int] | None = None
+        owner_lock: int | None = None
+        owner_lock_attempted = False
+        try:
+            internal_fd = _open_directory(
+                self._internal_root,
+                expected=self._internal_root_identity,
+            )
+            try:
+                with _serialized_source_publication(
+                    self.local_root,
+                    internal_fd,
+                    enabled=True,
+                ):
+                    os.mkdir(name, mode=0o700, dir_fd=internal_fd)
+                    identity = _identity_at(internal_fd, name)
+                    if identity is None:
+                        raise SkillPathError("Git checkout workspace was not created")
+                    workspace_fd = _open_directory_at(
+                        internal_fd,
+                        name,
+                        expected=identity,
+                    )
+                    try:
+                        owner_lock_attempted = True
+                        owner_lock = self._lock_git_checkout_workspace(workspace_fd)
+                    finally:
+                        os.close(workspace_fd)
+                    if owner_lock is None:
+                        raise SkillPathError(
+                            "new Git checkout workspace could not be owned"
+                        )
+            finally:
+                os.close(internal_fd)
+        except BaseException:
+            try:
+                if identity is not None and (
+                    not owner_lock_attempted or owner_lock is not None
+                ):
+                    self._remove_git_checkout_workspace(name, expected=identity)
+            finally:
+                if owner_lock is not None:
+                    fcntl.flock(owner_lock, fcntl.LOCK_UN)
+                    os.close(owner_lock)
+            raise
+
+        workspace = self._internal_root / name
+        try:
+            yield workspace
+        finally:
+            try:
+                assert identity is not None
+                self._remove_git_checkout_workspace(name, expected=identity)
+            finally:
+                if owner_lock is not None:
+                    fcntl.flock(owner_lock, fcntl.LOCK_UN)
+                    os.close(owner_lock)
 
     @property
     def local_root_identity(self) -> tuple[int, int]:
@@ -1460,11 +1665,10 @@ class SkillStore:
     def read_file(self, record: SkillRecord, relative_path: str) -> str:
         validate_resource_path(relative_path)
         folder = self._require_real_folder(record)
-        path = lexical_contained_path(folder, relative_path, must_exist=True)
-        reject_symlink_chain(folder, path)
+        relative = Path(*PurePosixPath(relative_path).parts)
         folder_fd = _open_directory(folder, expected=record.folder_identity)
         try:
-            parent_fd, filename = _open_parent_at(folder_fd, path.relative_to(folder))
+            parent_fd, filename = _open_parent_at(folder_fd, relative)
             try:
                 flags = (
                     os.O_RDONLY

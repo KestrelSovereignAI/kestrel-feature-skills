@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import multiprocessing
 import os
@@ -20,6 +21,7 @@ from kestrel_feature_skills.errors import (
 from kestrel_feature_skills.format import (
     MAX_FOLDER_BYTES,
     MAX_FOLDER_FILES,
+    MAX_RESOURCE_PATH_BYTES,
     MAX_SKILL_FILE_BYTES,
     serialize_skill_markdown,
     validate_skill_folder,
@@ -115,6 +117,19 @@ def _try_publication_state_claim_from_separate_process(root, name, result):
             claim.release()
     except Exception as exc:  # noqa: BLE001 - report child failures to parent
         result.put(f"{type(exc).__name__}: {exc}")
+
+
+def _hold_git_checkout_workspace_from_separate_process(root, result):
+    """Hold a checkout owner lock until the parent deliberately kills us."""
+
+    try:
+        store = SkillStore(Path(root))
+        with store.git_checkout_workspace() as workspace:
+            (workspace / "partial.pack").write_bytes(b"active checkout")
+            result.put(("ready", str(workspace)))
+            time.sleep(60)
+    except Exception as exc:  # noqa: BLE001 - report child failures to parent
+        result.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
 def test_atomic_create_leaves_no_temporary_or_claim_files(tmp_path):
@@ -1370,18 +1385,18 @@ def test_read_pins_intermediate_directories_against_symlink_swap(tmp_path, monke
     outside = tmp_path / "outside-read"
     outside.mkdir()
     (outside / "notes.md").write_text("OUTSIDE-SECRET", encoding="utf-8")
-    real_reject = store_module.reject_symlink_chain
+    real_open_parent = store_module._open_parent_at
     swapped = False
 
-    def swap_after_check(root, path):
+    def swap_before_descriptor_walk(root_fd, relative, **kwargs):
         nonlocal swapped
-        real_reject(root, path)
-        if root == folder and path == references / "notes.md" and not swapped:
+        if relative.as_posix() == "references/notes.md" and not swapped:
             shutil.rmtree(references)
             references.symlink_to(outside, target_is_directory=True)
             swapped = True
+        return real_open_parent(root_fd, relative, **kwargs)
 
-    monkeypatch.setattr(store_module, "reject_symlink_chain", swap_after_check)
+    monkeypatch.setattr(store_module, "_open_parent_at", swap_before_descriptor_walk)
 
     with pytest.raises(SkillPathError, match="symlink|directory"):
         store.read_file(record, "references/notes.md")
@@ -1426,6 +1441,65 @@ def test_read_rejects_replaced_fifo_without_waiting_for_a_writer(tmp_path):
     assert len(errors) == 1
     assert isinstance(errors[0], SkillPathError)
     assert "regular file" in str(errors[0])
+
+
+def test_read_keeps_max_length_resource_traversal_descriptor_relative(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(
+        SkillDocument("long-read", "Long descriptor read", "Procedure.")
+    )
+    parts = tuple(character * 250 for character in "abcd")
+    filename = "notes.md"
+    relative_path = "/".join((*parts, filename))
+    assert len(relative_path.encode("utf-8")) <= MAX_RESOURCE_PATH_BYTES
+
+    descriptor = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        for part in parts:
+            os.mkdir(part, mode=0o700, dir_fd=descriptor)
+            child = os.open(
+                part,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        resource = os.open(
+            filename,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=descriptor,
+        )
+        try:
+            os.write(resource, b"descriptor-relative resource")
+        finally:
+            os.close(resource)
+    finally:
+        os.close(descriptor)
+
+    source = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    )
+    records, errors = source.discover()
+    assert errors == ()
+    record = records[0]
+    assert relative_path in {item["path"] for item in store.tree(record)}
+
+    def absolute_resolution_would_overflow(*_args, **_kwargs):
+        raise OSError(errno.ENAMETOOLONG, "simulated macOS PATH_MAX")
+
+    monkeypatch.setattr(
+        store_module,
+        "lexical_contained_path",
+        absolute_resolution_would_overflow,
+    )
+
+    assert store.read_file(record, relative_path) == "descriptor-relative resource"
 
 
 def test_write_pins_intermediate_directories_against_symlink_swap(
@@ -2468,3 +2542,47 @@ def test_hidden_install_orphan_does_not_block_retry(tmp_path):
     ).discover()
     assert [record.name for record in records] == ["retry-install"]
     assert errors == ()
+
+
+def test_store_reaps_only_unlocked_git_checkout_workspaces(tmp_path):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    orphan = store._internal_root / ".kestrel-skill-git-crashed"
+    orphan.mkdir()
+    (orphan / "partial.pack").write_bytes(b"partial checkout")
+
+    reopened = SkillStore(root)
+
+    assert not orphan.exists()
+    with reopened.git_checkout_workspace() as active:
+        (active / "partial.pack").write_bytes(b"active checkout")
+        concurrent = SkillStore(root)
+        assert concurrent.local_root == reopened.local_root
+        assert active.is_dir()
+    assert not active.exists()
+
+
+def test_store_reaps_git_checkout_after_owner_process_is_killed(tmp_path):
+    root = tmp_path / "skills"
+    SkillStore(root)
+    context = multiprocessing.get_context("spawn")
+    result = context.Queue()
+    owner = context.Process(
+        target=_hold_git_checkout_workspace_from_separate_process,
+        args=(str(root), result),
+    )
+    owner.start()
+    state, detail = result.get(timeout=10)
+    try:
+        assert state == "ready", detail
+        workspace = Path(detail)
+        SkillStore(root)
+        assert workspace.is_dir(), "a live checkout owner was reaped"
+    finally:
+        owner.terminate()
+        owner.join(timeout=10)
+    assert not owner.is_alive()
+
+    SkillStore(root)
+
+    assert not workspace.exists()

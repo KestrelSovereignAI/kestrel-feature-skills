@@ -7,7 +7,6 @@ import hashlib
 import json
 import logging
 import os
-import tempfile
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -999,13 +998,29 @@ class ProceduralSkillsFeature(Feature):
         config_deleted = True
         graph_deleted = True
         errors: list[str] = []
+        enablement_cleanup_error: str | None = None
+        enablement_cleanup_observed_absent = False
         if enablement.available:
             try:
                 await enablement.delete(name)
                 self._states.pop(name, None)
             except DatabaseError as exc:
-                config_deleted = False
-                errors.append(f"enablement row cleanup failed: {exc}")
+                try:
+                    observed_states = await enablement.load()
+                except DatabaseError as reconciliation_error:
+                    enablement_cleanup_error = (
+                        "enablement row cleanup failed and could not be reconciled: "
+                        f"{exc}; reconciliation failed: {reconciliation_error}"
+                    )
+                else:
+                    self._states = dict(observed_states)
+                    if name in observed_states:
+                        enablement_cleanup_error = (
+                            f"enablement row cleanup failed: {exc}"
+                        )
+                    else:
+                        enablement_cleanup_observed_absent = True
+                        self._enablement_error = None
         storage = getattr(self.agent, "storage", None)
         if (
             storage is not None
@@ -1023,6 +1038,16 @@ class ProceduralSkillsFeature(Feature):
                 graph_deleted = False
                 errors.append(f"graph index cleanup failed: {exc}")
         await self._refresh_locked()
+        if enablement_cleanup_error is not None:
+            final_refresh_observed_absent = bool(
+                self._enablement_error is None and name not in self._states
+            )
+            if not (
+                enablement_cleanup_observed_absent
+                or final_refresh_observed_absent
+            ):
+                config_deleted = False
+                errors.insert(0, enablement_cleanup_error)
         remaining = self._snapshot.by_name().get(name)
         return {
             "name": name,
@@ -1066,10 +1091,7 @@ class ProceduralSkillsFeature(Feature):
             raise SkillConflictError(
                 f"skill already exists in the resolved catalog: {skill_name}"
             )
-        with tempfile.TemporaryDirectory(
-            prefix=".kestrel-skill-git-",
-            dir=store.local_root.parent,
-        ) as temporary:
+        with store.git_checkout_workspace() as temporary:
             target = Path(temporary) / "checkout"
             checkout = await self._checkout_git_until_stopped(
                 source_url=source_url,

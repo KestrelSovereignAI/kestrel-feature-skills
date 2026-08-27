@@ -1514,6 +1514,84 @@ async def test_delete_reports_partial_after_authoritative_folder_removal(
 
 
 @pytest.mark.asyncio
+async def test_delete_reconciles_enablement_cleanup_that_committed_before_error(
+    feature, monkeypatch
+):
+    name = "ambiguous-delete"
+    await feature.skill_create(name, "Ambiguous delete", "body", enabled=True)
+    original_delete = feature._enablement.delete
+
+    async def commit_then_disconnect(candidate):
+        await original_delete(candidate)
+        raise DatabaseError("connection lost after delete commit")
+
+    monkeypatch.setattr(feature._enablement, "delete", commit_then_disconnect)
+
+    result = await feature.skill_delete(name)
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["config_deleted"] is True
+    assert result.data["errors"] == []
+    assert name not in await feature._enablement.load()
+
+
+@pytest.mark.asyncio
+async def test_delete_uses_final_refresh_to_reconcile_ambiguous_cleanup(
+    feature, monkeypatch
+):
+    name = "refresh-reconciled-delete"
+    await feature.skill_create(name, "Refresh reconciled delete", "body", enabled=True)
+    original_delete = feature._enablement.delete
+    original_load = feature._enablement.load
+    post_commit = False
+    refused_reconciliation = False
+
+    async def commit_then_disconnect(candidate):
+        nonlocal post_commit
+        await original_delete(candidate)
+        post_commit = True
+        raise DatabaseError("connection lost after delete commit")
+
+    async def fail_first_post_commit_load():
+        nonlocal refused_reconciliation
+        if post_commit and not refused_reconciliation:
+            refused_reconciliation = True
+            raise DatabaseError("read connection also reset once")
+        return await original_load()
+
+    monkeypatch.setattr(feature._enablement, "delete", commit_then_disconnect)
+    monkeypatch.setattr(feature._enablement, "load", fail_first_post_commit_load)
+
+    result = await feature.skill_delete(name)
+
+    assert refused_reconciliation is True
+    assert result.status is ToolResultStatus.OK
+    assert result.data["config_deleted"] is True
+    assert result.data["errors"] == []
+    assert name not in await original_load()
+
+
+@pytest.mark.asyncio
+async def test_delete_reports_enablement_cleanup_that_failed_before_commit(
+    feature, monkeypatch
+):
+    name = "failed-delete-state"
+    await feature.skill_create(name, "Failed state delete", "body", enabled=True)
+
+    async def disconnect_before_commit(_candidate):
+        raise DatabaseError("connection lost before delete commit")
+
+    monkeypatch.setattr(feature._enablement, "delete", disconnect_before_commit)
+
+    result = await feature.skill_delete(name)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["config_deleted"] is False
+    assert "enablement row cleanup failed" in result.error
+    assert name in await feature._enablement.load()
+
+
+@pytest.mark.asyncio
 async def test_delete_failure_cannot_enable_a_same_named_shared_fallback(
     feature, tmp_path, monkeypatch
 ):
@@ -1970,6 +2048,45 @@ async def test_git_install_records_revision_and_leaves_skill_disabled(
     assert record.provenance.revision == "b" * 40
     assert record.provenance.remote_url == "https://example.com/repo.git"
     assert record.state.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_git_install_uses_recoverable_internal_checkout_workspace(
+    feature, monkeypatch
+):
+    observed_workspaces = []
+
+    async def fake_checkout(*, source_url, ref, skill_name, target):
+        workspace = target.parent
+        observed_workspaces.append(workspace)
+        assert workspace.parent == feature._store._internal_root
+        source = target / skill_name
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(skill_name, "Recoverable checkout", "Procedure.")
+            ),
+            encoding="utf-8",
+        )
+        return GitCheckout(
+            root=target,
+            skill_folder=source,
+            revision="a" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    monkeypatch.setattr(feature, "_checkout_git_until_stopped", fake_checkout)
+
+    installed = await feature.install_skill(
+        source_url="https://example.com/repo.git",
+        skill_name="recoverable-checkout",
+        ref="main",
+    )
+
+    assert installed["enabled"] is False
+    assert len(observed_workspaces) == 1
+    assert not observed_workspaces[0].exists()
 
 
 @pytest.mark.asyncio
