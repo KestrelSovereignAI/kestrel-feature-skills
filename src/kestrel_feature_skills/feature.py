@@ -26,7 +26,7 @@ from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
     resolve_feature_database,
 )
-from kestrel_sovereign.storage.async_graph_store import GraphNode
+from kestrel_sovereign.storage.async_graph_store import GraphNode, NodeSwapResult
 from kestrel_sovereign.storage.privacy_wrapper import optional_transition_lock
 
 from .context import (
@@ -1091,39 +1091,40 @@ class ProceduralSkillsFeature(Feature):
             raise SkillConflictError(
                 f"skill already exists in the resolved catalog: {skill_name}"
             )
-        with store.git_checkout_workspace() as temporary:
-            target = Path(temporary) / "checkout"
-            checkout = await self._checkout_git_until_stopped(
-                source_url=source_url,
-                ref=ref,
-                skill_name=skill_name,
-                target=target,
-            )
-            provenance = SkillProvenance(
-                kind="git",
-                source_id=checkout.remote_url,
-                locator=f"{checkout.ref}:{skill_name}",
-                revision=checkout.revision,
-                remote_url=checkout.remote_url,
-            )
-            async with self._publication_state_claim(store, skill_name):
-                # Checkout can be slow enough for a host-shared skill with the
-                # same name to appear after the initial catalog check. Refresh
-                # while holding the publication claim so that local install
-                # cannot silently shadow the newly resolved source.
-                await self._refresh_locked()
-                if skill_name in self._snapshot.by_name():
-                    raise SkillConflictError(
-                        f"skill already exists in the resolved catalog: {skill_name}"
-                    )
-                operation = await self._publish_installed_skill_with_state_claim(
-                    store=store,
-                    enablement=enablement,
-                    source_folder=checkout.skill_folder,
-                    provenance=provenance,
+        operation: _InstalledSkillOperation | None = None
+        try:
+            with store.git_checkout_workspace() as temporary:
+                target = Path(temporary) / "checkout"
+                checkout = await self._checkout_git_until_stopped(
+                    source_url=source_url,
+                    ref=ref,
                     skill_name=skill_name,
+                    target=target,
                 )
-                try:
+                provenance = SkillProvenance(
+                    kind="git",
+                    source_id=checkout.remote_url,
+                    locator=f"{checkout.ref}:{skill_name}",
+                    revision=checkout.revision,
+                    remote_url=checkout.remote_url,
+                )
+                async with self._publication_state_claim(store, skill_name):
+                    # Checkout can be slow enough for a host-shared skill with the
+                    # same name to appear after the initial catalog check. Refresh
+                    # while holding the publication claim so that local install
+                    # cannot silently shadow the newly resolved source.
+                    await self._refresh_locked()
+                    if skill_name in self._snapshot.by_name():
+                        raise SkillConflictError(
+                            f"skill already exists in the resolved catalog: {skill_name}"
+                        )
+                    operation = await self._publish_installed_skill_with_state_claim(
+                        store=store,
+                        enablement=enablement,
+                        source_folder=checkout.skill_folder,
+                        provenance=provenance,
+                        skill_name=skill_name,
+                    )
                     await self._refresh_locked()
                     record = SkillStore.get(self._snapshot, skill_name)
                     if not (
@@ -1137,14 +1138,19 @@ class ProceduralSkillsFeature(Feature):
                             f"{skill_name}; the shadowed local publication was "
                             "rolled back"
                         )
-                except BaseException as finalization_error:
-                    await self._rollback_installed_publication(
-                        store=store,
-                        enablement=enablement,
-                        operation=operation,
-                        publication_error=finalization_error,
-                    )
-                    raise
+        except BaseException as installation_error:
+            # Context-manager exit is part of installation finalization. A
+            # workspace cleanup error after publication must compensate the
+            # committed folder and disabled-state row before reporting failure.
+            if operation is not None:
+                await self._rollback_installed_publication(
+                    store=store,
+                    enablement=enablement,
+                    operation=operation,
+                    publication_error=installation_error,
+                )
+            raise
+        assert operation is not None
         return {
             "name": skill_name,
             "folder": str(operation.folder),
@@ -1321,11 +1327,51 @@ class ProceduralSkillsFeature(Feature):
 
     async def _index_record(self, record: SkillRecord) -> bool:
         storage = getattr(self.agent, "storage", None)
-        if storage is None or not hasattr(storage, "add_node"):
+        if (
+            storage is None
+            or not hasattr(storage, "get_node")
+            or not hasattr(storage, "compare_and_swap_node")
+        ):
             return False
         node = self._index_node(record)
         try:
-            await storage.add_node(node)
+            existing = await storage.get_node(node.node_id)
+            if existing is not None and (
+                getattr(existing, "node_type", None) != PROCEDURAL_SKILL_NODE_TYPE
+                or getattr(existing, "label", None) != record.name
+            ):
+                logger.warning(
+                    "Refusing to overwrite non-matching graph node at expected "
+                    "skill index id %s",
+                    node.node_id,
+                )
+                return False
+            expected = (
+                dict(existing.properties)
+                if existing is not None and isinstance(existing.properties, dict)
+                else None
+            )
+            outcome = await storage.compare_and_swap_node(
+                node.node_id,
+                expected,
+                node,
+            )
+            if outcome != NodeSwapResult.SWAPPED:
+                logger.warning(
+                    "Could not conditionally update procedural_skill index for %s: %s",
+                    record.name,
+                    outcome,
+                )
+                return False
+            persisted = await storage.get_node(node.node_id)
+            if persisted is None or self._index_payload(persisted) != self._index_payload(
+                node
+            ):
+                logger.warning(
+                    "Procedural_skill index for %s changed during verification",
+                    record.name,
+                )
+                return False
         except Exception as exc:  # noqa: BLE001 - graph is a recoverable index
             logger.warning(
                 "Could not update procedural_skill index for %s: %s", record.name, exc

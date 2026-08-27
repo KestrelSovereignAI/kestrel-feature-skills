@@ -10,6 +10,7 @@ from kestrel_sdk.features.contributions import PermissionLevel
 from kestrel_sdk.storage.database import DatabaseError
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.privacy import PrivacyConfig
+from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
 
 import kestrel_feature_skills.store as store_module
 from kestrel_feature_skills import ProceduralSkillsFeature
@@ -754,6 +755,78 @@ async def test_create_writes_procedural_skill_graph_node(feature):
 
 
 @pytest.mark.asyncio
+async def test_indexing_preserves_non_skill_node_at_deterministic_id(feature):
+    name = "graph-id-collision"
+    node_id = feature._node_id(name)
+    unrelated = GraphNode(
+        node_id=node_id,
+        node_type="episode",
+        label="unrelated graph data",
+        properties={"sentinel": "must survive"},
+    )
+    feature.agent.storage.nodes[node_id] = unrelated
+
+    created = await feature.create_skill(
+        name=name,
+        description="Colliding procedural skill",
+        body="Procedure.",
+    )
+
+    assert created["indexed"] is False
+    assert feature.agent.storage.nodes[node_id] is unrelated
+    assert feature.agent.storage.nodes[node_id].node_type == "episode"
+    assert feature.agent.storage.nodes[node_id].properties == {
+        "sentinel": "must survive"
+    }
+    assert name not in feature._indexed_names
+
+
+@pytest.mark.asyncio
+async def test_sqlite_graph_cas_preserves_non_skill_node_at_index_id(
+    feature, tmp_path
+):
+    name = "sqlite-graph-id-collision"
+    agent_id = "did:test:sqlite-graph-id-collision"
+    graph = AsyncGraphStore(feature.agent._raw_storage.db, agent_id=agent_id)
+    agent = SimpleNamespace(
+        did=agent_id,
+        agent_id=agent_id,
+        procedural_skills_root=tmp_path / "sqlite-graph-skills",
+        _raw_storage=feature.agent._raw_storage,
+        storage=graph,
+    )
+    indexed = ProceduralSkillsFeature(agent)
+    node_id = indexed._node_id(name)
+    unrelated = GraphNode(
+        node_id=node_id,
+        node_type="episode",
+        label="unrelated SQLite graph data",
+        properties={"agent_id": agent_id, "sentinel": "must survive"},
+    )
+    await graph.add_node(unrelated)
+    await indexed.initialize()
+    try:
+        created = await indexed.create_skill(
+            name=name,
+            description="SQLite colliding procedural skill",
+            body="Procedure.",
+        )
+
+        persisted = await graph.get_node(node_id)
+        assert created["indexed"] is False
+        assert persisted is not None
+        assert persisted.node_type == "episode"
+        assert persisted.label == "unrelated SQLite graph data"
+        assert persisted.properties == {
+            "agent_id": agent_id,
+            "sentinel": "must survive",
+        }
+    finally:
+        await indexed.shutdown()
+        await graph.delete_node(node_id)
+
+
+@pytest.mark.asyncio
 async def test_refresh_indexes_valid_folder_discovered_outside_the_tools(feature):
     folder = feature.agent.procedural_skills_root / "discovered-index"
     folder.mkdir()
@@ -1483,10 +1556,10 @@ async def test_refresh_retains_last_known_enablement_during_database_outage(
 async def test_graph_failure_is_recoverable_and_file_remains_authoritative(
     feature, monkeypatch
 ):
-    async def fail(_node):
+    async def fail(_node_id, _expected, _node, **_kwargs):
         raise UnexpectedGraphError("graph unavailable")
 
-    monkeypatch.setattr(feature.agent.storage, "add_node", fail)
+    monkeypatch.setattr(feature.agent.storage, "compare_and_swap_node", fail)
     result = await feature.skill_create("file-first", "File survives", "body")
     assert result.status is ToolResultStatus.OK
     assert result.data["indexed"] is False
@@ -2086,6 +2159,60 @@ async def test_git_install_uses_recoverable_internal_checkout_workspace(
 
     assert installed["enabled"] is False
     assert len(observed_workspaces) == 1
+    assert not observed_workspaces[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_git_install_compensates_when_checkout_workspace_cleanup_fails(
+    feature, monkeypatch
+):
+    name = "cleanup-failed-install"
+    observed_workspaces = []
+
+    def cleanup_fails_after_publication(_name, *, expected):
+        assert expected
+        raise OSError("simulated checkout workspace cleanup failure")
+
+    async def fake_checkout(*, source_url, ref, skill_name, target):
+        observed_workspaces.append(target.parent)
+        source = target / skill_name
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(skill_name, "Cleanup failure", "Procedure.")
+            ),
+            encoding="utf-8",
+        )
+        return GitCheckout(
+            root=target,
+            skill_folder=source,
+            revision="a" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    monkeypatch.setattr(
+        feature._store,
+        "_remove_git_checkout_workspace",
+        cleanup_fails_after_publication,
+    )
+    monkeypatch.setattr(feature, "_checkout_git_until_stopped", fake_checkout)
+
+    with pytest.raises(OSError, match="checkout workspace cleanup failure"):
+        await feature.install_skill(
+            source_url="https://example.com/repo.git",
+            skill_name=name,
+            ref="main",
+        )
+
+    assert not (feature.agent.procedural_skills_root / name).exists()
+    assert name not in await feature._enablement.load()
+    assert name not in feature.snapshot.by_name()
+    assert len(observed_workspaces) == 1
+    assert observed_workspaces[0].is_dir()
+
+    store_module.SkillStore(feature.agent.procedural_skills_root)
+
     assert not observed_workspaces[0].exists()
 
 
