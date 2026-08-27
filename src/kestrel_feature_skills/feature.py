@@ -330,7 +330,10 @@ class ProceduralSkillsFeature(Feature):
         store = SkillStore(local_root)
         sources = [
             DirectorySkillSource(
-                root=local_root,
+                # SkillStore pins the resolved directory and its inode.  Use
+                # that same path for discovery so retargeting a symlinked
+                # ancestor cannot split reads from mutations.
+                root=store.local_root,
                 source_id="agent-local",
                 kind="agent-local",
                 precedence=AGENT_LOCAL_PRECEDENCE,

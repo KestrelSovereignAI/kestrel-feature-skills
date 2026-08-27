@@ -338,8 +338,17 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             "Switch to [full view](?mode=full).\n\n"
             "Introductory paragraph\n[example]: ../missing-reference.md\n\n"
             "Use `[example](../missing-code.md)\n<a>\nend` inline.\n\n"
-            "<div>\n[example](../missing-html.md)\n",
+            "<div>\n[example](../missing-html.md)\n\n"
+            "stray [\n\n# heading](../missing-cross-block.md)\n\n"
+            "[broken](../missing-title.md bad title)\n\n"
+            "Do not interpret \\<javascript:alert(1)> as an autolink.\n\n"
+            "Read [angle notes](<foo\\>bar.md>).\n\n"
+            "Read [reference notes][escaped-angle].\n\n"
+            "[escaped-angle]: <foo\\>bar.md>\n",
             encoding="utf-8",
+        )
+        (commonmark_control_folder / "foo>bar.md").write_text(
+            "escaped angle notes\n", encoding="utf-8"
         )
 
         reloaded = client.post(f"{base}/reload")

@@ -359,6 +359,48 @@ async def test_refresh_indexes_valid_folder_discovered_outside_the_tools(feature
 
 
 @pytest.mark.asyncio
+async def test_catalog_discovery_stays_pinned_when_root_ancestor_symlink_moves(
+    feature, tmp_path
+):
+    first_parent = tmp_path / "first-parent"
+    second_parent = tmp_path / "second-parent"
+    first_parent.mkdir()
+    second_parent.mkdir()
+    current_parent = tmp_path / "current-parent"
+    current_parent.symlink_to(first_parent, target_is_directory=True)
+    agent = SimpleNamespace(
+        did="did:test:pinned-skill-root",
+        agent_id="did:test:pinned-skill-root",
+        procedural_skills_root=current_parent / "skills",
+        _raw_storage=feature.agent._raw_storage,
+        storage=feature.agent.storage,
+    )
+    pinned = ProceduralSkillsFeature(agent)
+    await pinned.initialize()
+    try:
+        created = await pinned.skill_create("from-first", "Pinned first root", "body")
+        assert created.status is ToolResultStatus.OK
+
+        (second_parent / "skills" / "from-second").mkdir(parents=True)
+        (second_parent / "skills" / "from-second" / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument("from-second", "Retargeted second root", "body")
+            ),
+            encoding="utf-8",
+        )
+        current_parent.unlink()
+        current_parent.symlink_to(second_parent, target_is_directory=True)
+
+        await pinned.refresh()
+
+        assert "from-first" in pinned.snapshot.by_name()
+        assert "from-second" not in pinned.snapshot.by_name()
+        assert pinned._store.local_root == (first_parent / "skills").resolve()
+    finally:
+        await pinned.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_refresh_removes_index_for_authoritative_folder_removed_outside_tools(
     feature,
 ):

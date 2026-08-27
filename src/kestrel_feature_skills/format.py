@@ -27,7 +27,8 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _UNICODE_LINE_SEPARATOR = re.compile(r"[\x85\u2028\u2029]")
 _MARKDOWN_REFERENCE_DEFINITION = re.compile(
     r"(?m)^[ \t]{0,3}\[(?:\\[^\r\n]|[^\]\\\r\n])+\]:[ \t]*"
-    r"(?:\r?\n[ \t]{0,3})?(?:<([^>\r\n]+)>|(\S+))"
+    r"(?:\r?\n[ \t]{0,3})?"
+    r"(?:<((?:\\[^\r\n]|[^<>\\\r\n])+)>|(\S+))"
 )
 _MARKDOWN_REFERENCE_DEFINITION_START = re.compile(
     r"^[ \t]{0,3}\[(?:\\[^\r\n]|[^\]\\\r\n])+\]:"
@@ -352,7 +353,9 @@ def _reference_continuation_content(
     return content
 
 
-def _analyze_markdown(body: str) -> tuple[str, tuple[str, ...]]:
+def _analyze_markdown(
+    body: str,
+) -> tuple[str, tuple[str, ...], tuple[tuple[int, int], ...]]:
     """Normalize containers, mask code, and find block-valid definitions."""
 
     masked: list[str] = []
@@ -636,13 +639,55 @@ def _analyze_markdown(body: str) -> tuple[str, tuple[str, ...]]:
                 closing_index += 1
             else:
                 position += 1
-    return "".join(masked), tuple(reference_destinations)
+    return (
+        "".join(masked),
+        tuple(reference_destinations),
+        tuple((start, end) for start, end in inline_blocks),
+    )
 
 
 def _mask_markdown_code(body: str) -> str:
     """Normalize containers and mask code while preserving line boundaries."""
 
     return _analyze_markdown(body)[0]
+
+
+def _inline_link_suffix(body: str, cursor: int) -> int | None:
+    """Return the end of a complete link suffix after its destination."""
+
+    if cursor >= len(body):
+        return None
+    if body[cursor] == ")":
+        return cursor + 1
+    if not body[cursor].isspace():
+        return None
+    while cursor < len(body) and body[cursor].isspace():
+        cursor += 1
+    if cursor >= len(body):
+        return None
+    if body[cursor] == ")":
+        return cursor + 1
+    opening = body[cursor]
+    if opening not in {'"', "'", "("}:
+        return None
+    closing = ")" if opening == "(" else opening
+    cursor += 1
+    while cursor < len(body):
+        character = body[cursor]
+        if character == "\\" and cursor + 1 < len(body):
+            cursor += 2
+            continue
+        if character == closing:
+            cursor += 1
+            break
+        if opening == "(" and character == "(":
+            return None
+        cursor += 1
+    else:
+        return None
+    while cursor < len(body) and body[cursor].isspace():
+        cursor += 1
+    return cursor + 1 if cursor < len(body) and body[cursor] == ")" else None
 
 
 def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
@@ -686,8 +731,12 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
                 if body[cursor] in "\r\n<":
                     break
                 if body[cursor] == ">":
-                    destinations.append(body[start : cursor + 1])
-                    cursor += 1
+                    suffix_end = _inline_link_suffix(body, cursor + 1)
+                    if suffix_end is not None:
+                        destinations.append(body[start : cursor + 1])
+                        cursor = suffix_end
+                    else:
+                        cursor += 1
                     break
                 cursor += 1
             index = cursor
@@ -712,26 +761,60 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
                 cursor += 1
                 continue
             if body[cursor].isspace() and parenthesis_depth == 0:
-                destinations.append(body[start:cursor])
+                suffix_end = _inline_link_suffix(body, cursor)
+                if suffix_end is not None:
+                    destinations.append(body[start:cursor])
+                    cursor = suffix_end
                 break
             cursor += 1
         index = cursor
     return tuple(destinations)
 
 
+def _escaped_at(body: str, position: int, *, lower_bound: int = 0) -> bool:
+    backslashes = 0
+    position -= 1
+    while position >= lower_bound and body[position] == "\\":
+        backslashes += 1
+        position -= 1
+    return backslashes % 2 == 1
+
+
+def _angle_destination(candidate: str) -> str | None:
+    """Strip an angle destination using its first unescaped closing delimiter."""
+
+    if not candidate.startswith("<"):
+        return None
+    cursor = 1
+    while cursor < len(candidate):
+        if candidate[cursor] == "\\" and cursor + 1 < len(candidate):
+            cursor += 2
+            continue
+        if candidate[cursor] == ">":
+            return candidate[1:cursor]
+        cursor += 1
+    return None
+
+
 def _local_markdown_destinations(body: str) -> tuple[str, ...]:
     destinations: list[str] = []
-    visible_body, reference_destinations = _analyze_markdown(body)
-    raw_destinations = list(_inline_markdown_destinations(visible_body))
+    visible_body, reference_destinations, inline_blocks = _analyze_markdown(body)
+    raw_destinations: list[str] = []
+    for block_start, block_end in inline_blocks:
+        inline_body = visible_body[block_start:block_end]
+        raw_destinations.extend(_inline_markdown_destinations(inline_body))
+        raw_destinations.extend(
+            match.group(1)
+            for match in _MARKDOWN_AUTOLINK.finditer(inline_body)
+            if not _escaped_at(inline_body, match.start())
+        )
     raw_destinations.extend(reference_destinations)
-    raw_destinations.extend(
-        match.group(1) for match in _MARKDOWN_AUTOLINK.finditer(visible_body)
-    )
     for candidate in raw_destinations:
         raw = candidate.strip()
-        if raw.startswith("<") and ">" in raw:
-            raw = raw[1 : raw.index(">")]
-        else:
+        angle_destination = _angle_destination(raw)
+        if angle_destination is not None:
+            raw = angle_destination
+        elif not raw.startswith("<"):
             raw = raw.split(maxsplit=1)[0]
         raw = _MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", raw)
         if not raw or raw.startswith("#"):

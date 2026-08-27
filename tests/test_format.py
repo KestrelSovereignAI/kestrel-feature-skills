@@ -484,6 +484,93 @@ def test_query_only_same_document_link_is_accepted(tmp_path):
     assert validate_skill_folder(folder, source_root=tmp_path) == value
 
 
+def test_inline_link_label_cannot_cross_commonmark_block_boundary(tmp_path):
+    value = SkillDocument(
+        "cross-block-label",
+        "Cross-block label",
+        "stray [\n\n# heading](../secret.md)",
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "[x](../missing.md bad title)",
+        '[x](../missing.md "unterminated"',
+    ),
+)
+def test_incomplete_inline_link_with_whitespace_is_literal(tmp_path, body):
+    value = SkillDocument("incomplete-link", "Incomplete inline link", body)
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_escaped_angle_destination_terminator_is_part_of_path(tmp_path):
+    value = SkillDocument(
+        "escaped-angle", "Escaped angle destination", r"[notes](<foo\>bar.md>)"
+    )
+    folder = write_skill(tmp_path, value)
+    (folder / "foo>bar.md").write_text("notes", encoding="utf-8")
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_escaped_angle_reference_destination_is_part_of_path(tmp_path):
+    value = SkillDocument(
+        "escaped-angle-reference",
+        "Escaped angle reference destination",
+        "[notes][target]\n\n[target]: <foo\\>bar.md>",
+    )
+    folder = write_skill(tmp_path, value)
+    (folder / "foo>bar.md").write_text("notes", encoding="utf-8")
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        '[notes](notes.md "double-quoted title")',
+        "[notes](notes.md 'single-quoted title')",
+        "[notes](notes.md (parenthesized title))",
+        '[notes](<notes.md> "angle title")',
+    ),
+)
+def test_complete_inline_link_titles_remain_validated(tmp_path, body):
+    value = SkillDocument("titled-link", "Titled inline link", body)
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="does not exist"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_escaped_commonmark_autolink_is_literal(tmp_path):
+    value = SkillDocument(
+        "escaped-autolink",
+        "Escaped autolink",
+        r"Do not interpret \<javascript:alert(1)> as a link.",
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_even_backslash_parity_does_not_escape_commonmark_autolink(tmp_path):
+    value = SkillDocument(
+        "live-autolink-parity",
+        "Live autolink after escaped backslash",
+        r"A literal backslash \\<javascript:alert(1)> precedes a live autolink.",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="unsupported link scheme"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_executable_link_scheme_rejected(tmp_path):
     value = SkillDocument("bad-link", "Bad link", "[click](javascript:alert(1))")
     folder = write_skill(tmp_path, value)
