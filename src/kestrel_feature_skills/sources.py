@@ -13,7 +13,8 @@ from pathlib import Path
 from types import MappingProxyType
 
 from .errors import SkillError, SkillFormatError, SkillPathError
-from .format import validate_skill_folder_descriptor
+from .format import validate_skill_folder_descriptor, validate_skill_name
+from .git_source import validate_ref, validate_remote_url
 from .models import (
     CatalogSnapshot,
     DiscoveryError,
@@ -124,7 +125,7 @@ def _provenance_text(
 
 
 def _validated_provenance(provenance: SkillProvenance) -> SkillProvenance:
-    return SkillProvenance(
+    validated = SkillProvenance(
         kind=_provenance_text(provenance.kind, field="kind"),
         source_id=_provenance_text(provenance.source_id, field="source_id"),
         locator=_provenance_text(provenance.locator, field="locator"),
@@ -133,6 +134,35 @@ def _validated_provenance(provenance: SkillProvenance) -> SkillProvenance:
             provenance.remote_url, field="remote_url", optional=True
         ),
     )
+    if validated.kind != "git":
+        return validated
+    if not isinstance(validated.revision, str) or not re.fullmatch(
+        r"[0-9a-f]{40}", validated.revision
+    ):
+        raise SkillFormatError(
+            "Git provenance revision must be a full lowercase commit hash"
+        )
+    if validated.remote_url is None:
+        raise SkillFormatError("Git provenance remote_url must be present")
+    try:
+        remote_url = validate_remote_url(validated.remote_url)
+    except SkillError as exc:
+        raise SkillFormatError("Git provenance remote_url is invalid") from exc
+    if validated.source_id != remote_url:
+        raise SkillFormatError(
+            "Git provenance source_id must match its validated remote_url"
+        )
+    ref, separator, skill_name = validated.locator.rpartition(":")
+    if not separator:
+        raise SkillFormatError("Git provenance locator must identify ref:skill-name")
+    try:
+        validate_ref(ref)
+        validate_skill_name(skill_name)
+    except SkillError as exc:
+        raise SkillFormatError(
+            "Git provenance locator must identify a valid ref and skill name"
+        ) from exc
+    return validated
 
 
 def _load_provenance_at(

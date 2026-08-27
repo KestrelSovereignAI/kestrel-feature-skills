@@ -311,21 +311,17 @@ class ProceduralSkillsFeature(Feature):
             name: self._index_payload(self._index_node(record))
             for name, record in records_by_name.items()
         }
-        indexed_payloads = (
-            await self._persisted_index_payloads()
-            if self._indexed_payloads is None
-            else dict(self._indexed_payloads)
-        )
+        # The graph is a recoverable secondary index and may be repaired by a
+        # different process. Reconcile against one fresh, agent-scoped batch
+        # instead of trusting the in-memory cache or issuing one query per skill.
+        indexed_payloads = await self._persisted_index_payloads()
         for stale_name in sorted(indexed_payloads.keys() - records_by_name.keys()):
             if await self._delete_index_node(stale_name):
                 indexed_payloads.pop(stale_name, None)
         for record in self._snapshot.records:
             desired_payload = desired_payloads[record.name]
             if indexed_payloads.get(record.name) == desired_payload:
-                persisted_payload = await self._persisted_index_payload(record.name)
-                if persisted_payload == desired_payload:
-                    continue
-                indexed_payloads.pop(record.name, None)
+                continue
             if await self._index_record(record):
                 indexed_payloads[record.name] = desired_payload
         self._indexed_payloads = indexed_payloads
@@ -1396,27 +1392,6 @@ class ProceduralSkillsFeature(Feature):
                 except (AttributeError, TypeError, ValueError):
                     continue
         return payloads
-
-    async def _persisted_index_payload(self, name: str) -> str | None:
-        """Read one index node before trusting the in-memory payload cache."""
-
-        storage = getattr(self.agent, "storage", None)
-        if storage is None or not hasattr(storage, "get_node"):
-            return None
-        node_id = self._node_id(name)
-        try:
-            node = await storage.get_node(node_id)
-        except Exception as exc:  # noqa: BLE001 - graph is a recoverable index
-            logger.warning(
-                "Could not verify procedural_skill index for %s: %s", name, exc
-            )
-            return None
-        if node is None or getattr(node, "node_type", None) != PROCEDURAL_SKILL_NODE_TYPE:
-            return None
-        try:
-            return self._index_payload(node)
-        except (AttributeError, TypeError, ValueError):
-            return None
 
     def _node_id(self, name: str) -> str:
         material = f"{_agent_id(self.agent)}\x00{name}".encode()

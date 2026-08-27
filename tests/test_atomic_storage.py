@@ -40,6 +40,19 @@ def payload(name="atomic"):
     ).encode("utf-8")
 
 
+def git_provenance(name: str) -> SkillProvenance:
+    """Return complete installed-source metadata for storage-focused tests."""
+
+    remote_url = "https://example.com/repo.git"
+    return SkillProvenance(
+        kind="git",
+        source_id=remote_url,
+        locator=f"main:{name}",
+        revision="a" * 40,
+        remote_url=remote_url,
+    )
+
+
 def write_bounded_text_padding(root: Path, total_bytes: int) -> None:
     """Fill a folder without violating the per-resource read contract."""
 
@@ -1116,9 +1129,7 @@ def test_publication_refuses_full_source_without_leaving_skill(
             )
             store.install_folder(
                 source,
-                provenance=SkillProvenance(
-                    "git", "https://example.com/skills.git", f"main:{name}"
-                ),
+                provenance=git_provenance(name),
             )
 
     assert not (store.local_root / name).exists()
@@ -1620,9 +1631,7 @@ def test_install_rollback_preserves_a_changed_publication(tmp_path):
     store = SkillStore(tmp_path / "rollback-local")
     folder, publication = store.install_folder_pinned(
         source,
-        provenance=SkillProvenance(
-            "git", "https://example.com/repo.git", "main:rollback-install"
-        ),
+        provenance=git_provenance("rollback-install"),
     )
     (folder / "notes.md").write_text("changed after publication", encoding="utf-8")
 
@@ -1651,9 +1660,7 @@ def test_install_rollback_quarantines_before_comparing_publication(
     store = SkillStore(tmp_path / "rollback-race-local")
     folder, publication = store.install_folder_pinned(
         source,
-        provenance=SkillProvenance(
-            "git", "https://example.com/repo.git", "main:rollback-race-install"
-        ),
+        provenance=git_provenance("rollback-race-install"),
     )
     inspected = False
     real_inspect = store_module._inspect_child_at
@@ -1695,9 +1702,7 @@ def test_install_rollback_preserves_changed_quarantine_and_raced_replacement(
     store = SkillStore(tmp_path / "rollback-restore-local")
     folder, publication = store.install_folder_pinned(
         source,
-        provenance=SkillProvenance(
-            "git", "https://example.com/repo.git", f"main:{name}"
-        ),
+        provenance=git_provenance(name),
     )
     real_inspect = store_module._inspect_child_at
     replacement_marker = folder / "replacement.md"
@@ -1750,7 +1755,7 @@ def test_install_rejects_generated_provenance_crossing_file_limit(tmp_path):
     with pytest.raises(SkillFormatError, match="exceeds.*files"):
         store.install_folder(
             source,
-            provenance=SkillProvenance("git", "https://example.com/repo.git", "main"),
+            provenance=git_provenance(document.name),
         )
 
     assert not (store.local_root / document.name).exists()
@@ -1800,7 +1805,7 @@ def test_install_rejects_generated_provenance_crossing_byte_limit(tmp_path):
     with pytest.raises(SkillFormatError, match="exceeds.*bytes"):
         store.install_folder(
             source,
-            provenance=SkillProvenance("git", "https://example.com/repo.git", "main"),
+            provenance=git_provenance(document.name),
         )
 
     assert not (store.local_root / document.name).exists()
@@ -2353,9 +2358,7 @@ def test_install_keeps_target_hidden_until_complete(tmp_path, monkeypatch):
 
     installed = store.install_folder(
         source,
-        provenance=SkillProvenance(
-            "git", "https://example.com/repo.git", "main:hidden-install"
-        ),
+        provenance=git_provenance("hidden-install"),
     )
 
     assert observed_copy
@@ -2426,9 +2429,7 @@ def test_publication_does_not_replace_raced_empty_destination(
             )
             store.install_folder(
                 source,
-                provenance=SkillProvenance(
-                    "git", "https://example.com/repo.git", f"main:{name}"
-                ),
+                provenance=git_provenance(name),
             )
 
     assert raced_identity is not None
@@ -2454,9 +2455,7 @@ def test_hidden_install_orphan_does_not_block_retry(tmp_path):
 
     installed = store.install_folder(
         source,
-        provenance=SkillProvenance(
-            "git", "https://example.com/repo.git", "main:retry-install"
-        ),
+        provenance=git_provenance("retry-install"),
     )
 
     assert (installed / "SKILL.md").is_file()

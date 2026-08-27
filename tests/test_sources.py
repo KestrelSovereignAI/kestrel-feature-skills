@@ -332,6 +332,53 @@ def test_host_shared_git_provenance_keeps_host_precedence(tmp_path):
     assert snapshot.shadowed["promoted"] == (local_provenance,)
 
 
+@pytest.mark.parametrize(
+    ("override", "invalid_field"),
+    (
+        ({"revision": None}, "revision"),
+        (
+            {
+                "source_id": "http://example.com/source.git",
+                "remote_url": "http://example.com/source.git",
+            },
+            "remote_url",
+        ),
+        ({"source_id": "https://example.com/other.git"}, "source_id"),
+        ({"locator": "missing-skill-name"}, "locator"),
+    ),
+)
+def test_invalid_git_provenance_is_rejected_before_resolution(
+    tmp_path, override, invalid_field
+):
+    local = tmp_path / "local"
+    shared = tmp_path / "shared"
+    local.mkdir()
+    shared.mkdir()
+    local_folder = make_skill(local, "false-git", "local false Git claim")
+    make_skill(shared, "false-git", "valid host fallback")
+    provenance = {
+        "version": 1,
+        "kind": "git",
+        "source_id": "https://example.com/source.git",
+        "locator": "main:false-git",
+        "revision": "a" * 40,
+        "remote_url": "https://example.com/source.git",
+    }
+    provenance.update(override)
+    (local_folder / PROVENANCE_FILENAME).write_text(
+        json.dumps(provenance),
+        encoding="utf-8",
+    )
+
+    snapshot = catalog(local, shared).refresh()
+
+    assert snapshot.by_name()["false-git"].source_kind == "host-shared"
+    assert "false-git" not in snapshot.shadowed
+    assert len(snapshot.errors) == 1
+    assert snapshot.errors[0].locator == "false-git"
+    assert f"Git provenance {invalid_field}" in snapshot.errors[0].error
+
+
 def test_malformed_folder_is_reported_not_loaded(tmp_path):
     local = tmp_path / "local"
     shared = tmp_path / "shared"

@@ -805,6 +805,40 @@ async def test_unchanged_refresh_repairs_externally_damaged_graph_node(
 
 
 @pytest.mark.asyncio
+async def test_unchanged_refresh_verifies_graph_nodes_in_one_batch(
+    feature, monkeypatch
+):
+    for index in range(3):
+        await feature.skill_create(
+            f"batch-index-{index}",
+            f"Batch graph index {index}",
+            "body",
+        )
+    batch_calls = 0
+    point_calls = 0
+    original_batch = feature.agent.storage.get_nodes_by_type
+    original_point = feature.agent.storage.get_node
+
+    async def count_batch(node_type):
+        nonlocal batch_calls
+        batch_calls += 1
+        return await original_batch(node_type)
+
+    async def count_point(node_id):
+        nonlocal point_calls
+        point_calls += 1
+        return await original_point(node_id)
+
+    monkeypatch.setattr(feature.agent.storage, "get_nodes_by_type", count_batch)
+    monkeypatch.setattr(feature.agent.storage, "get_node", count_point)
+
+    await feature.refresh()
+
+    assert batch_calls == 1
+    assert point_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_state_change_indexes_graph_once_despite_multiple_refreshes(feature):
     await feature.skill_create("changed-index", "Changed graph index", "body")
     feature.agent.storage.added.clear()
