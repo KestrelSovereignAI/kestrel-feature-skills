@@ -227,6 +227,7 @@ async function loadCatalog() {
   } catch (error) {
     if (epoch === state.catalogEpoch && currentAgent() === agent) {
       setStatus(detail(error), true);
+      void reconcileAvailability();
     }
   }
 }
@@ -243,6 +244,7 @@ async function reloadCatalog() {
   } catch (error) {
     if (epoch === state.catalogEpoch && currentAgent() === agent) {
       setStatus(detail(error), true);
+      void reconcileAvailability();
     }
   }
 }

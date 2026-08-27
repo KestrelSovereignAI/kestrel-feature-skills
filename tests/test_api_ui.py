@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -255,6 +256,41 @@ async def test_catalog_route_rehydrates_after_persistent_privacy_returns(
     assert catalog.json()["skills"][0]["name"] == "privacy-ui"
     assert opened.status_code == 200
     assert "Privacy UI" in opened.json()["content"]
+
+
+@pytest.mark.asyncio
+async def test_tree_and_file_routes_hold_privacy_lock_through_filesystem_reads(
+    client, feature, monkeypatch
+):
+    await client.post(
+        "/api/procedural-skills",
+        json={"name": "privacy-http", "description": "Privacy HTTP", "body": "body"},
+    )
+    feature.agent._privacy_transition_lock = asyncio.Lock()
+    feature.agent.privacy_config = PrivacyConfig(storage="full")
+    observed = []
+    original_tree = feature._store.tree
+    original_read_file = feature._store.read_file
+
+    def observed_tree(record):
+        observed.append(("tree", feature.agent._privacy_transition_lock.locked()))
+        return original_tree(record)
+
+    def observed_read_file(record, relative_path):
+        observed.append(("file", feature.agent._privacy_transition_lock.locked()))
+        return original_read_file(record, relative_path)
+
+    monkeypatch.setattr(feature._store, "tree", observed_tree)
+    monkeypatch.setattr(feature._store, "read_file", observed_read_file)
+
+    tree = await client.get("/api/procedural-skills/privacy-http/tree")
+    opened = await client.get(
+        "/api/procedural-skills/privacy-http/file", params={"path": "SKILL.md"}
+    )
+
+    assert tree.status_code == 200
+    assert opened.status_code == 200
+    assert observed == [("tree", True), ("file", True)]
 
 
 @pytest.mark.asyncio

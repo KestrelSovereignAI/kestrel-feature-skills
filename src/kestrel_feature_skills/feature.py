@@ -195,28 +195,26 @@ class ProceduralSkillsFeature(Feature):
         )
 
     async def refresh(self) -> CatalogSnapshot:
-        async with optional_transition_lock(_privacy_transition_lock(self.agent)):
-            if self._privacy_hidden():
-                self._hide_persistent_state()
-                return self._snapshot
-            self._ensure_persistent_services()
-            return await self._refresh_locked()
+        async with self.persistent_read(refresh=True):
+            return self._snapshot
 
-    async def ensure_catalog_ready(self) -> bool:
-        """Lazily rehydrate read services after persistent privacy returns."""
+    @asynccontextmanager
+    async def persistent_read(self, *, refresh: bool = False):
+        """Hold the privacy-transition lock through one persisted read scope."""
 
         async with optional_transition_lock(_privacy_transition_lock(self.agent)):
             if self._privacy_hidden():
                 self._hide_persistent_state()
-                return False
+                yield False
+                return
             needs_refresh = any(
                 service is None
                 for service in (self._store, self._catalog, self._enablement)
             )
             self._ensure_persistent_services()
-            if needs_refresh:
+            if refresh or needs_refresh:
                 await self._refresh_locked()
-            return True
+            yield True
 
     async def _refresh_locked(self) -> CatalogSnapshot:
         if self._catalog is None or self._enablement is None:
@@ -1154,8 +1152,8 @@ class ProceduralSkillsFeature(Feature):
     )
     async def skill_list(self) -> ToolResult:
         try:
-            await self.ensure_catalog_ready()
-            payload = self.catalog_payload()
+            async with self.persistent_read():
+                payload = self.catalog_payload()
         except (SkillError, OSError, DatabaseError, RuntimeError) as exc:
             return ToolResult.failed(str(exc))
         names = [item["name"] for item in payload["skills"]]  # type: ignore[index]
@@ -1174,26 +1172,26 @@ class ProceduralSkillsFeature(Feature):
     )
     async def skill_read(self, name: str, path: str = SKILL_FILENAME) -> ToolResult:
         try:
-            await self.ensure_catalog_ready()
-            inventory = self.read_skill(name=name)
-            if path == SKILL_FILENAME:
-                payload = inventory
-                confirmation = f"Read procedural skill {name}:\n{payload['body']}"
-            else:
-                inventoried_files = {
-                    str(item["path"])
-                    for item in inventory["resources"]
-                    if item.get("type") == "file"
-                }
-                if path not in inventoried_files:
-                    raise SkillPathError(
-                        f"resource is not in the skill inventory: {path}"
+            async with self.persistent_read():
+                inventory = self.read_skill(name=name)
+                if path == SKILL_FILENAME:
+                    payload = inventory
+                    confirmation = f"Read procedural skill {name}:\n{payload['body']}"
+                else:
+                    inventoried_files = {
+                        str(item["path"])
+                        for item in inventory["resources"]
+                        if item.get("type") == "file"
+                    }
+                    if path not in inventoried_files:
+                        raise SkillPathError(
+                            f"resource is not in the skill inventory: {path}"
+                        )
+                    payload = self.read_file(name=name, relative_path=path)
+                    confirmation = (
+                        f"Read procedural skill resource {name}/{path} as text; "
+                        f"no code was executed:\n{payload['content']}"
                     )
-                payload = self.read_file(name=name, relative_path=path)
-                confirmation = (
-                    f"Read procedural skill resource {name}/{path} as text; "
-                    f"no code was executed:\n{payload['content']}"
-                )
         except (SkillError, OSError, DatabaseError, RuntimeError) as exc:
             return ToolResult.failed(str(exc))
         return ToolResult.ok(confirmation, data=payload)
@@ -1206,14 +1204,14 @@ class ProceduralSkillsFeature(Feature):
     )
     async def skill_search(self, query: str) -> ToolResult:
         try:
-            await self.ensure_catalog_ready()
-            matches = SkillStore.search(self.snapshot, query)
+            async with self.persistent_read():
+                matches = SkillStore.search(self.snapshot, query)
+                rows = [
+                    self._record_payload(record, set(self._context_render.included))
+                    for record in matches
+                ]
         except (SkillError, OSError, DatabaseError, RuntimeError) as exc:
             return ToolResult.failed(str(exc))
-        rows = [
-            self._record_payload(record, set(self._context_render.included))
-            for record in matches
-        ]
         return ToolResult.ok(
             f"Found {len(rows)} procedural skill(s) matching {query!r}.",
             data={"skills": rows, "count": len(rows)},

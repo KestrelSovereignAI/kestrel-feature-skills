@@ -233,6 +233,42 @@ test.describe.serial('procedural skills contributed console', () => {
     await expect(page.getByRole('button', { name: SKILL_NAME })).toBeVisible();
   });
 
+  test('superseding catalog failure still tears down unavailable feature UI', async ({ page }) => {
+    await openPanel(page);
+    const tab = page.locator('.nav-tab[data-panel="procedural-skills"]');
+    let requestCount = 0;
+    let releaseFirst;
+    const firstReleased = new Promise((resolve) => { releaseFirst = resolve; });
+    let markFirstStarted;
+    const firstStarted = new Promise((resolve) => { markFirstStarted = resolve; });
+    await page.route(new RegExp(`${API_ROOT}(?:/reload)?$`), async (route) => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        markFirstStarted();
+        await firstReleased;
+      }
+      await route.fulfill({
+        status: 404,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail: 'Feature route unavailable' }),
+      });
+    });
+    try {
+      await page.evaluate(() => {
+        globalThis.dispatchEvent(new CustomEvent('capabilities:changed'));
+      });
+      await firstStarted;
+      await page.getByTestId('skills-reload').click();
+      await expect.poll(() => requestCount).toBeGreaterThanOrEqual(2);
+      releaseFirst();
+      await expect(tab).toHaveCount(0);
+      await expect(page.locator('#panel-procedural-skills')).toHaveCount(0);
+    } finally {
+      releaseFirst();
+      await page.unrouteAll({ behavior: 'ignoreErrors' });
+    }
+  });
+
   test('recreated active panel container remounts its feature body', async ({ page }) => {
     await openPanel(page);
     await page.evaluate(async () => {

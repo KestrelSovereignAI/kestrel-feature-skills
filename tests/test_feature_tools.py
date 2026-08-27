@@ -447,6 +447,36 @@ async def test_read_tools_rehydrate_after_returning_to_persistent_privacy(featur
 
 
 @pytest.mark.asyncio
+async def test_skill_read_holds_privacy_lock_through_inventory_and_resource_read(
+    feature, monkeypatch
+):
+    await feature.skill_create("privacy-read-lock", "Privacy read lock", "Body")
+    await feature.skill_edit("privacy-read-lock", "Resource", relative_path="notes.md")
+    feature.agent._privacy_transition_lock = asyncio.Lock()
+    feature.agent.privacy_config = PrivacyConfig(storage="full")
+    observed = []
+    original_tree = feature._store.tree
+    original_read_file = feature._store.read_file
+
+    def observed_tree(record):
+        observed.append(("tree", feature.agent._privacy_transition_lock.locked()))
+        return original_tree(record)
+
+    def observed_read_file(record, relative_path):
+        observed.append(("file", feature.agent._privacy_transition_lock.locked()))
+        return original_read_file(record, relative_path)
+
+    monkeypatch.setattr(feature._store, "tree", observed_tree)
+    monkeypatch.setattr(feature._store, "read_file", observed_read_file)
+
+    result = await feature.skill_read("privacy-read-lock", "notes.md")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["content"] == "Resource"
+    assert observed == [("tree", True), ("file", True)]
+
+
+@pytest.mark.asyncio
 async def test_mutation_rehydrates_after_returning_to_persistent_privacy(feature):
     await feature.skill_create("privacy-mutation", "Privacy mutation", "Body")
     await feature.skill_enable("privacy-mutation", priority=7)

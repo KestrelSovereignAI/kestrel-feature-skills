@@ -89,16 +89,16 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
     @router.get("")
     async def catalog() -> dict[str, object]:
         try:
-            await feature.ensure_catalog_ready()
-            return feature.catalog_payload()
+            async with feature.persistent_read():
+                return feature.catalog_payload()
         except (DatabaseError, OSError, RuntimeError) as exc:
             raise _http_error(exc) from exc
 
     @router.post("/reload")
     async def reload_catalog() -> dict[str, object]:
         try:
-            await feature.refresh()
-            return feature.catalog_payload()
+            async with feature.persistent_read(refresh=True):
+                return feature.catalog_payload()
         except (DatabaseError, OSError, RuntimeError) as exc:
             raise _http_error(exc) from exc
 
@@ -149,8 +149,8 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
     @router.get("/{name}/tree")
     async def tree(name: str) -> dict[str, object]:
         try:
-            await feature.ensure_catalog_ready()
-            return {"name": name, "entries": list(feature.tree(name=name))}
+            async with feature.persistent_read():
+                return {"name": name, "entries": list(feature.tree(name=name))}
         except (
             SkillNotFoundError,
             SkillFormatError,
@@ -168,8 +168,8 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
         path: str = Query(..., min_length=1, max_length=MAX_RESOURCE_PATH_BYTES),
     ) -> dict[str, object]:
         try:
-            await feature.ensure_catalog_ready()
-            return feature.read_file(name=name, relative_path=path)
+            async with feature.persistent_read():
+                return feature.read_file(name=name, relative_path=path)
         except (
             SkillNotFoundError,
             SkillFormatError,
