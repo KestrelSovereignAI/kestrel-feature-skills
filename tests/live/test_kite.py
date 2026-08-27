@@ -491,6 +491,10 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         )
         assert bounded_edit.status_code == 422, bounded_edit.text
         assert not (bounded_folder / "notes.md").exists()
+        bounded_catalog = client.get(base).json()
+        assert bounded_edit_name in {
+            error["locator"] for error in bounded_catalog["errors"]
+        }
 
         tree = client.get(f"{base}/{name}/tree")
         assert tree.status_code == 200, tree.text
@@ -608,12 +612,17 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
         )
         assert deleted.status_code == 200, deleted.text
-        for cleanup_name in (hidden_retry_name, bounded_edit_name):
-            cleanup = client.delete(
-                f"{base}/{cleanup_name}",
-                headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
-            )
-            assert cleanup.status_code == 200, cleanup.text
+        hidden_cleanup = client.delete(
+            f"{base}/{hidden_retry_name}",
+            headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
+        )
+        assert hidden_cleanup.status_code == 200, hidden_cleanup.text
+        bounded_cleanup = client.delete(
+            f"{base}/{bounded_edit_name}",
+            headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
+        )
+        assert bounded_cleanup.status_code == 404, bounded_cleanup.text
+        shutil.rmtree(root / bounded_edit_name, ignore_errors=True)
         for rejected_name in rejected_names:
             shutil.rmtree(root / rejected_name, ignore_errors=True)
         shutil.rmtree(root / code_example_name, ignore_errors=True)
