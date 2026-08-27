@@ -499,6 +499,50 @@ def test_git_runner_rejects_checkout_with_too_many_zero_byte_entries(
         )
 
 
+def test_git_runner_reaps_process_when_checkout_measurement_fails(
+    tmp_path, monkeypatch
+):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f"#!{sys.executable}\nimport time\ntime.sleep(30)\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    processes = []
+    real_popen = git_source_module.subprocess.Popen
+
+    def tracking_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def fail_measurement(*_args, **_kwargs):
+        raise GitSourceError("could not measure bounded git checkout data")
+
+    monkeypatch.setattr(git_source_module.subprocess, "Popen", tracking_popen)
+    monkeypatch.setattr(git_source_module, "_tree_limit_error", fail_measurement)
+
+    with pytest.raises(GitSourceError, match="could not measure"):
+        git_source_module._run_git(
+            ["probe"],
+            size_limit_root=tmp_path,
+            max_bytes=1024,
+            max_entries=16,
+        )
+
+    assert len(processes) == 1
+    process = processes[0]
+    alive_after_return = process.poll() is None
+    if alive_after_return:
+        git_source_module._kill_process_group(process)
+        process.wait()
+    assert not alive_after_return
+    assert process.poll() is not None
+
+
 def test_git_runner_rejects_host_transport_rewrites(tmp_path, monkeypatch):
     origin = tmp_path / "repository.git"
     git_source_module._run_git(["init", "--bare", str(origin)])

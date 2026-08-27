@@ -82,6 +82,68 @@ def test_create_refuses_replaced_local_root_without_writing_through_symlink(tmp_
     assert not (displaced / "root-race").exists()
 
 
+def test_constructor_refuses_local_root_symlink_swap_during_pinning(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "skills"
+    root.mkdir()
+    displaced = tmp_path / "displaced-skills-at-init"
+    outside = tmp_path / "outside-at-init"
+    outside.mkdir()
+    real_is_symlink = Path.is_symlink
+    swapped = False
+
+    def swap_after_symlink_check(path):
+        nonlocal swapped
+        result = real_is_symlink(path)
+        if path == root and not swapped:
+            swapped = True
+            root.rename(displaced)
+            root.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(Path, "is_symlink", swap_after_symlink_check)
+
+    with pytest.raises(
+        SkillPathError,
+        match="root|real directory|directory changed|symlink",
+    ):
+        SkillStore(root)
+
+    assert root.is_symlink()
+    assert displaced.is_dir()
+    assert outside.is_dir()
+
+
+def test_constructor_refuses_local_root_directory_swap_during_pinning(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "skills"
+    root.mkdir()
+    displaced = tmp_path / "displaced-skills-directory-swap"
+    replacement_marker = root / "replacement-must-survive.md"
+    real_is_symlink = Path.is_symlink
+    swapped = False
+
+    def swap_after_symlink_check(path):
+        nonlocal swapped
+        result = real_is_symlink(path)
+        if path == root and not swapped:
+            swapped = True
+            root.rename(displaced)
+            root.mkdir()
+            replacement_marker.write_text("replacement", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(Path, "is_symlink", swap_after_symlink_check)
+
+    with pytest.raises(SkillPathError, match="directory changed|root"):
+        SkillStore(root)
+
+    assert displaced.is_dir()
+    assert replacement_marker.read_text(encoding="utf-8") == "replacement"
+
+
 def test_create_pins_publication_if_local_root_is_replaced_mid_write(
     tmp_path, monkeypatch
 ):

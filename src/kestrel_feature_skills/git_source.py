@@ -204,19 +204,35 @@ def _run_git(
         except FileNotFoundError as exc:
             raise GitSourceError("git executable is unavailable") from exc
         deadline = time.monotonic() + timeout
-        while process.poll() is None:
-            if cancel_event is not None and cancel_event.is_set():
-                _kill_process_group(process)
-                process.wait()
-                raise GitSourceError("git source operation was cancelled")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _kill_process_group(process)
-                process.wait()
-                raise GitSourceError("git source operation timed out")
+        try:
+            while process.poll() is None:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise GitSourceError("git source operation was cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GitSourceError("git source operation timed out")
+                if (
+                    _bounded_output_size(stdout_file, stderr_file)
+                    > MAX_GIT_OUTPUT_BYTES
+                ):
+                    raise GitSourceError(
+                        f"git source exceeded the {MAX_GIT_OUTPUT_BYTES}-byte output limit"
+                    )
+                limit_error = (
+                    _tree_limit_error(
+                        size_limit_root,
+                        max_bytes=max_bytes,
+                        max_entries=max_entries,
+                    )
+                    if size_limit_root is not None
+                    and max_bytes is not None
+                    and max_entries is not None
+                    else None
+                )
+                if limit_error is not None:
+                    raise GitSourceError(limit_error)
+                time.sleep(min(_TRANSFER_POLL_SECONDS, max(remaining, 0)))
             if _bounded_output_size(stdout_file, stderr_file) > MAX_GIT_OUTPUT_BYTES:
-                _kill_process_group(process)
-                process.wait()
                 raise GitSourceError(
                     f"git source exceeded the {MAX_GIT_OUTPUT_BYTES}-byte output limit"
                 )
@@ -232,34 +248,22 @@ def _run_git(
                 else None
             )
             if limit_error is not None:
-                _kill_process_group(process)
-                process.wait()
                 raise GitSourceError(limit_error)
-            time.sleep(min(_TRANSFER_POLL_SECONDS, max(remaining, 0)))
-        if _bounded_output_size(stdout_file, stderr_file) > MAX_GIT_OUTPUT_BYTES:
-            raise GitSourceError(
-                f"git source exceeded the {MAX_GIT_OUTPUT_BYTES}-byte output limit"
-            )
-        limit_error = (
-            _tree_limit_error(
-                size_limit_root,
-                max_bytes=max_bytes,
-                max_entries=max_entries,
-            )
-            if size_limit_root is not None
-            and max_bytes is not None
-            and max_entries is not None
-            else None
-        )
-        if limit_error is not None:
-            raise GitSourceError(limit_error)
-        stdout = _read_git_output(stdout_file)
-        stderr = _read_git_output(stderr_file)
-        if process.returncode:
-            raise GitSourceError(
-                f"git source operation failed: {_git_failure_detail(stdout, stderr)}"
-            )
-        return stdout.strip()
+            stdout = _read_git_output(stdout_file)
+            stderr = _read_git_output(stderr_file)
+            if process.returncode:
+                raise GitSourceError(
+                    f"git source operation failed: {_git_failure_detail(stdout, stderr)}"
+                )
+            return stdout.strip()
+        except BaseException:
+            # Every failure after Popen—including a scanner or output-monitor
+            # error—must end the detached process before the caller can release
+            # its privacy lock or remove the checkout directory.
+            if process.poll() is None:
+                _kill_process_group(process)
+            process.wait()
+            raise
 
 
 @dataclass(frozen=True, slots=True)

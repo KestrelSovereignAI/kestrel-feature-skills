@@ -505,11 +505,51 @@ class SkillStore:
 
     def __init__(self, local_root: Path):
         local_root.mkdir(parents=True, exist_ok=True)
-        if local_root.is_symlink():
+        try:
+            root_stat = local_root.lstat()
+        except OSError as exc:
+            raise SkillPathError(
+                "agent-local skill root must be a real directory"
+            ) from exc
+        root_identity = (root_stat.st_dev, root_stat.st_ino)
+        if not stat.S_ISDIR(root_stat.st_mode) or local_root.is_symlink():
             raise SkillPathError("agent-local skill root must not be a symlink")
-        self.local_root = local_root.resolve(strict=True)
-        root_stat = self.local_root.stat()
-        self._local_root_identity = (root_stat.st_dev, root_stat.st_ino)
+        # Open the lexical root without following its final component before
+        # resolving it.  Otherwise a rename-to-symlink race between the check
+        # above and ``resolve()`` can make another agent's directory the
+        # authoritative local store.
+        descriptor = _open_directory(local_root, expected=root_identity)
+        try:
+            try:
+                resolved_root = local_root.resolve(strict=True)
+            except OSError as exc:
+                raise SkillPathError(
+                    "agent-local skill root changed while resolving it"
+                ) from exc
+            verification = _open_directory(resolved_root, expected=root_identity)
+            os.close(verification)
+            try:
+                lexical_stat = local_root.lstat()
+            except OSError as exc:
+                raise SkillPathError(
+                    "agent-local skill root changed while resolving it"
+                ) from exc
+            if (
+                not stat.S_ISDIR(lexical_stat.st_mode)
+                or (lexical_stat.st_dev, lexical_stat.st_ino) != root_identity
+            ):
+                raise SkillPathError(
+                    "agent-local skill root changed while resolving it"
+                )
+            lexical_verification = _open_directory(
+                local_root,
+                expected=root_identity,
+            )
+            os.close(lexical_verification)
+        finally:
+            os.close(descriptor)
+        self.local_root = resolved_root
+        self._local_root_identity = root_identity
 
     @staticmethod
     def get(snapshot: CatalogSnapshot, name: str) -> SkillRecord:
