@@ -1083,10 +1083,11 @@ def inspect_skill_folder_descriptor(
     entry_count = 0
     file_count = 0
     byte_count = 0
+    exact_primary_seen = False
     captured: list[ValidatedSkillFolderEntry] = []
 
     def scan(directory_fd: int, parents: tuple[str, ...]) -> None:
-        nonlocal entry_count, file_count, byte_count
+        nonlocal entry_count, file_count, byte_count, exact_primary_seen
         try:
             entries = os.scandir(directory_fd)
         except OSError as exc:
@@ -1096,6 +1097,8 @@ def inspect_skill_folder_descriptor(
                 name = entry.name
                 relative_parts = (*parents, name)
                 relative = PurePosixPath(*relative_parts).as_posix()
+                if not parents and name == SKILL_FILENAME:
+                    exact_primary_seen = True
                 entry_count += 1
                 if entry_count > MAX_FOLDER_ENTRIES:
                     raise SkillFormatError(
@@ -1166,6 +1169,8 @@ def inspect_skill_folder_descriptor(
             entries.close()
 
     scan(folder_fd, ())
+    if not exact_primary_seen:
+        raise SkillFormatError("skill folder must contain exact-case SKILL.md")
     primary = _read_regular_file_at(
         folder_fd,
         SKILL_FILENAME,

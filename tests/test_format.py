@@ -128,6 +128,29 @@ def test_folder_name_must_match_frontmatter(tmp_path):
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+def test_folder_requires_exact_case_primary_filename_on_case_insensitive_lookup(
+    tmp_path, monkeypatch
+):
+    value = document(name="exact-primary")
+    folder = tmp_path / value.name
+    folder.mkdir()
+    (folder / "skill.md").write_text(
+        serialize_skill_markdown(value),
+        encoding="utf-8",
+    )
+    real_read = format_module._read_regular_file_at
+
+    def case_insensitive_read(directory_fd, name, *, max_bytes):
+        if name == "SKILL.md":
+            name = "skill.md"
+        return real_read(directory_fd, name, max_bytes=max_bytes)
+
+    monkeypatch.setattr(format_module, "_read_regular_file_at", case_insensitive_read)
+
+    with pytest.raises(SkillFormatError, match="exact-case SKILL.md"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_folder_scan_error_rejects_candidate(tmp_path, monkeypatch):
     folder = write_skill(tmp_path)
 

@@ -1058,6 +1058,10 @@ class ProceduralSkillsFeature(Feature):
     ) -> dict[str, object]:
         store, enablement = self._require_services()
         skill_name = validate_skill_name(skill_name)
+        # The cached snapshot may still contain a folder that was removed by an
+        # external actor. Refresh before the fast conflict check so an available
+        # name does not require a separate user-triggered reload.
+        await self._refresh_locked()
         if skill_name in self._snapshot.by_name():
             raise SkillConflictError(
                 f"skill already exists in the resolved catalog: {skill_name}"

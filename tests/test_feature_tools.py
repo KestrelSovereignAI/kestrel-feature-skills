@@ -1973,6 +1973,47 @@ async def test_git_install_records_revision_and_leaves_skill_disabled(
 
 
 @pytest.mark.asyncio
+async def test_git_install_refreshes_a_stale_conflict_before_checkout(
+    feature, monkeypatch
+):
+    name = "stale-install-conflict"
+    await feature.skill_create(name, "Removed local skill", "Old procedure.")
+    stale_folder = feature.agent.procedural_skills_root / name
+    for path in stale_folder.iterdir():
+        path.unlink()
+    stale_folder.rmdir()
+
+    async def fake_checkout(*, source_url, ref, skill_name, target):
+        source = target / skill_name
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(skill_name, "Fresh remote skill", "New procedure.")
+            ),
+            encoding="utf-8",
+        )
+        return GitCheckout(
+            root=target,
+            skill_folder=source,
+            revision="a" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    monkeypatch.setattr(feature, "_checkout_git_until_stopped", fake_checkout)
+
+    installed = await feature.install_skill(
+        source_url="https://example.com/repo.git",
+        skill_name=name,
+        ref="main",
+    )
+
+    assert installed["revision"] == "a" * 40
+    assert installed["enabled"] is False
+    assert feature.snapshot.by_name()[name].document.description == "Fresh remote skill"
+
+
+@pytest.mark.asyncio
 async def test_git_install_rechecks_host_sources_after_checkout(
     feature, tmp_path, monkeypatch
 ):
