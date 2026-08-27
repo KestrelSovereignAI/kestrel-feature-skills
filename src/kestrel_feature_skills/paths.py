@@ -11,12 +11,28 @@ from .errors import SkillPathError
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 
 
-def direct_child(root: Path, name: str) -> Path:
+def direct_child(
+    root: Path,
+    name: str,
+    *,
+    root_identity: tuple[int, int] | None = None,
+) -> Path:
     """Return a direct child without permitting alternate path spellings."""
 
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise SkillPathError("skill name must identify one direct child folder")
-    candidate = root.resolve(strict=True) / name
+    try:
+        root_value = root.lstat()
+    except OSError as exc:
+        raise SkillPathError("skill root must be a real directory") from exc
+    identity = (root_value.st_dev, root_value.st_ino)
+    if (
+        root.is_symlink()
+        or not root.is_dir()
+        or (root_identity is not None and identity != root_identity)
+    ):
+        raise SkillPathError("skill root directory changed after validation")
+    candidate = root / name
     if candidate.is_symlink():
         raise SkillPathError("skill direct child must not be a symlink")
     return candidate

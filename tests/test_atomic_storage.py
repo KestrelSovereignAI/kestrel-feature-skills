@@ -66,6 +66,80 @@ def test_create_rejects_dangling_direct_child_symlink_without_orphan(tmp_path):
     assert not alternate.exists()
 
 
+def test_create_refuses_replaced_local_root_without_writing_through_symlink(tmp_path):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    displaced = tmp_path / "displaced-skills"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root.rename(displaced)
+    root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(SkillPathError, match="real directory|directory changed|root"):
+        store.create(SkillDocument("root-race", "Root race", "Procedure."))
+
+    assert not (outside / "root-race").exists()
+    assert not (displaced / "root-race").exists()
+
+
+def test_create_pins_publication_if_local_root_is_replaced_mid_write(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    displaced = tmp_path / "displaced-skills-mid-write"
+    outside = tmp_path / "outside-mid-write"
+    outside.mkdir()
+    outside_decoy = outside / "root-race-mid-write"
+    outside_decoy.mkdir()
+    (outside_decoy / "marker.md").write_text("outside", encoding="utf-8")
+    real_publish = store_module._atomic_write_primary_at
+    swapped = False
+
+    def swap_root_then_publish(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            root.rename(displaced)
+            root.symlink_to(outside, target_is_directory=True)
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store_module,
+        "_atomic_write_primary_at",
+        swap_root_then_publish,
+    )
+
+    with pytest.raises(SkillPathError, match="real directory|directory changed"):
+        store.create(SkillDocument("root-race-mid-write", "Root race", "Procedure."))
+
+    assert not (outside_decoy / "SKILL.md").exists()
+    assert (outside_decoy / "marker.md").read_text(encoding="utf-8") == "outside"
+    assert not (displaced / "root-race-mid-write").exists()
+
+
+def test_create_failure_cleanup_preserves_raced_replacement(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    original = store.local_root / "create-cleanup-race"
+    displaced = tmp_path / "displaced-create"
+    replacement_marker = original / "replacement-must-survive.md"
+
+    def swap_then_fail(*args, **kwargs):
+        original.rename(displaced)
+        original.mkdir()
+        replacement_marker.write_text("replacement", encoding="utf-8")
+        raise SkillPathError("simulated validation failure")
+
+    monkeypatch.setattr(store_module, "_atomic_write_primary_at", swap_then_fail)
+
+    with pytest.raises(SkillPathError, match="changed during deletion"):
+        store.create(SkillDocument("create-cleanup-race", "Cleanup race", "Procedure."))
+
+    assert replacement_marker.read_text(encoding="utf-8") == "replacement"
+    assert not list(store.local_root.glob(".create-cleanup-race.delete.*"))
+    assert displaced.is_dir()
+
+
 def test_collision_refuses_to_overwrite_existing_primary(tmp_path):
     folder = tmp_path / "atomic"
     folder.mkdir()
@@ -539,7 +613,7 @@ def test_write_pins_intermediate_directories_against_symlink_swap(
         real_reject(root, path)
         if root == folder and path == references / "notes.md":
             checked += 1
-            if checked == 4:
+            if checked == 3:
                 references.rename(displaced)
                 references.symlink_to(outside, target_is_directory=True)
 
@@ -568,18 +642,18 @@ def test_primary_edit_pins_skill_folder_against_replacement(tmp_path, monkeypatc
     outside_primary = outside / "SKILL.md"
     outside_primary.write_text("OUTSIDE-PRIMARY", encoding="utf-8")
     displaced = tmp_path / "displaced-primary"
-    real_open_directory = store_module._open_directory
+    real_open_directory_at = store_module._open_directory_at
     swapped = False
 
-    def swap_before_pinned_open(path, *, expected=None):
+    def swap_before_pinned_open(parent_fd, name, *, expected=None):
         nonlocal swapped
-        if path == folder and not swapped:
+        if name == record.name and not swapped:
             folder.rename(displaced)
             outside.rename(folder)
             swapped = True
-        return real_open_directory(path, expected=expected)
+        return real_open_directory_at(parent_fd, name, expected=expected)
 
-    monkeypatch.setattr(store_module, "_open_directory", swap_before_pinned_open)
+    monkeypatch.setattr(store_module, "_open_directory_at", swap_before_pinned_open)
     replacement = serialize_skill_markdown(
         SkillDocument("primary-race", "Replacement", "Changed procedure.")
     )
@@ -725,6 +799,45 @@ def test_mutation_rejects_folder_replaced_by_symlink_after_discovery(tmp_path):
 
 
 @pytest.mark.parametrize("operation", ("edit", "delete"))
+def test_mutation_lock_refuses_replaced_local_root_without_outside_write(
+    tmp_path, operation
+):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    store.create(SkillDocument("root-lock-race", "Root lock race", "Procedure."))
+    source = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    )
+    record = source.discover()[0][0]
+    displaced = tmp_path / "displaced-root-lock"
+    outside = tmp_path / "outside-root-lock"
+    outside.mkdir()
+    root.rename(displaced)
+    root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(SkillPathError):
+        if operation == "edit":
+            store.edit_primary(
+                record,
+                serialize_skill_markdown(
+                    SkillDocument(
+                        "root-lock-race",
+                        "Changed",
+                        "Changed procedure.",
+                    )
+                ),
+            )
+        else:
+            store.delete(record)
+
+    assert not (outside / ".root-lock-race.mutation.lock").exists()
+    assert (displaced / "root-lock-race" / "SKILL.md").is_file()
+
+
+@pytest.mark.parametrize("operation", ("edit", "delete"))
 def test_mutation_rejects_real_folder_replacement_after_discovery(tmp_path, operation):
     store = SkillStore(tmp_path / "skills")
     original = store.create(SkillDocument("replaced", "Original", "Procedure."))
@@ -754,6 +867,37 @@ def test_mutation_rejects_real_folder_replacement_after_discovery(tmp_path, oper
             store.delete(record)
 
     assert marker.read_text(encoding="utf-8") == "replacement must survive"
+
+
+def test_rollback_created_preserves_replacement_swapped_after_identity_check(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("rollback-race", "Rollback", "Procedure."))
+    identity = (folder.stat().st_dev, folder.stat().st_ino)
+    displaced = tmp_path / "displaced-rollback"
+    marker = folder / "replacement-must-survive.md"
+    real_rename = os.rename
+    swapped = False
+
+    def swap_before_removal(source_name, destination_name, **kwargs):
+        nonlocal swapped
+        if source_name == folder.name and not swapped:
+            swapped = True
+            real_rename(folder, displaced)
+            folder.mkdir()
+            marker.write_text("replacement", encoding="utf-8")
+        return real_rename(source_name, destination_name, **kwargs)
+
+    monkeypatch.setattr(store_module.os, "rename", swap_before_removal)
+
+    with pytest.raises(SkillPathError, match="changed|preserved"):
+        store.rollback_created(folder, identity=identity)
+
+    quarantines = list(store.local_root.glob(".rollback-race.delete.*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / marker.name).read_text(encoding="utf-8") == "replacement"
+    assert (displaced / "SKILL.md").is_file()
 
 
 def test_delete_refuses_replacement_swapped_in_after_identity_verification(
@@ -786,6 +930,139 @@ def test_delete_refuses_replacement_swapped_in_after_identity_verification(
 
     assert replacement_marker.read_text(encoding="utf-8") == "replacement"
     assert (displaced / "SKILL.md").is_file()
+
+
+def test_install_refuses_replaced_local_root_without_writing_through_symlink(tmp_path):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    source_root = tmp_path / "source"
+    source = source_root / "remote-root-race"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("remote-root-race", "Remote root race", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+    displaced = tmp_path / "displaced-install-root"
+    outside = tmp_path / "outside-install"
+    outside.mkdir()
+    root.rename(displaced)
+    root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(SkillPathError, match="real directory|directory changed|root"):
+        store.install_folder(
+            source,
+            provenance=SkillProvenance(
+                "git",
+                "https://example.com/repo.git",
+                "main:remote-root-race",
+                revision="a" * 40,
+                remote_url="https://example.com/repo.git",
+            ),
+        )
+
+    assert not (outside / "remote-root-race").exists()
+    assert not (displaced / "remote-root-race").exists()
+
+
+def test_install_pins_publication_if_local_root_is_replaced_mid_write(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    source_root = tmp_path / "source-mid-write"
+    source = source_root / "install-root-race-mid-write"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(
+                "install-root-race-mid-write",
+                "Install root race",
+                "Procedure.",
+            )
+        ),
+        encoding="utf-8",
+    )
+    displaced = tmp_path / "displaced-install-mid-write"
+    outside = tmp_path / "outside-install-mid-write"
+    outside.mkdir()
+    outside_decoy = outside / "install-root-race-mid-write"
+    outside_decoy.mkdir()
+    (outside_decoy / "marker.md").write_text("outside", encoding="utf-8")
+    real_publish = store_module._atomic_replace_file_at
+    swapped = False
+
+    def swap_root_then_publish(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            root.rename(displaced)
+            root.symlink_to(outside, target_is_directory=True)
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store_module,
+        "_atomic_replace_file_at",
+        swap_root_then_publish,
+    )
+
+    with pytest.raises(SkillPathError, match="real directory|directory changed"):
+        store.install_folder(
+            source,
+            provenance=SkillProvenance(
+                "git",
+                "https://example.com/repo.git",
+                "main:install-root-race-mid-write",
+                revision="c" * 40,
+                remote_url="https://example.com/repo.git",
+            ),
+        )
+
+    assert not (outside_decoy / ".kestrel-provenance.json").exists()
+    assert not (outside_decoy / "SKILL.md").exists()
+    assert (outside_decoy / "marker.md").read_text(encoding="utf-8") == "outside"
+    assert not (displaced / "install-root-race-mid-write").exists()
+
+
+def test_install_failure_cleanup_preserves_raced_replacement(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    source_root = tmp_path / "source"
+    source = source_root / "install-cleanup-race"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("install-cleanup-race", "Install cleanup", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+    target = store.local_root / "install-cleanup-race"
+    displaced = tmp_path / "displaced-install"
+    marker = target / "replacement-must-survive.md"
+
+    def swap_then_fail(*_args, **_kwargs):
+        target.rename(displaced)
+        target.mkdir()
+        marker.write_text("replacement", encoding="utf-8")
+        raise OSError("simulated provenance failure")
+
+    monkeypatch.setattr(store_module, "_atomic_replace_file_at", swap_then_fail)
+
+    with pytest.raises(SkillPathError, match="changed during deletion"):
+        store.install_folder(
+            source,
+            provenance=SkillProvenance(
+                "git",
+                "https://example.com/repo.git",
+                "main:install-cleanup-race",
+                revision="b" * 40,
+                remote_url="https://example.com/repo.git",
+            ),
+        )
+
+    assert marker.read_text(encoding="utf-8") == "replacement"
+    assert not list(store.local_root.glob(".install-cleanup-race.delete.*"))
+    assert displaced.is_dir()
 
 
 def test_delete_preserves_replacement_swapped_during_atomic_quarantine(

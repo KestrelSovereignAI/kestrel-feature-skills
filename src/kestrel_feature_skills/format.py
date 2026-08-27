@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -331,7 +332,10 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
         raw = _MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", raw)
         if not raw or raw.startswith("#"):
             continue
-        decoded = unquote(raw)
+        # CommonMark resolves HTML character references in destinations before
+        # interpreting the resulting URI. Validate that rendered value so an
+        # entity cannot hide traversal or an executable scheme.
+        decoded = unquote(html.unescape(raw))
         try:
             split = urlsplit(decoded)
         except ValueError as exc:

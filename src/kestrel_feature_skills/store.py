@@ -25,7 +25,6 @@ from .format import (
     SKILL_FILENAME,
     parse_skill_markdown,
     serialize_skill_markdown,
-    validate_document_references,
     validate_skill_folder,
     validate_skill_name,
 )
@@ -51,29 +50,52 @@ _DIRECTORY_FLAGS = (
 
 
 @contextmanager
-def _serialized_skill_mutation(root: Path, name: str):
+def _serialized_skill_mutation(
+    root: Path,
+    name: str,
+    *,
+    root_identity: tuple[int, int],
+):
     """Serialize validation and publication across threads and processes."""
 
     key = (str(root), validate_skill_name(name))
     with _MUTATION_LOCKS_GUARD:
         thread_lock = _MUTATION_LOCKS.setdefault(key, threading.RLock())
     with thread_lock:
-        lock_path = root / f".{name}.mutation.lock"
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        root_fd = _open_directory(root, expected=root_identity)
+        lock_name = f".{name}.mutation.lock"
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
         try:
-            descriptor = os.open(lock_path, flags, 0o600)
-        except OSError as exc:
-            raise SkillPathError("could not open the skill mutation lock") from exc
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise SkillPathError("skill mutation lock must be a regular file")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            yield
-        finally:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                descriptor = os.open(lock_name, flags, 0o600, dir_fd=root_fd)
+            except OSError as exc:
+                raise SkillPathError("could not open the skill mutation lock") from exc
+            locked = False
+            try:
+                value = os.fstat(descriptor)
+                if not stat.S_ISREG(value.st_mode):
+                    raise SkillPathError("skill mutation lock must be a regular file")
+                lock_identity = (value.st_dev, value.st_ino)
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                locked = True
+                if _identity_at(root_fd, lock_name) != lock_identity:
+                    raise SkillPathError(
+                        "skill mutation lock changed while acquiring it"
+                    )
+                yield root_fd
             finally:
-                os.close(descriptor)
+                try:
+                    if locked:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+        finally:
+            os.close(root_fd)
 
 
 def _unlock_claim(descriptor: int | None) -> None:
@@ -283,6 +305,26 @@ def _open_directory(path: Path, *, expected: tuple[int, int] | None = None) -> i
     return descriptor
 
 
+def _open_directory_at(
+    parent_fd: int,
+    name: str,
+    *,
+    expected: tuple[int, int] | None = None,
+) -> int:
+    try:
+        descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:
+        raise SkillPathError("skill directory must be a real directory") from exc
+    value = os.fstat(descriptor)
+    identity = (value.st_dev, value.st_ino)
+    if not stat.S_ISDIR(value.st_mode) or (
+        expected is not None and identity != expected
+    ):
+        os.close(descriptor)
+        raise SkillPathError("skill directory changed after validation")
+    return descriptor
+
+
 def _quarantine_directory_at(
     root_fd: int,
     name: str,
@@ -320,6 +362,25 @@ def _quarantine_directory_at(
         "local skill folder changed during deletion; "
         f"unexpected folder preserved as {quarantine}"
     )
+
+
+def _remove_expected_directory_at(
+    root_fd: int,
+    name: str,
+    *,
+    expected: tuple[int, int],
+) -> None:
+    """Remove exactly one pinned child, preserving any raced replacement."""
+
+    quarantine = _quarantine_directory_at(root_fd, name, expected=expected)
+    try:
+        shutil.rmtree(quarantine, dir_fd=root_fd)
+    except BaseException as exc:
+        exc.add_note(
+            "skill removal did not complete; remaining data, if any, "
+            f"is preserved as {quarantine}"
+        )
+        raise
 
 
 def _open_parent_at(
@@ -367,6 +428,41 @@ def _atomic_replace_file_at(directory_fd: int, name: str, payload: bytes) -> Non
         )
     finally:
         _unlink_at(directory_fd, temporary)
+
+
+def _copy_regular_file_at(source: Path, directory_fd: int, name: str) -> None:
+    """Copy one staged regular file into a pinned destination directory."""
+
+    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_fd = os.open(source, source_flags)
+    except OSError as exc:
+        raise SkillPathError("staged skill resource must be a regular file") from exc
+    destination_fd: int | None = None
+    try:
+        if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+            raise SkillPathError("staged skill resource must be a regular file")
+        destination_fd = os.open(
+            name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        with (
+            os.fdopen(source_fd, "rb", closefd=False) as source_handle,
+            os.fdopen(destination_fd, "wb", closefd=False) as destination_handle,
+        ):
+            shutil.copyfileobj(source_handle, destination_handle)
+            destination_handle.flush()
+            os.fsync(destination_handle.fileno())
+    finally:
+        os.close(source_fd)
+        if destination_fd is not None:
+            os.close(destination_fd)
 
 
 def atomic_write_primary(folder: Path, payload: bytes, *, overwrite: bool) -> None:
@@ -425,25 +521,73 @@ class SkillStore:
 
     def create(self, document: SkillDocument) -> Path:
         name = validate_skill_name(document.name)
-        folder = direct_child(self.local_root, name)
+        payload = serialize_skill_markdown(document).encode("utf-8")
+        with tempfile.TemporaryDirectory(prefix=".kestrel-skill-create-") as temporary:
+            staged_root = Path(temporary).resolve(strict=True)
+            staged_folder = staged_root / name
+            staged_folder.mkdir(mode=0o700)
+            (staged_folder / SKILL_FILENAME).write_bytes(payload)
+            validate_skill_folder(staged_folder, source_root=staged_root)
+
+        root_fd = _open_directory(
+            self.local_root,
+            expected=self._local_root_identity,
+        )
+        created_identity: tuple[int, int] | None = None
         try:
-            folder.mkdir(mode=0o700)
-        except FileExistsError as exc:
-            raise SkillConflictError(f"skill already exists: {name}") from exc
-        try:
-            validate_document_references(document, folder)
-            atomic_write_primary(
-                folder,
-                serialize_skill_markdown(document).encode("utf-8"),
-                overwrite=False,
+            folder = direct_child(
+                self.local_root,
+                name,
+                root_identity=self._local_root_identity,
             )
-            validate_skill_folder(folder, source_root=self.local_root)
-        except (SkillFormatError, SkillPathError, SkillConflictError, OSError):
-            if folder.exists() and not any(folder.iterdir()):
-                folder.rmdir()
-            elif folder.exists() and not (folder / SKILL_FILENAME).exists():
-                shutil.rmtree(folder)
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=root_fd)
+            except FileExistsError as exc:
+                raise SkillConflictError(f"skill already exists: {name}") from exc
+            created_identity = _identity_at(root_fd, name)
+            if created_identity is None:
+                raise SkillPathError("created skill folder vanished before publication")
+            folder_fd = _open_directory_at(
+                root_fd,
+                name,
+                expected=created_identity,
+            )
+            try:
+                _atomic_write_primary_at(
+                    folder_fd,
+                    name,
+                    payload,
+                    overwrite=False,
+                )
+                if set(os.listdir(folder_fd)) != {SKILL_FILENAME}:
+                    raise SkillConflictError(
+                        "created skill folder changed during publication"
+                    )
+            finally:
+                os.close(folder_fd)
+            if _identity_at(root_fd, name) != created_identity:
+                raise SkillPathError("created skill folder changed during publication")
+            verification_fd = _open_directory(
+                self.local_root,
+                expected=self._local_root_identity,
+            )
+            os.close(verification_fd)
+        except BaseException as publication_error:
+            if created_identity is not None:
+                try:
+                    _remove_expected_directory_at(
+                        root_fd,
+                        name,
+                        expected=created_identity,
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_error.add_note(
+                        f"skill creation originally failed: {publication_error}"
+                    )
+                    raise cleanup_error from publication_error
             raise
+        finally:
+            os.close(root_fd)
         return folder
 
     def edit_primary(self, record: SkillRecord, content: str) -> SkillDocument:
@@ -456,12 +600,16 @@ class SkillStore:
             payload = content.encode("utf-8")
         except UnicodeEncodeError as exc:
             raise SkillFormatError("editor content must be valid UTF-8 text") from exc
-        with _serialized_skill_mutation(self.local_root, record.name):
+        with _serialized_skill_mutation(
+            self.local_root,
+            record.name,
+            root_identity=self._local_root_identity,
+        ) as root_fd:
             folder = self._require_local(record)
             with tempfile.TemporaryDirectory(
-                prefix=".kestrel-skill-edit-", dir=self.local_root
+                prefix=".kestrel-skill-edit-"
             ) as temporary:
-                staged_root = Path(temporary)
+                staged_root = Path(temporary).resolve(strict=True)
                 staged_folder = staged_root / record.name
                 shutil.copytree(folder, staged_folder, symlinks=True)
                 atomic_write_primary(staged_folder, payload, overwrite=True)
@@ -472,8 +620,9 @@ class SkillStore:
             # Validation and publication share the per-skill lock, so every
             # candidate includes the preceding resource/primary mutation.
             folder = self._require_local(record)
-            descriptor = _open_directory(
-                folder,
+            descriptor = _open_directory_at(
+                root_fd,
+                record.name,
                 expected=record.folder_identity,
             )
             try:
@@ -490,21 +639,22 @@ class SkillStore:
     def rollback_created(self, folder: Path, *, identity: tuple[int, int]) -> None:
         """Remove this operation's new folder without following a replacement."""
 
-        expected = direct_child(self.local_root, folder.name)
-        try:
-            current = expected.lstat()
-        except FileNotFoundError:
-            return
-        if (
-            expected != folder
-            or expected.is_symlink()
-            or not expected.is_dir()
-            or (current.st_dev, current.st_ino) != identity
-        ):
+        name = validate_skill_name(folder.name)
+        expected = self.local_root / name
+        if expected != folder:
             raise SkillPathError(
                 "created skill folder changed before persistence rollback"
             )
-        shutil.rmtree(expected)
+        root_fd = _open_directory(
+            self.local_root,
+            expected=self._local_root_identity,
+        )
+        try:
+            if _identity_at(root_fd, name) is None:
+                return
+            _remove_expected_directory_at(root_fd, name, expected=identity)
+        finally:
+            os.close(root_fd)
 
     def read_file(self, record: SkillRecord, relative_path: str) -> str:
         folder = self._require_real_folder(record)
@@ -573,14 +723,18 @@ class SkillStore:
             payload = content.encode("utf-8")
         except UnicodeEncodeError as exc:
             raise SkillFormatError("editor content must be valid UTF-8 text") from exc
-        with _serialized_skill_mutation(self.local_root, record.name):
+        with _serialized_skill_mutation(
+            self.local_root,
+            record.name,
+            root_identity=self._local_root_identity,
+        ) as root_fd:
             folder = self._require_local(record)
             path = lexical_contained_path(folder, relative.as_posix(), must_exist=False)
             reject_symlink_chain(folder, path)
             with tempfile.TemporaryDirectory(
-                prefix=".kestrel-skill-edit-", dir=self.local_root
+                prefix=".kestrel-skill-edit-"
             ) as temporary:
-                staged_root = Path(temporary)
+                staged_root = Path(temporary).resolve(strict=True)
                 staged_folder = staged_root / record.name
                 shutil.copytree(folder, staged_folder, symlinks=True)
                 staged_path = lexical_contained_path(
@@ -597,8 +751,11 @@ class SkillStore:
             folder = self._require_local(record)
             path = lexical_contained_path(folder, relative.as_posix(), must_exist=False)
             reject_symlink_chain(folder, path)
-            reject_symlink_chain(folder, path)
-            folder_fd = _open_directory(folder, expected=record.folder_identity)
+            folder_fd = _open_directory_at(
+                root_fd,
+                record.name,
+                expected=record.folder_identity,
+            )
             try:
                 parent_fd, filename = _open_parent_at(
                     folder_fd,
@@ -664,45 +821,116 @@ class SkillStore:
         document = validate_skill_folder(
             source_folder, source_root=source_folder.parent
         )
-        target = direct_child(self.local_root, document.name)
-        try:
-            target.mkdir(mode=0o700)
-        except FileExistsError as exc:
-            raise SkillConflictError(f"skill already exists: {document.name}") from exc
-        try:
-            for path in sorted(
-                source_folder.rglob("*"), key=lambda item: item.as_posix()
-            ):
-                relative = path.relative_to(source_folder)
-                if relative.as_posix() in {SKILL_FILENAME, PROVENANCE_FILENAME}:
-                    continue
-                destination = target / relative
-                if path.is_dir():
-                    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
-                elif path.is_file():
-                    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                    shutil.copyfile(path, destination, follow_symlinks=False)
-                else:
+        with tempfile.TemporaryDirectory(prefix=".kestrel-skill-install-") as temporary:
+            staged_root = Path(temporary).resolve(strict=True)
+            staged_folder = staged_root / document.name
+            shutil.copytree(source_folder, staged_folder, symlinks=True)
+            document = validate_skill_folder(staged_folder, source_root=staged_root)
+            primary_payload = (staged_folder / SKILL_FILENAME).read_bytes()
+            provenance_payload = serialize_provenance(provenance)
+
+            root_fd = _open_directory(
+                self.local_root,
+                expected=self._local_root_identity,
+            )
+            created_identity: tuple[int, int] | None = None
+            try:
+                target = direct_child(
+                    self.local_root,
+                    document.name,
+                    root_identity=self._local_root_identity,
+                )
+                try:
+                    os.mkdir(document.name, mode=0o700, dir_fd=root_fd)
+                except FileExistsError as exc:
+                    raise SkillConflictError(
+                        f"skill already exists: {document.name}"
+                    ) from exc
+                created_identity = _identity_at(root_fd, document.name)
+                if created_identity is None:
                     raise SkillPathError(
-                        f"unsupported remote resource: {relative.as_posix()}"
+                        "installed skill folder vanished before publication"
                     )
-            atomic_replace_file(
-                target / PROVENANCE_FILENAME, serialize_provenance(provenance)
-            )
-            atomic_write_primary(
-                target,
-                serialize_skill_markdown(document).encode("utf-8"),
-                overwrite=False,
-            )
-            validate_skill_folder(target, source_root=self.local_root)
-        except (SkillFormatError, SkillPathError, SkillConflictError, OSError):
-            if target.exists():
-                shutil.rmtree(target)
-            raise
+                target_fd = _open_directory_at(
+                    root_fd,
+                    document.name,
+                    expected=created_identity,
+                )
+                try:
+                    for path in sorted(
+                        staged_folder.rglob("*"), key=lambda item: item.as_posix()
+                    ):
+                        relative = path.relative_to(staged_folder)
+                        if relative.as_posix() in {
+                            SKILL_FILENAME,
+                            PROVENANCE_FILENAME,
+                        }:
+                            continue
+                        parent_fd, filename = _open_parent_at(
+                            target_fd,
+                            relative,
+                            create=True,
+                        )
+                        try:
+                            if path.is_dir():
+                                try:
+                                    os.mkdir(filename, mode=0o700, dir_fd=parent_fd)
+                                except FileExistsError:
+                                    pass
+                            elif path.is_file():
+                                _copy_regular_file_at(path, parent_fd, filename)
+                            else:
+                                raise SkillPathError(
+                                    f"unsupported remote resource: {relative.as_posix()}"
+                                )
+                        finally:
+                            os.close(parent_fd)
+                    _atomic_replace_file_at(
+                        target_fd,
+                        PROVENANCE_FILENAME,
+                        provenance_payload,
+                    )
+                    _atomic_write_primary_at(
+                        target_fd,
+                        document.name,
+                        primary_payload,
+                        overwrite=False,
+                    )
+                finally:
+                    os.close(target_fd)
+                if _identity_at(root_fd, document.name) != created_identity:
+                    raise SkillPathError(
+                        "installed skill folder changed during publication"
+                    )
+                verification_fd = _open_directory(
+                    self.local_root,
+                    expected=self._local_root_identity,
+                )
+                os.close(verification_fd)
+            except BaseException as publication_error:
+                if created_identity is not None:
+                    try:
+                        _remove_expected_directory_at(
+                            root_fd,
+                            document.name,
+                            expected=created_identity,
+                        )
+                    except BaseException as cleanup_error:
+                        cleanup_error.add_note(
+                            f"skill installation originally failed: {publication_error}"
+                        )
+                        raise cleanup_error from publication_error
+                raise
+            finally:
+                os.close(root_fd)
         return target
 
     def delete(self, record: SkillRecord) -> None:
-        with _serialized_skill_mutation(self.local_root, record.name):
+        with _serialized_skill_mutation(
+            self.local_root,
+            record.name,
+            root_identity=self._local_root_identity,
+        ) as root_fd:
             expected = self._require_local(record)
             try:
                 current = expected.lstat()
@@ -714,27 +942,11 @@ class SkillStore:
                 current.st_dev,
                 current.st_ino,
             )
-            root_fd = _open_directory(
-                self.local_root,
-                expected=self._local_root_identity,
+            _remove_expected_directory_at(
+                root_fd,
+                record.name,
+                expected=expected_identity,
             )
-            quarantine: str | None = None
-            try:
-                quarantine = _quarantine_directory_at(
-                    root_fd,
-                    record.name,
-                    expected=expected_identity,
-                )
-                shutil.rmtree(quarantine, dir_fd=root_fd)
-            except BaseException as exc:
-                if quarantine is not None:
-                    exc.add_note(
-                        "skill deletion did not complete; remaining data, if any, "
-                        f"is preserved as {quarantine}"
-                    )
-                raise
-            finally:
-                os.close(root_fd)
 
     @staticmethod
     def search(snapshot: CatalogSnapshot, query: str) -> tuple[SkillRecord, ...]:

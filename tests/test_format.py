@@ -267,6 +267,27 @@ def test_executable_link_scheme_rejected(tmp_path):
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "body, bundled_name",
+    (
+        ("[outside](..&sol;outside.md)", "..&sol;outside.md"),
+        ("[click](javascript&colon;alert(1))", None),
+        ("[click](javascript&#58;alert(1))", None),
+        ("[click](javascript&#x3a;alert(1))", None),
+    ),
+)
+def test_commonmark_entities_cannot_hide_escape_or_executable_scheme(
+    tmp_path, body, bundled_name
+):
+    value = SkillDocument("entity-link", "Entity link", body)
+    folder = write_skill(tmp_path, value)
+    if bundled_name is not None:
+        (folder / bundled_name).write_text("decoy", encoding="utf-8")
+
+    with pytest.raises(SkillPathError, match="traversal|unsupported link scheme"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_malformed_link_url_is_a_visible_path_error(tmp_path):
     value = SkillDocument("bad-url", "Bad URL", "[broken](//[invalid)")
     folder = write_skill(tmp_path, value)
