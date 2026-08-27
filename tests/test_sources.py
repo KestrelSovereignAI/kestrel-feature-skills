@@ -295,6 +295,43 @@ def test_host_shared_skill_shadows_git_installed_origin(tmp_path):
     assert snapshot.shadowed_records["overlap"][0].provenance == provenance
 
 
+def test_host_shared_git_provenance_keeps_host_precedence(tmp_path):
+    local = tmp_path / "local"
+    shared = tmp_path / "shared"
+    local.mkdir()
+    shared.mkdir()
+    local_folder = make_skill(local, "promoted", "local Git installation")
+    shared_folder = make_skill(shared, "promoted", "promoted host copy")
+    local_provenance = SkillProvenance(
+        kind="git",
+        source_id="https://example.com/a-local.git",
+        locator="main:promoted",
+        revision="a" * 40,
+        remote_url="https://example.com/a-local.git",
+    )
+    shared_provenance = SkillProvenance(
+        kind="git",
+        source_id="https://example.com/z-host.git",
+        locator="main:promoted",
+        revision="b" * 40,
+        remote_url="https://example.com/z-host.git",
+    )
+    (local_folder / PROVENANCE_FILENAME).write_bytes(
+        serialize_provenance(local_provenance)
+    )
+    (shared_folder / PROVENANCE_FILENAME).write_bytes(
+        serialize_provenance(shared_provenance)
+    )
+
+    snapshot = catalog(local, shared).refresh()
+
+    winner = snapshot.by_name()["promoted"]
+    assert winner.document.description == "promoted host copy"
+    assert winner.source_kind == "host-shared"
+    assert winner.precedence == HOST_SHARED_PRECEDENCE
+    assert snapshot.shadowed["promoted"] == (local_provenance,)
+
+
 def test_malformed_folder_is_reported_not_loaded(tmp_path):
     local = tmp_path / "local"
     shared = tmp_path / "shared"

@@ -783,6 +783,28 @@ async def test_unchanged_refresh_does_not_reindex_graph_node(feature):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ("missing", "corrupt"))
+async def test_unchanged_refresh_repairs_externally_damaged_graph_node(
+    feature, damage
+):
+    name = f"repair-{damage}-index"
+    await feature.skill_create(name, "Repair graph index", "body")
+    node_id = feature._node_id(name)
+    feature.agent.storage.added.clear()
+    if damage == "missing":
+        feature.agent.storage.nodes.pop(node_id)
+    else:
+        feature.agent.storage.nodes[node_id].properties["description"] = "corrupt"
+
+    await feature.refresh()
+
+    assert len(feature.agent.storage.added) == 1
+    repaired = feature.agent.storage.nodes[node_id]
+    assert repaired.properties["description"] == "Repair graph index"
+    assert name in feature._indexed_names
+
+
+@pytest.mark.asyncio
 async def test_state_change_indexes_graph_once_despite_multiple_refreshes(feature):
     await feature.skill_create("changed-index", "Changed graph index", "body")
     feature.agent.storage.added.clear()
@@ -1815,6 +1837,63 @@ async def test_delete_removes_shadowed_local_git_installation(
         assert remaining.state == SkillState(True, 17)
         assert other.agent.storage.added == []
         assert other.agent.storage.deleted == []
+    finally:
+        await other.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shadowed_delete_succeeds_when_host_winner_disappears(
+    feature, tmp_path, monkeypatch
+):
+    name = "shadowed-delete-host-race"
+    local = feature.agent.procedural_skills_root / name
+    local.mkdir()
+    (local / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Hidden Git installation", "Local procedure.")
+        ),
+        encoding="utf-8",
+    )
+    (local / PROVENANCE_FILENAME).write_bytes(
+        serialize_provenance(
+            SkillProvenance(
+                kind="git",
+                source_id="https://example.com/skills.git",
+                locator=f"main:{name}",
+                revision="a" * 40,
+                remote_url="https://example.com/skills.git",
+            )
+        )
+    )
+    shared = tmp_path / "shared-delete-race"
+    shared_skill = shared / name
+    shared_skill.mkdir(parents=True)
+    (shared_skill / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Transient host winner", "Host procedure.")
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KESTREL_SHARED_SKILLS_DIR", str(shared))
+    other = ProceduralSkillsFeature(feature.agent)
+    await other.initialize()
+    real_delete = other._store.delete
+
+    def delete_local_as_host_disappears(record):
+        real_delete(record)
+        (shared_skill / "SKILL.md").unlink()
+        shared_skill.rmdir()
+
+    monkeypatch.setattr(other._store, "delete", delete_local_as_host_disappears)
+    try:
+        result = await other.skill_delete(name)
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["removed_file"] is True
+        assert result.data["resolved_skill_retained"] is False
+        assert result.data["remaining_source_kind"] is None
+        assert not local.exists()
+        assert not shared_skill.exists()
     finally:
         await other.shutdown()
 

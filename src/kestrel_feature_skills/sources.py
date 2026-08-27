@@ -371,6 +371,7 @@ class DirectorySkillSource(SkillSource):
                         precedence=(
                             REMOTE_PRECEDENCE
                             if provenance.kind == "git"
+                            and self.kind == "agent-local"
                             else self.precedence
                         ),
                         provenance=provenance,

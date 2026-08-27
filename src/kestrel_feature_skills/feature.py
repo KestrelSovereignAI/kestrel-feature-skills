@@ -322,7 +322,10 @@ class ProceduralSkillsFeature(Feature):
         for record in self._snapshot.records:
             desired_payload = desired_payloads[record.name]
             if indexed_payloads.get(record.name) == desired_payload:
-                continue
+                persisted_payload = await self._persisted_index_payload(record.name)
+                if persisted_payload == desired_payload:
+                    continue
+                indexed_payloads.pop(record.name, None)
             if await self._index_record(record):
                 indexed_payloads[record.name] = desired_payload
         self._indexed_payloads = indexed_payloads
@@ -963,18 +966,20 @@ class ProceduralSkillsFeature(Feature):
         if deleting_shadowed_local:
             store.delete(record)
             await self._refresh_locked()
-            remaining = SkillStore.get(self._snapshot, name)
+            remaining = self._snapshot.by_name().get(name)
             return {
                 "name": name,
                 "removed_file": True,
                 "config_deleted": False,
                 "config_retained": True,
                 "graph_deleted": False,
-                "graph_retained": True,
+                "graph_retained": name in self._indexed_names,
                 "errors": [],
                 "deleted_source_kind": record.source_kind,
-                "resolved_skill_retained": True,
-                "remaining_source_kind": remaining.source_kind,
+                "resolved_skill_retained": remaining is not None,
+                "remaining_source_kind": (
+                    remaining.source_kind if remaining is not None else None
+                ),
             }
         if enablement.available:
             _previous_state, disabled_state = await self._prepare_disabled_state(
@@ -1391,6 +1396,27 @@ class ProceduralSkillsFeature(Feature):
                 except (AttributeError, TypeError, ValueError):
                     continue
         return payloads
+
+    async def _persisted_index_payload(self, name: str) -> str | None:
+        """Read one index node before trusting the in-memory payload cache."""
+
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "get_node"):
+            return None
+        node_id = self._node_id(name)
+        try:
+            node = await storage.get_node(node_id)
+        except Exception as exc:  # noqa: BLE001 - graph is a recoverable index
+            logger.warning(
+                "Could not verify procedural_skill index for %s: %s", name, exc
+            )
+            return None
+        if node is None or getattr(node, "node_type", None) != PROCEDURAL_SKILL_NODE_TYPE:
+            return None
+        try:
+            return self._index_payload(node)
+        except (AttributeError, TypeError, ValueError):
+            return None
 
     def _node_id(self, name: str) -> str:
         material = f"{_agent_id(self.agent)}\x00{name}".encode()
