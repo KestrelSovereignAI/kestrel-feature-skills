@@ -67,6 +67,7 @@ function setStatus(message, isError = false) {
 }
 
 function mount(container) {
+  observePrivacyTransitions();
   const toolbar = el('div', 'skills-toolbar');
   const reload = button('Discover / reload', reloadCatalog);
   reload.dataset.testid = 'skills-reload';
@@ -495,20 +496,51 @@ registerPanel(panelDefinition);
 async function reconcileAvailability() {
   const agent = currentAgent();
   const epoch = ++state.availabilityEpoch;
+  const catalogEpoch = ++state.catalogEpoch;
+  let catalog;
   try {
-    await request('');
+    catalog = await request('');
   } catch (_) {
-    if (epoch !== state.availabilityEpoch || currentAgent() !== agent) return;
+    if (
+      epoch !== state.availabilityEpoch
+      || catalogEpoch !== state.catalogEpoch
+      || currentAgent() !== agent
+    ) return;
     state.restoreOnAvailability ||= panelIsSelected();
     state.available = false;
     syncNav();
     return;
   }
-  if (epoch !== state.availabilityEpoch || currentAgent() !== agent) return;
+  if (
+    epoch !== state.availabilityEpoch
+    || catalogEpoch !== state.catalogEpoch
+    || currentAgent() !== agent
+  ) return;
+  state.catalog = catalog;
+  renderCatalog();
   state.available = true;
   syncNav();
   restoreSelectedPanel();
 }
+
+let privacyObserver = null;
+
+function observePrivacyTransitions() {
+  if (privacyObserver || typeof MutationObserver !== 'function') return;
+  const indicator = document.getElementById('chat-privacy-indicator')
+    || document.getElementById('privacy-indicator');
+  if (!indicator) return;
+  privacyObserver = new MutationObserver(() => {
+    void reconcileAvailability();
+  });
+  privacyObserver.observe(indicator, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
+}
+
+observePrivacyTransitions();
 
 bus.on('panel:shown', (payload) => {
   if (payload?.panelId === PANEL_ID) {

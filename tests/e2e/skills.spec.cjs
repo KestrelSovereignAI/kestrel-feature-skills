@@ -263,6 +263,42 @@ test.describe.serial('procedural skills contributed console', () => {
     await expect(page.locator('#panel-procedural-skills')).toBeVisible();
   });
 
+  test('privacy indicator transition clears a concealed persisted editor', async ({ page }) => {
+    await openPanel(page);
+    await page.getByRole('button', { name: SKILL_NAME }).click();
+    await page.getByRole('button', { name: 'SKILL.md' }).click();
+    const editor = page.getByLabel('Skill file editor');
+    await expect(editor).toHaveValue(new RegExp(DESCRIPTION));
+    await page.route(new RegExp(`${API_ROOT}$`), async (route) => {
+      if (route.request().method() !== 'GET') return route.continue();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          skills: [],
+          errors: [],
+          count: 0,
+          context: { text: '', included: [], dropped: [], token_costs: {} },
+        }),
+      });
+    });
+    try {
+      await page.evaluate(() => {
+        const indicator = document.getElementById('chat-privacy-indicator')
+          || document.getElementById('privacy-indicator');
+        if (!indicator) throw new Error('privacy indicator is unavailable');
+        indicator.replaceChildren(Object.assign(document.createElement('span'), {
+          textContent: 'Ephemeral',
+        }));
+      });
+      await expect(page.getByRole('button', { name: SKILL_NAME })).toHaveCount(0);
+      await expect(editor).toHaveValue('');
+      await expect(editor).toBeDisabled();
+    } finally {
+      await page.unrouteAll({ behavior: 'ignoreErrors' });
+    }
+  });
+
   test('Python editor exposes execution risk and has no run surface', async ({ page }) => {
     await openPanel(page);
     await page.getByRole('button', { name: SKILL_NAME }).click();

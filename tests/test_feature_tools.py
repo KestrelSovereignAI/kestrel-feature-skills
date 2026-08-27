@@ -1428,6 +1428,57 @@ async def test_git_install_records_revision_and_leaves_skill_disabled(
 
 
 @pytest.mark.asyncio
+async def test_git_install_rechecks_host_sources_after_checkout(
+    feature, tmp_path, monkeypatch
+):
+    name = "host-arrived-during-checkout"
+    shared_root = tmp_path / "shared-skills"
+    shared_root.mkdir()
+    monkeypatch.setenv("KESTREL_SHARED_SKILLS_DIR", str(shared_root))
+    installer = ProceduralSkillsFeature(feature.agent)
+    await installer.initialize()
+
+    async def checkout_while_host_skill_appears(*, source_url, ref, skill_name, target):
+        shared_folder = shared_root / skill_name
+        shared_folder.mkdir()
+        (shared_folder / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(skill_name, "New host skill", "Host procedure.")
+            ),
+            encoding="utf-8",
+        )
+        source = target / skill_name
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(skill_name, "Remote skill", "Remote procedure.")
+            ),
+            encoding="utf-8",
+        )
+        return GitCheckout(
+            root=target,
+            skill_folder=source,
+            revision="f" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    monkeypatch.setattr(
+        installer, "_checkout_git_until_stopped", checkout_while_host_skill_appears
+    )
+    try:
+        with pytest.raises(SkillConflictError, match="resolved catalog"):
+            await installer.install_skill(
+                source_url="https://example.com/repo.git",
+                skill_name=name,
+                ref="main",
+            )
+        assert not (feature.agent.procedural_skills_root / name).exists()
+    finally:
+        await installer.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_git_install_waits_for_worker_before_releasing(
     feature, monkeypatch
 ):

@@ -932,6 +932,15 @@ class ProceduralSkillsFeature(Feature):
                 remote_url=checkout.remote_url,
             )
             async with self._publication_state_claim(store, skill_name):
+                # Checkout can be slow enough for a host-shared skill with the
+                # same name to appear after the initial catalog check. Refresh
+                # while holding the publication claim so that local install
+                # cannot silently shadow the newly resolved source.
+                await self._refresh_locked()
+                if skill_name in self._snapshot.by_name():
+                    raise SkillConflictError(
+                        f"skill already exists in the resolved catalog: {skill_name}"
+                    )
                 folder = await self._publish_installed_skill_with_state_claim(
                     store=store,
                     enablement=enablement,

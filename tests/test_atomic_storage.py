@@ -826,6 +826,45 @@ def test_read_pins_intermediate_directories_against_symlink_swap(tmp_path, monke
     assert (outside / "notes.md").read_text(encoding="utf-8") == "OUTSIDE-SECRET"
 
 
+def test_read_rejects_replaced_fifo_without_waiting_for_a_writer(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("fifo-read", "FIFO read", "Procedure."))
+    resource = folder / "notes.md"
+    resource.write_text("ordinary resource", encoding="utf-8")
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    resource.unlink()
+    os.mkfifo(resource)
+    completed = threading.Event()
+    errors = []
+
+    def read_replaced_resource():
+        try:
+            store.read_file(record, "notes.md")
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    reader = threading.Thread(target=read_replaced_resource)
+    reader.start()
+    finished_without_writer = completed.wait(timeout=0.5)
+    if not finished_without_writer:
+        writer = os.open(resource, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(writer)
+    reader.join(timeout=5)
+
+    assert finished_without_writer, "resource read blocked while opening a FIFO"
+    assert not reader.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], SkillPathError)
+    assert "regular file" in str(errors[0])
+
+
 def test_write_pins_intermediate_directories_against_symlink_swap(
     tmp_path, monkeypatch
 ):
