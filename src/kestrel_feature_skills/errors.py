@@ -13,6 +13,10 @@ class SkillPathError(SkillError, ValueError):
     """A requested path escapes or violates a skill root."""
 
 
+class SkillPublicationCleanupError(SkillPathError):
+    """A failed publication left a same-named folder whose removal was unproven."""
+
+
 class SkillConflictError(SkillError):
     """A create or install conflicts with an existing skill."""
 
@@ -51,5 +55,6 @@ __all__ = [
     "SkillNotFoundError",
     "SkillPathError",
     "SkillPrivacyError",
+    "SkillPublicationCleanupError",
     "SkillReadOnlyError",
 ]

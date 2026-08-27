@@ -11,6 +11,7 @@ from kestrel_sdk.storage.database import DatabaseError
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.privacy import PrivacyConfig
 
+import kestrel_feature_skills.store as store_module
 from kestrel_feature_skills import ProceduralSkillsFeature
 from kestrel_feature_skills.context import render_context_clause
 from kestrel_feature_skills.enablement import DEFAULT_PRIORITY, MAX_PRIORITY
@@ -1040,6 +1041,54 @@ async def test_create_rollback_keeps_raced_replacement_disabled_over_prior_state
 
 
 @pytest.mark.asyncio
+async def test_failed_create_publication_keeps_raced_replacement_disabled(
+    feature, tmp_path, monkeypatch
+):
+    name = "create-publication-raced-replacement"
+    prior_state = await feature._enablement.set(name, enabled=True, priority=17)
+    feature._states[name] = prior_state
+    published = feature.agent.procedural_skills_root / name
+    displaced = tmp_path / "displaced-failed-create-publication"
+    marker = published / "replacement-survived-failed-publication.md"
+
+    def swap_then_fail(*_args, **_kwargs):
+        published.rename(displaced)
+        published.mkdir()
+        marker.write_text("replacement", encoding="utf-8")
+        (published / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(
+                    name,
+                    "Unapproved replacement after failed create publication",
+                    "Unapproved procedure.",
+                )
+            ),
+            encoding="utf-8",
+        )
+        raise OSError("simulated create publication failure")
+
+    monkeypatch.setattr(store_module, "_atomic_write_primary_at", swap_then_fail)
+
+    result = await feature.skill_create(
+        name,
+        "Create publication must fail closed",
+        "Procedure.",
+        enabled=False,
+    )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert marker.read_text(encoding="utf-8") == "replacement"
+    assert displaced.is_dir()
+    assert (await feature._enablement.load())[name] == SkillState(
+        False, DEFAULT_PRIORITY
+    )
+    assert feature.snapshot.by_name()[name].state == SkillState(False, DEFAULT_PRIORITY)
+    assert "Unapproved replacement after failed create publication" not in (
+        feature.context_clause_text
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_rollback_preserves_concurrent_same_inode_resource(
     feature, monkeypatch
 ):
@@ -1767,6 +1816,68 @@ async def test_failed_git_install_restores_prior_enablement_state(
     else:
         assert persisted[name] == prior_state
         assert feature._states[name] == prior_state
+
+
+@pytest.mark.asyncio
+async def test_failed_install_publication_keeps_raced_replacement_disabled(
+    feature, tmp_path, monkeypatch
+):
+    name = "install-publication-raced-replacement"
+    prior_state = await feature._enablement.set(name, enabled=True, priority=19)
+    feature._states[name] = prior_state
+    published = feature.agent.procedural_skills_root / name
+    displaced = tmp_path / "displaced-failed-install-publication"
+    marker = published / "replacement-survived-failed-install.md"
+    checkout_root = tmp_path / "checkout-failed-install-publication"
+    source = checkout_root / "skills" / name
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(SkillDocument(name, "Remote", "Procedure.")),
+        encoding="utf-8",
+    )
+
+    def fake_checkout(self, *, url, ref, skill_name, target, cancel_event=None):
+        return GitCheckout(
+            root=checkout_root,
+            skill_folder=source,
+            revision="f" * 40,
+            remote_url=url,
+            ref=ref,
+        )
+
+    def swap_then_fail(*_args, **_kwargs):
+        published.rename(displaced)
+        published.mkdir()
+        marker.write_text("replacement", encoding="utf-8")
+        (published / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(
+                    name,
+                    "Unapproved replacement after failed install publication",
+                    "Unapproved procedure.",
+                )
+            ),
+            encoding="utf-8",
+        )
+        raise OSError("simulated install publication failure")
+
+    monkeypatch.setattr(
+        "kestrel_feature_skills.git_source.GitSkillSource.checkout", fake_checkout
+    )
+    monkeypatch.setattr(store_module, "_atomic_replace_file_at", swap_then_fail)
+
+    result = await feature.skill_install("https://example.com/repo.git", name, "main")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert marker.read_text(encoding="utf-8") == "replacement"
+    assert displaced.is_dir()
+    assert (await feature._enablement.load())[name] == SkillState(
+        False, DEFAULT_PRIORITY
+    )
+    assert feature.snapshot.by_name()[name].state == SkillState(False, DEFAULT_PRIORITY)
+    assert "Unapproved replacement after failed install publication" not in (
+        feature.context_clause_text
+    )
 
 
 @pytest.mark.asyncio

@@ -34,7 +34,13 @@ from .context import (
     render_context_clause,
 )
 from .enablement import DEFAULT_PRIORITY, SkillEnablementStore, validate_priority
-from .errors import SkillConflictError, SkillError, SkillPathError, SkillPrivacyError
+from .errors import (
+    SkillConflictError,
+    SkillError,
+    SkillPathError,
+    SkillPrivacyError,
+    SkillPublicationCleanupError,
+)
 from .format import SKILL_FILENAME, validate_skill_name
 from .git_source import GitCheckout, GitSkillSource
 from .models import (
@@ -514,24 +520,30 @@ class ProceduralSkillsFeature(Feature):
     ) -> dict[str, object]:
         name = document.name
         previous_state: SkillState | None = None
+        disabled_state: SkillState | None = None
         state_was_persisted = False
         if enablement.available:
-            previous_state, state = await self._prepare_disabled_state(
+            previous_state, disabled_state = await self._prepare_disabled_state(
                 enablement,
                 document.name,
                 priority=resolved_priority,
                 operation="skill create disabled-state preparation",
             )
-            self._states[document.name] = state
+            self._states[document.name] = disabled_state
             state_was_persisted = True
         try:
             folder, created_identity = store.create_pinned(document)
         except Exception as publication_error:
             if state_was_persisted:
+                restore_state = (
+                    disabled_state
+                    if isinstance(publication_error, SkillPublicationCleanupError)
+                    else previous_state
+                )
                 await self._restore_enablement_after_publication_failure(
                     enablement,
                     document.name,
-                    previous_state,
+                    restore_state,
                     publication_error,
                     operation="skill create",
                 )
@@ -971,24 +983,30 @@ class ProceduralSkillsFeature(Feature):
         skill_name: str,
     ) -> Path:
         previous_state: SkillState | None = None
+        disabled_state: SkillState | None = None
         state_was_persisted = False
         if enablement.available:
-            previous_state, state = await self._prepare_disabled_state(
+            previous_state, disabled_state = await self._prepare_disabled_state(
                 enablement,
                 skill_name,
                 priority=DEFAULT_PRIORITY,
                 operation="skill install disabled-state preparation",
             )
-            self._states[skill_name] = state
+            self._states[skill_name] = disabled_state
             state_was_persisted = True
         try:
             return store.install_folder(source_folder, provenance=provenance)
         except Exception as publication_error:
             if state_was_persisted:
+                restore_state = (
+                    disabled_state
+                    if isinstance(publication_error, SkillPublicationCleanupError)
+                    else previous_state
+                )
                 await self._restore_enablement_after_publication_failure(
                     enablement,
                     skill_name,
-                    previous_state,
+                    restore_state,
                     publication_error,
                     operation="skill install publication",
                 )

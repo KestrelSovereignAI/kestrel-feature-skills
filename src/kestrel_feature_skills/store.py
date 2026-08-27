@@ -19,6 +19,7 @@ from .errors import (
     SkillFormatError,
     SkillNotFoundError,
     SkillPathError,
+    SkillPublicationCleanupError,
     SkillReadOnlyError,
 )
 from .format import (
@@ -797,7 +798,10 @@ class SkillStore:
                         cleanup_error.add_note(
                             f"skill creation originally failed: {publication_error}"
                         )
-                        raise cleanup_error from publication_error
+                        raise SkillPublicationCleanupError(
+                            "skill creation cleanup could not confirm removal: "
+                            f"{cleanup_error}"
+                        ) from cleanup_error
                 raise
         return folder, published
 
@@ -1185,7 +1189,10 @@ class SkillStore:
                         cleanup_error.add_note(
                             f"skill installation originally failed: {publication_error}"
                         )
-                        raise cleanup_error from publication_error
+                        raise SkillPublicationCleanupError(
+                            "skill installation cleanup could not confirm removal: "
+                            f"{cleanup_error}"
+                        ) from cleanup_error
                 raise
             finally:
                 os.close(root_fd)
