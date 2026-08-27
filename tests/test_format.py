@@ -1188,3 +1188,15 @@ def test_descriptor_scan_never_materializes_all_directory_names(tmp_path, monkey
         )
     finally:
         os.close(directory_fd)
+
+
+@pytest.mark.parametrize(
+    "reserved_name",
+    (".SKILL.md.claim", ".SKILL.md.tmp.authored"),
+)
+def test_validation_rejects_primary_writer_reserved_resources(tmp_path, reserved_name):
+    folder = write_skill(tmp_path)
+    (folder / reserved_name).write_text("authored resource", encoding="utf-8")
+
+    with pytest.raises(SkillFormatError, match="reserved"):
+        validate_skill_folder(folder, source_root=tmp_path)

@@ -24,11 +24,17 @@ from .errors import (
 )
 from .format import (
     MAX_SKILL_FILE_BYTES,
+    PRIMARY_WRITER_CLAIM,
+    PRIMARY_WRITER_TEMP_PREFIX,
     SKILL_FILENAME,
+    ValidatedSkillFolder,
+    inspect_skill_folder,
+    inspect_skill_folder_descriptor,
     parse_skill_markdown,
     serialize_skill_markdown,
     validate_resource_path,
     validate_skill_folder,
+    validate_skill_folder_descriptor,
     validate_skill_name,
 )
 from .models import CatalogSnapshot, SkillDocument, SkillProvenance, SkillRecord
@@ -41,7 +47,6 @@ from .sources import PROVENANCE_FILENAME, serialize_provenance
 
 CLAIM_STALENESS_SECONDS = 60
 MAX_EDITOR_FILE_BYTES = 262_144
-_INTERNAL_PREFIXES = (".SKILL.md.tmp.", ".SKILL.md.claim")
 _MUTATION_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 _MUTATION_LOCKS_GUARD = threading.Lock()
 _PUBLICATION_STATE_LOCKS: dict[tuple[str, str], threading.Lock] = {}
@@ -578,6 +583,38 @@ def atomic_replace_file(path: Path, payload: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _materialize_validated_folder(
+    snapshot: ValidatedSkillFolder,
+    destination: Path,
+) -> None:
+    """Rebuild one bounded descriptor snapshot in a private staging folder."""
+
+    destination.mkdir(mode=0o700)
+    for entry in snapshot.entries:
+        target = destination.joinpath(*Path(entry.path).parts)
+        if entry.is_directory:
+            target.mkdir(mode=0o700)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        assert entry.payload is not None
+        _write_tmp(target, entry.payload)
+
+
+def _inspect_child_at(
+    root_fd: int,
+    name: str,
+    *,
+    expected: tuple[int, int] | None,
+) -> ValidatedSkillFolder:
+    """Inspect one child without reopening its mutable lexical path."""
+
+    descriptor = _open_directory_at(root_fd, name, expected=expected)
+    try:
+        return inspect_skill_folder_descriptor(descriptor, folder_name=name)
+    finally:
+        os.close(descriptor)
+
+
 class SkillStore:
     """Mutate only the agent-local root; read from the resolved catalog."""
 
@@ -726,30 +763,36 @@ class SkillStore:
             (staged_folder / SKILL_FILENAME).write_bytes(payload)
             validate_skill_folder(staged_folder, source_root=staged_root)
 
-        created_identity: tuple[int, int] | None = None
         with _serialized_skill_mutation(
             self.local_root,
             name,
             root_identity=self._local_root_identity,
         ) as root_fd:
+            folder = direct_child(
+                self.local_root,
+                name,
+                root_identity=self._local_root_identity,
+            )
+            if _identity_at(root_fd, name) is not None:
+                raise SkillConflictError(f"skill already exists: {name}")
+            staging_name = f".{name}.create.{uuid.uuid4().hex}"
+            created_identity: tuple[int, int] | None = None
+            cleanup_name = staging_name
             try:
-                folder = direct_child(
-                    self.local_root,
-                    name,
-                    root_identity=self._local_root_identity,
-                )
                 try:
-                    os.mkdir(name, mode=0o700, dir_fd=root_fd)
+                    os.mkdir(staging_name, mode=0o700, dir_fd=root_fd)
                 except FileExistsError as exc:
-                    raise SkillConflictError(f"skill already exists: {name}") from exc
-                created_identity = _identity_at(root_fd, name)
+                    raise SkillPathError(
+                        "create staging name unexpectedly collided"
+                    ) from exc
+                created_identity = _identity_at(root_fd, staging_name)
                 if created_identity is None:
                     raise SkillPathError(
-                        "created skill folder vanished before publication"
+                        "created skill staging folder vanished before publication"
                     )
                 folder_fd = _open_directory_at(
                     root_fd,
-                    name,
+                    staging_name,
                     expected=created_identity,
                 )
                 try:
@@ -761,8 +804,12 @@ class SkillStore:
                     )
                     if set(os.listdir(folder_fd)) != {SKILL_FILENAME}:
                         raise SkillConflictError(
-                            "created skill folder changed during publication"
+                            "created skill staging folder changed during publication"
                         )
+                    validate_skill_folder_descriptor(
+                        folder_fd,
+                        folder_name=name,
+                    )
                     primary = os.stat(
                         SKILL_FILENAME,
                         dir_fd=folder_fd,
@@ -775,23 +822,47 @@ class SkillStore:
                         primary_mtime_ns=primary.st_mtime_ns,
                         primary_ctime_ns=primary.st_ctime_ns,
                     )
+                    try:
+                        os.fsync(folder_fd)
+                    except OSError:
+                        pass
                 finally:
                     os.close(folder_fd)
-                if _identity_at(root_fd, name) != created_identity:
+                if _identity_at(root_fd, staging_name) != created_identity:
                     raise SkillPathError(
-                        "created skill folder changed during publication"
+                        "created skill staging folder changed during publication"
                     )
                 verification_fd = _open_directory(
                     self.local_root,
                     expected=self._local_root_identity,
                 )
                 os.close(verification_fd)
+                if _identity_at(root_fd, name) is not None:
+                    raise SkillConflictError(f"skill already exists: {name}")
+                os.rename(
+                    staging_name,
+                    name,
+                    src_dir_fd=root_fd,
+                    dst_dir_fd=root_fd,
+                )
+                cleanup_name = name
+                if _identity_at(root_fd, name) != created_identity:
+                    raise SkillPathError(
+                        "created skill folder changed during publication"
+                    )
+                try:
+                    os.fsync(root_fd)
+                except OSError:
+                    pass
             except BaseException as publication_error:
-                if created_identity is not None:
+                if (
+                    created_identity is not None
+                    and _identity_at(root_fd, cleanup_name) is not None
+                ):
                     try:
                         _remove_expected_directory_at(
                             root_fd,
-                            name,
+                            cleanup_name,
                             expected=created_identity,
                         )
                     except BaseException as cleanup_error:
@@ -802,6 +873,11 @@ class SkillStore:
                             "skill creation cleanup could not confirm removal: "
                             f"{cleanup_error}"
                         ) from cleanup_error
+                if cleanup_name != name and _identity_at(root_fd, name) is not None:
+                    raise SkillPublicationCleanupError(
+                        "skill creation failed while an unowned same-named folder "
+                        "appeared; its removal was not attempted"
+                    ) from publication_error
                 raise
         return folder, published
 
@@ -820,13 +896,18 @@ class SkillStore:
             record.name,
             root_identity=self._local_root_identity,
         ) as root_fd:
-            folder = self._require_local(record)
+            self._require_local(record)
+            snapshot = _inspect_child_at(
+                root_fd,
+                record.name,
+                expected=record.folder_identity,
+            )
             with tempfile.TemporaryDirectory(
                 prefix=".kestrel-skill-edit-"
             ) as temporary:
                 staged_root = Path(temporary).resolve(strict=True)
                 staged_folder = staged_root / record.name
-                shutil.copytree(folder, staged_folder, symlinks=True)
+                _materialize_validated_folder(snapshot, staged_folder)
                 atomic_write_primary(staged_folder, payload, overwrite=True)
                 candidate = validate_skill_folder(
                     staged_folder, source_root=staged_root
@@ -834,7 +915,7 @@ class SkillStore:
 
             # Validation and publication share the per-skill lock, so every
             # candidate includes the preceding resource/primary mutation.
-            folder = self._require_local(record)
+            self._require_local(record)
             descriptor = _open_directory_at(
                 root_fd,
                 record.name,
@@ -996,12 +1077,17 @@ class SkillStore:
             folder = self._require_local(record)
             path = lexical_contained_path(folder, relative.as_posix(), must_exist=False)
             reject_symlink_chain(folder, path)
+            snapshot = _inspect_child_at(
+                root_fd,
+                record.name,
+                expected=record.folder_identity,
+            )
             with tempfile.TemporaryDirectory(
                 prefix=".kestrel-skill-edit-"
             ) as temporary:
                 staged_root = Path(temporary).resolve(strict=True)
                 staged_folder = staged_root / record.name
-                shutil.copytree(folder, staged_folder, symlinks=True)
+                _materialize_validated_folder(snapshot, staged_folder)
                 staged_path = lexical_contained_path(
                     staged_folder, relative.as_posix(), must_exist=False
                 )
@@ -1054,24 +1140,30 @@ class SkillStore:
 
     def tree(self, record: SkillRecord) -> tuple[dict[str, object], ...]:
         folder = self._require_real_folder(record)
-        validate_skill_folder(folder, source_root=folder.parent)
+        folder_fd = _open_directory(folder, expected=record.folder_identity)
+        try:
+            snapshot = inspect_skill_folder_descriptor(
+                folder_fd,
+                folder_name=record.name,
+            )
+        finally:
+            os.close(folder_fd)
         entries: list[dict[str, object]] = []
-        for path in sorted(folder.rglob("*"), key=lambda item: item.as_posix()):
-            relative = path.relative_to(folder).as_posix()
-            if path.parent == folder and (
+        for entry in sorted(snapshot.entries, key=lambda item: item.path):
+            path = Path(entry.path)
+            if len(path.parts) == 1 and (
                 path.name == PROVENANCE_FILENAME
-                or path.name.startswith(_INTERNAL_PREFIXES)
+                or path.name == PRIMARY_WRITER_CLAIM
+                or path.name.startswith(PRIMARY_WRITER_TEMP_PREFIX)
             ):
                 continue
-            if path.is_symlink():
-                raise SkillPathError(f"symlink appeared during tree read: {relative}")
-            is_file = path.is_file()
-            editable = bool(is_file and self.file_is_editable(record, relative))
+            is_file = not entry.is_directory
+            editable = bool(is_file and self.file_is_editable(record, entry.path))
             entries.append(
                 {
-                    "path": relative,
+                    "path": entry.path,
                     "type": "file" if is_file else "directory",
-                    "bytes": path.stat().st_size if is_file else None,
+                    "bytes": len(entry.payload) if entry.payload is not None else None,
                     "editable": editable,
                     "execution_risk": bool(is_file and path.suffix == ".py"),
                 }
@@ -1084,13 +1176,14 @@ class SkillStore:
         *,
         provenance: SkillProvenance,
     ) -> Path:
-        document = validate_skill_folder(
+        source_snapshot = inspect_skill_folder(
             source_folder, source_root=source_folder.parent
         )
+        document = source_snapshot.document
         with tempfile.TemporaryDirectory(prefix=".kestrel-skill-install-") as temporary:
             staged_root = Path(temporary).resolve(strict=True)
             staged_folder = staged_root / document.name
-            shutil.copytree(source_folder, staged_folder, symlinks=True)
+            _materialize_validated_folder(source_snapshot, staged_folder)
             provenance_payload = serialize_provenance(provenance)
             atomic_replace_file(
                 staged_folder / PROVENANCE_FILENAME,
@@ -1099,103 +1192,146 @@ class SkillStore:
             document = validate_skill_folder(staged_folder, source_root=staged_root)
             primary_payload = (staged_folder / SKILL_FILENAME).read_bytes()
 
-            root_fd = _open_directory(
+            with _serialized_skill_mutation(
                 self.local_root,
-                expected=self._local_root_identity,
-            )
-            created_identity: tuple[int, int] | None = None
-            try:
+                document.name,
+                root_identity=self._local_root_identity,
+            ) as root_fd:
                 target = direct_child(
                     self.local_root,
                     document.name,
                     root_identity=self._local_root_identity,
                 )
+                if _identity_at(root_fd, document.name) is not None:
+                    raise SkillConflictError(f"skill already exists: {document.name}")
+                staging_name = f".{document.name}.install.{uuid.uuid4().hex}"
+                created_identity: tuple[int, int] | None = None
+                cleanup_name = staging_name
                 try:
-                    os.mkdir(document.name, mode=0o700, dir_fd=root_fd)
+                    os.mkdir(staging_name, mode=0o700, dir_fd=root_fd)
                 except FileExistsError as exc:
-                    raise SkillConflictError(
-                        f"skill already exists: {document.name}"
-                    ) from exc
-                created_identity = _identity_at(root_fd, document.name)
-                if created_identity is None:
                     raise SkillPathError(
-                        "installed skill folder vanished before publication"
-                    )
-                target_fd = _open_directory_at(
-                    root_fd,
-                    document.name,
-                    expected=created_identity,
-                )
+                        "install staging name unexpectedly collided"
+                    ) from exc
+                created_identity = _identity_at(root_fd, staging_name)
                 try:
-                    for path in sorted(
-                        staged_folder.rglob("*"), key=lambda item: item.as_posix()
-                    ):
-                        relative = path.relative_to(staged_folder)
-                        if relative.as_posix() in {
-                            SKILL_FILENAME,
-                            PROVENANCE_FILENAME,
-                        }:
-                            continue
-                        parent_fd, filename = _open_parent_at(
+                    if created_identity is None:
+                        raise SkillPathError(
+                            "installed skill staging folder vanished before publication"
+                        )
+                    target_fd = _open_directory_at(
+                        root_fd,
+                        staging_name,
+                        expected=created_identity,
+                    )
+                    try:
+                        for path in sorted(
+                            staged_folder.rglob("*"), key=lambda item: item.as_posix()
+                        ):
+                            relative = path.relative_to(staged_folder)
+                            if relative.as_posix() in {
+                                SKILL_FILENAME,
+                                PROVENANCE_FILENAME,
+                            }:
+                                continue
+                            parent_fd, filename = _open_parent_at(
+                                target_fd,
+                                relative,
+                                create=True,
+                            )
+                            try:
+                                if path.is_dir():
+                                    try:
+                                        os.mkdir(filename, mode=0o700, dir_fd=parent_fd)
+                                    except FileExistsError:
+                                        pass
+                                elif path.is_file():
+                                    _copy_regular_file_at(path, parent_fd, filename)
+                                else:
+                                    raise SkillPathError(
+                                        "unsupported remote resource: "
+                                        f"{relative.as_posix()}"
+                                    )
+                            finally:
+                                os.close(parent_fd)
+                        _atomic_replace_file_at(
                             target_fd,
-                            relative,
-                            create=True,
+                            PROVENANCE_FILENAME,
+                            provenance_payload,
+                        )
+                        _atomic_write_primary_at(
+                            target_fd,
+                            document.name,
+                            primary_payload,
+                            overwrite=False,
+                        )
+                        validate_skill_folder_descriptor(
+                            target_fd,
+                            folder_name=document.name,
                         )
                         try:
-                            if path.is_dir():
-                                try:
-                                    os.mkdir(filename, mode=0o700, dir_fd=parent_fd)
-                                except FileExistsError:
-                                    pass
-                            elif path.is_file():
-                                _copy_regular_file_at(path, parent_fd, filename)
-                            else:
-                                raise SkillPathError(
-                                    f"unsupported remote resource: {relative.as_posix()}"
-                                )
-                        finally:
-                            os.close(parent_fd)
-                    _atomic_replace_file_at(
-                        target_fd,
-                        PROVENANCE_FILENAME,
-                        provenance_payload,
+                            os.fsync(target_fd)
+                        except OSError:
+                            pass
+                    finally:
+                        os.close(target_fd)
+                    if _identity_at(root_fd, staging_name) != created_identity:
+                        raise SkillPathError(
+                            "installed skill staging folder changed during publication"
+                        )
+                    verification_fd = _open_directory(
+                        self.local_root,
+                        expected=self._local_root_identity,
                     )
-                    _atomic_write_primary_at(
-                        target_fd,
+                    os.close(verification_fd)
+                    if _identity_at(root_fd, document.name) is not None:
+                        raise SkillConflictError(
+                            f"skill already exists: {document.name}"
+                        )
+                    os.rename(
+                        staging_name,
                         document.name,
-                        primary_payload,
-                        overwrite=False,
+                        src_dir_fd=root_fd,
+                        dst_dir_fd=root_fd,
                     )
-                finally:
-                    os.close(target_fd)
-                if _identity_at(root_fd, document.name) != created_identity:
-                    raise SkillPathError(
-                        "installed skill folder changed during publication"
-                    )
-                verification_fd = _open_directory(
-                    self.local_root,
-                    expected=self._local_root_identity,
-                )
-                os.close(verification_fd)
-            except BaseException as publication_error:
-                if created_identity is not None:
+                    cleanup_name = document.name
+                    if _identity_at(root_fd, document.name) != created_identity:
+                        raise SkillPathError(
+                            "installed skill folder changed during publication"
+                        )
                     try:
-                        _remove_expected_directory_at(
-                            root_fd,
-                            document.name,
-                            expected=created_identity,
-                        )
-                    except BaseException as cleanup_error:
-                        cleanup_error.add_note(
-                            f"skill installation originally failed: {publication_error}"
-                        )
+                        os.fsync(root_fd)
+                    except OSError:
+                        pass
+                except BaseException as publication_error:
+                    if (
+                        created_identity is not None
+                        and _identity_at(root_fd, cleanup_name) is not None
+                    ):
+                        try:
+                            _remove_expected_directory_at(
+                                root_fd,
+                                cleanup_name,
+                                expected=created_identity,
+                            )
+                        except BaseException as cleanup_error:
+                            cleanup_error.add_note(
+                                "skill installation originally failed: "
+                                f"{publication_error}"
+                            )
+                            raise SkillPublicationCleanupError(
+                                "skill installation cleanup could not confirm removal: "
+                                f"{cleanup_error}"
+                            ) from cleanup_error
+                    if (
+                        cleanup_name != document.name
+                        and _identity_at(root_fd, document.name) is not None
+                    ):
                         raise SkillPublicationCleanupError(
-                            "skill installation cleanup could not confirm removal: "
-                            f"{cleanup_error}"
-                        ) from cleanup_error
-                raise
-            finally:
-                os.close(root_fd)
+                            "skill installation failed while an unowned same-named "
+                            "folder appeared; its removal was not attempted"
+                        ) from publication_error
+                    raise
         return target
 
     def delete(self, record: SkillRecord) -> None:

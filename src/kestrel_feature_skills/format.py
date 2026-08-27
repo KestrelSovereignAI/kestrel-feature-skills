@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
@@ -23,6 +24,8 @@ MAX_FOLDER_DEPTH = 32
 MAX_FOLDER_BYTES = 2_097_152
 MAX_RESOURCE_PATH_BYTES = 1024
 MAX_MARKDOWN_CONTAINER_DEPTH = 4096
+PRIMARY_WRITER_CLAIM = ".SKILL.md.claim"
+PRIMARY_WRITER_TEMP_PREFIX = ".SKILL.md.tmp."
 SKILL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
 _FRONTMATTER_KEYS = frozenset({"name", "description"})
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
@@ -82,6 +85,26 @@ _READ_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_CLOEXEC", 0)
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedSkillFolderEntry:
+    """One descriptor-pinned entry captured during bounded validation."""
+
+    path: str
+    payload: bytes | None
+
+    @property
+    def is_directory(self) -> bool:
+        return self.payload is None
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedSkillFolder:
+    """A complete bounded snapshot of one validated skill folder."""
+
+    document: SkillDocument
+    entries: tuple[ValidatedSkillFolderEntry, ...]
 
 
 def _utf8_bytes(value: str, *, label: str) -> bytes:
@@ -1050,16 +1073,17 @@ def _validate_reference_at(folder_fd: int, relative: str) -> None:
         os.close(descriptor)
 
 
-def validate_skill_folder_descriptor(
+def inspect_skill_folder_descriptor(
     folder_fd: int,
     *,
     folder_name: str,
-) -> SkillDocument:
-    """Validate a skill entirely through an already-pinned folder descriptor."""
+) -> ValidatedSkillFolder:
+    """Validate and capture a skill through one pinned, bounded traversal."""
 
     entry_count = 0
     file_count = 0
     byte_count = 0
+    captured: list[ValidatedSkillFolderEntry] = []
 
     def scan(directory_fd: int, parents: tuple[str, ...]) -> None:
         nonlocal entry_count, file_count, byte_count
@@ -1082,6 +1106,13 @@ def validate_skill_folder_descriptor(
                         f"skill folder exceeds maximum depth {MAX_FOLDER_DEPTH}"
                     )
                 validate_resource_path(relative)
+                if not parents and (
+                    name == PRIMARY_WRITER_CLAIM
+                    or name.startswith(PRIMARY_WRITER_TEMP_PREFIX)
+                ):
+                    raise SkillFormatError(
+                        f"top-level resource name is reserved by the skill writer: {name}"
+                    )
                 try:
                     value = os.stat(
                         name,
@@ -1097,6 +1128,7 @@ def validate_skill_folder_descriptor(
                         f"symlinks are not allowed in skill folders: {name}"
                     )
                 if stat.S_ISDIR(value.st_mode):
+                    captured.append(ValidatedSkillFolderEntry(relative, None))
                     child = _open_pinned_directory_at(
                         directory_fd,
                         name,
@@ -1127,6 +1159,7 @@ def validate_skill_folder_descriptor(
                     raise SkillFormatError(
                         f"skill folder exceeds {MAX_FOLDER_BYTES} bytes"
                     )
+                captured.append(ValidatedSkillFolderEntry(relative, payload))
         except OSError as exc:
             raise SkillFormatError("could not scan the complete skill folder") from exc
         finally:
@@ -1145,11 +1178,24 @@ def validate_skill_folder_descriptor(
         )
     for destination in _local_markdown_destinations(document.body):
         _validate_reference_at(folder_fd, destination)
-    return document
+    return ValidatedSkillFolder(document, tuple(captured))
 
 
-def validate_skill_folder(folder: Path, *, source_root: Path) -> SkillDocument:
-    """Validate the complete folder, including links and every symlink escape."""
+def validate_skill_folder_descriptor(
+    folder_fd: int,
+    *,
+    folder_name: str,
+) -> SkillDocument:
+    """Validate a skill entirely through an already-pinned folder descriptor."""
+
+    return inspect_skill_folder_descriptor(
+        folder_fd,
+        folder_name=folder_name,
+    ).document
+
+
+def inspect_skill_folder(folder: Path, *, source_root: Path) -> ValidatedSkillFolder:
+    """Capture a complete skill through a pinned and bounded path traversal."""
 
     if folder.is_symlink():
         raise SkillPathError("skill folders must not be symlinks")
@@ -1168,7 +1214,7 @@ def validate_skill_folder(folder: Path, *, source_root: Path) -> SkillDocument:
             expected=(identity.st_dev, identity.st_ino),
         )
         try:
-            return validate_skill_folder_descriptor(
+            return inspect_skill_folder_descriptor(
                 folder_fd,
                 folder_name=folder.name,
             )
@@ -1176,6 +1222,12 @@ def validate_skill_folder(folder: Path, *, source_root: Path) -> SkillDocument:
             os.close(folder_fd)
     finally:
         os.close(root_fd)
+
+
+def validate_skill_folder(folder: Path, *, source_root: Path) -> SkillDocument:
+    """Validate the complete folder, including links and every symlink escape."""
+
+    return inspect_skill_folder(folder, source_root=source_root).document
 
 
 __all__ = [
@@ -1186,7 +1238,13 @@ __all__ = [
     "MAX_FOLDER_FILES",
     "MAX_RESOURCE_PATH_BYTES",
     "MAX_SKILL_FILE_BYTES",
+    "PRIMARY_WRITER_CLAIM",
+    "PRIMARY_WRITER_TEMP_PREFIX",
     "SKILL_FILENAME",
+    "ValidatedSkillFolder",
+    "ValidatedSkillFolderEntry",
+    "inspect_skill_folder",
+    "inspect_skill_folder_descriptor",
     "parse_skill_markdown",
     "serialize_skill_markdown",
     "validate_document_references",

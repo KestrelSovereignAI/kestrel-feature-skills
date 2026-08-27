@@ -73,7 +73,11 @@ def _write_resource_from_separate_process(root, lock_state, result):
             kind="agent-local",
             precedence=0,
         )
+        deadline = time.monotonic() + 5
         records, errors = source.discover()
+        while not records and not errors and time.monotonic() < deadline:
+            time.sleep(0.01)
+            records, errors = source.discover()
         if errors or len(records) != 1:
             raise AssertionError(f"unexpected discovery result: {records=}, {errors=}")
         store.write_file(records[0], "notes.md", "Concurrent resource.\n")
@@ -340,20 +344,29 @@ def test_create_failure_cleanup_preserves_raced_replacement(tmp_path, monkeypatc
     store = SkillStore(tmp_path / "skills")
     original = store.local_root / "create-cleanup-race"
     displaced = tmp_path / "displaced-create"
-    replacement_marker = original / "replacement-must-survive.md"
+    replacement = None
+    replacement_marker = None
 
     def swap_then_fail(*args, **kwargs):
-        original.rename(displaced)
-        original.mkdir()
+        nonlocal replacement, replacement_marker
+        candidates = list(store.local_root.glob(".create-cleanup-race.create.*"))
+        assert len(candidates) == 1
+        replacement = candidates[0]
+        replacement.rename(displaced)
+        replacement.mkdir()
+        replacement_marker = replacement / "replacement-must-survive.md"
         replacement_marker.write_text("replacement", encoding="utf-8")
         raise SkillPathError("simulated validation failure")
 
     monkeypatch.setattr(store_module, "_atomic_write_primary_at", swap_then_fail)
 
-    with pytest.raises(SkillPathError, match="changed during deletion"):
+    with pytest.raises(SkillPathError, match="cleanup could not confirm removal"):
         store.create(SkillDocument("create-cleanup-race", "Cleanup race", "Procedure."))
 
+    assert replacement_marker is not None
     assert replacement_marker.read_text(encoding="utf-8") == "replacement"
+    assert replacement is not None and replacement.is_dir()
+    assert not original.exists()
     assert not list(store.local_root.glob(".create-cleanup-race.delete.*"))
     assert displaced.is_dir()
 
@@ -1404,17 +1417,23 @@ def test_install_failure_cleanup_preserves_raced_replacement(tmp_path, monkeypat
     )
     target = store.local_root / "install-cleanup-race"
     displaced = tmp_path / "displaced-install"
-    marker = target / "replacement-must-survive.md"
+    replacement = None
+    marker = None
 
     def swap_then_fail(*_args, **_kwargs):
-        target.rename(displaced)
-        target.mkdir()
+        nonlocal marker, replacement
+        candidates = list(store.local_root.glob(".install-cleanup-race.install.*"))
+        assert len(candidates) == 1
+        replacement = candidates[0]
+        replacement.rename(displaced)
+        replacement.mkdir()
+        marker = replacement / "replacement-must-survive.md"
         marker.write_text("replacement", encoding="utf-8")
         raise OSError("simulated provenance failure")
 
     monkeypatch.setattr(store_module, "_atomic_replace_file_at", swap_then_fail)
 
-    with pytest.raises(SkillPathError, match="changed during deletion"):
+    with pytest.raises(SkillPathError, match="cleanup could not confirm removal"):
         store.install_folder(
             source,
             provenance=SkillProvenance(
@@ -1426,7 +1445,10 @@ def test_install_failure_cleanup_preserves_raced_replacement(tmp_path, monkeypat
             ),
         )
 
+    assert marker is not None
     assert marker.read_text(encoding="utf-8") == "replacement"
+    assert replacement is not None and replacement.is_dir()
+    assert not target.exists()
     assert not list(store.local_root.glob(".install-cleanup-race.delete.*"))
     assert displaced.is_dir()
 
@@ -1556,3 +1578,165 @@ def test_delete_preserves_quarantined_folder_if_recursive_removal_fails(
         "preserved as .delete-restore.delete." in note
         for note in caught.value.__notes__
     )
+
+
+@pytest.mark.parametrize("operation", ("primary", "resource"))
+def test_edit_bounds_external_folder_before_staging_copy(
+    tmp_path, monkeypatch, operation
+):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(
+        SkillDocument("bounded-edit", "Bound before copy", "Procedure.")
+    )
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    for index in range(512):
+        (folder / f"external-{index:03}.md").write_text("x", encoding="utf-8")
+
+    def reject_unbounded_copy(*_args, **_kwargs):
+        raise AssertionError("unbounded path copy ran before folder limits")
+
+    monkeypatch.setattr(store_module.shutil, "copytree", reject_unbounded_copy)
+
+    with pytest.raises(SkillFormatError, match="exceeds.*(?:files|entries)"):
+        if operation == "primary":
+            store.edit_primary(
+                record,
+                serialize_skill_markdown(
+                    SkillDocument("bounded-edit", "Edited", "Procedure.")
+                ),
+            )
+        else:
+            store.write_file(record, "notes.md", "edited")
+
+
+def test_tree_inventory_does_not_reopen_folder_after_descriptor_validation(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("pinned-tree", "Pinned tree", "Procedure."))
+    (folder / "inside.md").write_text("inside", encoding="utf-8")
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    displaced = tmp_path / "pinned-tree-original"
+    outside = tmp_path / "outside-tree"
+    outside.mkdir()
+    (outside / "outside-secret.md").write_text("secret", encoding="utf-8")
+    real_validate = store_module.validate_skill_folder
+
+    def replace_after_validation(candidate, *, source_root):
+        document = real_validate(candidate, source_root=source_root)
+        candidate.rename(displaced)
+        candidate.symlink_to(outside, target_is_directory=True)
+        return document
+
+    monkeypatch.setattr(
+        store_module,
+        "validate_skill_folder",
+        replace_after_validation,
+    )
+
+    entries = store.tree(record)
+
+    assert {entry["path"] for entry in entries} == {"SKILL.md", "inside.md"}
+
+
+def test_install_keeps_target_hidden_until_complete(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    source = source_root / "hidden-install"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("hidden-install", "Hidden install", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+    (source / "notes.md").write_text("resource", encoding="utf-8")
+    store = SkillStore(tmp_path / "skills")
+    target = store.local_root / "hidden-install"
+    real_copy = store_module._copy_regular_file_at
+    observed_copy = False
+
+    def assert_target_hidden(*args, **kwargs):
+        nonlocal observed_copy
+        observed_copy = True
+        assert not target.exists(), "public target appeared before install completed"
+        return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(store_module, "_copy_regular_file_at", assert_target_hidden)
+
+    installed = store.install_folder(
+        source,
+        provenance=SkillProvenance(
+            "git", "https://example.com/repo.git", "main:hidden-install"
+        ),
+    )
+
+    assert observed_copy
+    assert installed == target
+    assert (target / "SKILL.md").is_file()
+
+
+def test_create_keeps_target_hidden_until_complete(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    target = store.local_root / "hidden-create"
+    real_write = store_module._atomic_write_primary_at
+    observed_write = False
+
+    def assert_target_hidden(*args, **kwargs):
+        nonlocal observed_write
+        observed_write = True
+        assert not target.exists(), "public target appeared before create completed"
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(store_module, "_atomic_write_primary_at", assert_target_hidden)
+
+    created = store.create(
+        SkillDocument("hidden-create", "Hidden create", "Procedure.")
+    )
+
+    assert observed_write
+    assert created == target
+    assert (target / "SKILL.md").is_file()
+
+
+def test_hidden_install_orphan_does_not_block_retry(tmp_path):
+    source_root = tmp_path / "source"
+    source = source_root / "retry-install"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("retry-install", "Retry install", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+    store = SkillStore(tmp_path / "skills")
+    orphan = store.local_root / ".retry-install.install.crashed"
+    orphan.mkdir()
+    (orphan / "partial.md").write_text("partial", encoding="utf-8")
+
+    installed = store.install_folder(
+        source,
+        provenance=SkillProvenance(
+            "git", "https://example.com/repo.git", "main:retry-install"
+        ),
+    )
+
+    assert (installed / "SKILL.md").is_file()
+    assert orphan.is_dir()
+    records, errors = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()
+    assert [record.name for record in records] == ["retry-install"]
+    assert errors == ()

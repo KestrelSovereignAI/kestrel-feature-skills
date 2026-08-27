@@ -1101,7 +1101,11 @@ async def test_failed_create_publication_keeps_raced_replacement_disabled(
     marker = published / "replacement-survived-failed-publication.md"
 
     def swap_then_fail(*_args, **_kwargs):
-        published.rename(displaced)
+        candidates = list(
+            feature.agent.procedural_skills_root.glob(f".{name}.create.*")
+        )
+        assert len(candidates) == 1
+        candidates[0].rename(displaced)
         published.mkdir()
         marker.write_text("replacement", encoding="utf-8")
         (published / "SKILL.md").write_text(
@@ -1895,7 +1899,11 @@ async def test_failed_install_publication_keeps_raced_replacement_disabled(
         )
 
     def swap_then_fail(*_args, **_kwargs):
-        published.rename(displaced)
+        candidates = list(
+            feature.agent.procedural_skills_root.glob(f".{name}.install.*")
+        )
+        assert len(candidates) == 1
+        candidates[0].rename(displaced)
         published.mkdir()
         marker.write_text("replacement", encoding="utf-8")
         (published / "SKILL.md").write_text(
@@ -1974,13 +1982,10 @@ async def test_nested_metadata_like_resources_remain_in_inventory(feature):
     }
     for relative_path, content in expected.items():
         (folder / relative_path).write_text(content, encoding="utf-8")
-    root_internal = ".SKILL.md.tmp.stale"
-    (folder / root_internal).write_text("stale internal file", encoding="utf-8")
     await feature.refresh()
 
     tree_paths = {entry["path"] for entry in feature.tree(name=name)}
     assert expected.keys() <= tree_paths
-    assert root_internal not in tree_paths
     for relative_path, content in expected.items():
         result = await feature.skill_read(name, relative_path)
         assert result.status is ToolResultStatus.OK

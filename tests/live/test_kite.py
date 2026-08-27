@@ -62,15 +62,22 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-blank-list-interruption",
         "kite-html-container-exit",
         "kite-consecutive-reference",
+        "kite-reserved-claim",
     )
     code_example_name = "kite-code-examples"
     commonmark_control_name = "kite-commonmark-controls"
     unapproved_install = "permission-sentinel"
+    hidden_retry_name = "kite-hidden-retry"
+    bounded_edit_name = "kite-bounded-edit"
     for rejected_name in rejected_names:
         shutil.rmtree(root / rejected_name, ignore_errors=True)
     shutil.rmtree(root / code_example_name, ignore_errors=True)
     shutil.rmtree(root / commonmark_control_name, ignore_errors=True)
     shutil.rmtree(root / unapproved_install, ignore_errors=True)
+    shutil.rmtree(root / hidden_retry_name, ignore_errors=True)
+    shutil.rmtree(root / bounded_edit_name, ignore_errors=True)
+    for orphan in root.glob(f".{hidden_retry_name}.create.*"):
+        shutil.rmtree(orphan, ignore_errors=True)
     (root.parent / "kite-outside.md").unlink(missing_ok=True)
 
     with httpx.Client(timeout=30, headers=headers) as client:
@@ -173,6 +180,17 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             folder = root / folder_name
             folder.mkdir()
             (folder / "SKILL.md").write_bytes(content)
+
+        reserved_claim_folder = root / "kite-reserved-claim"
+        reserved_claim_folder.mkdir()
+        (reserved_claim_folder / "SKILL.md").write_text(
+            '---\nname: "kite-reserved-claim"\n'
+            'description: "Reserved writer collision"\n---\n\nProcedure.\n',
+            encoding="utf-8",
+        )
+        (reserved_claim_folder / ".SKILL.md.claim").write_text(
+            "authored collision", encoding="utf-8"
+        )
 
         invalid_resources = {
             "kite-oversized-resource": b"x" * 262_145,
@@ -438,6 +456,42 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert {name, code_example_name, commonmark_control_name} <= discovered
         assert all(rejected_name not in discovered for rejected_name in rejected_names)
 
+        hidden_orphan = root / f".{hidden_retry_name}.create.crashed"
+        hidden_orphan.mkdir()
+        (hidden_orphan / "partial.md").write_text("partial", encoding="utf-8")
+        hidden_retry = client.post(
+            base,
+            json={
+                "name": hidden_retry_name,
+                "description": "Retry after hidden crash orphan",
+                "body": "Procedure.",
+            },
+        )
+        assert hidden_retry.status_code == 200, hidden_retry.text
+        assert (root / hidden_retry_name / "SKILL.md").is_file()
+        assert hidden_orphan.is_dir()
+
+        bounded_create = client.post(
+            base,
+            json={
+                "name": bounded_edit_name,
+                "description": "Bound external folder before edit",
+                "body": "Procedure.",
+            },
+        )
+        assert bounded_create.status_code == 200, bounded_create.text
+        bounded_folder = root / bounded_edit_name
+        for index in range(256):
+            (bounded_folder / f"external-{index:03}.md").write_text(
+                "x", encoding="utf-8"
+            )
+        bounded_edit = client.put(
+            f"{base}/{bounded_edit_name}/file",
+            json={"path": "notes.md", "content": "must not publish"},
+        )
+        assert bounded_edit.status_code == 422, bounded_edit.text
+        assert not (bounded_folder / "notes.md").exists()
+
         tree = client.get(f"{base}/{name}/tree")
         assert tree.status_code == 200, tree.text
         tree_paths = {entry["path"] for entry in tree.json()["entries"]}
@@ -554,11 +608,19 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
         )
         assert deleted.status_code == 200, deleted.text
+        for cleanup_name in (hidden_retry_name, bounded_edit_name):
+            cleanup = client.delete(
+                f"{base}/{cleanup_name}",
+                headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
+            )
+            assert cleanup.status_code == 200, cleanup.text
         for rejected_name in rejected_names:
             shutil.rmtree(root / rejected_name, ignore_errors=True)
         shutil.rmtree(root / code_example_name, ignore_errors=True)
         shutil.rmtree(root / commonmark_control_name, ignore_errors=True)
         shutil.rmtree(root / unapproved_install, ignore_errors=True)
+        for orphan in root.glob(f".{hidden_retry_name}.create.*"):
+            shutil.rmtree(orphan, ignore_errors=True)
         escape_target.unlink(missing_ok=True)
         cleaned = client.post(f"{base}/reload")
         assert cleaned.status_code == 200, cleaned.text
