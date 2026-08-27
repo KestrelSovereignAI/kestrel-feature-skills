@@ -1032,57 +1032,73 @@ def validate_skill_folder_descriptor(
     def scan(directory_fd: int, parents: tuple[str, ...]) -> None:
         nonlocal entry_count, file_count, byte_count
         try:
-            names = os.listdir(directory_fd)
+            entries = os.scandir(directory_fd)
         except OSError as exc:
             raise SkillFormatError("could not scan the complete skill folder") from exc
-        for name in names:
-            relative_parts = (*parents, name)
-            relative = PurePosixPath(*relative_parts).as_posix()
-            entry_count += 1
-            if entry_count > MAX_FOLDER_ENTRIES:
-                raise SkillFormatError(
-                    f"skill folder exceeds {MAX_FOLDER_ENTRIES} filesystem entries"
-                )
-            if len(relative_parts) > MAX_FOLDER_DEPTH:
-                raise SkillFormatError(
-                    f"skill folder exceeds maximum depth {MAX_FOLDER_DEPTH}"
-                )
-            validate_resource_path(relative)
-            try:
-                value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            except OSError as exc:
-                raise SkillFormatError(
-                    "could not scan the complete skill folder"
-                ) from exc
-            if stat.S_ISLNK(value.st_mode):
-                raise SkillPathError(
-                    f"symlinks are not allowed in skill folders: {name}"
-                )
-            if stat.S_ISDIR(value.st_mode):
-                child = _open_pinned_directory_at(
+        try:
+            for entry in entries:
+                name = entry.name
+                relative_parts = (*parents, name)
+                relative = PurePosixPath(*relative_parts).as_posix()
+                entry_count += 1
+                if entry_count > MAX_FOLDER_ENTRIES:
+                    raise SkillFormatError(
+                        f"skill folder exceeds {MAX_FOLDER_ENTRIES} filesystem entries"
+                    )
+                if len(relative_parts) > MAX_FOLDER_DEPTH:
+                    raise SkillFormatError(
+                        f"skill folder exceeds maximum depth {MAX_FOLDER_DEPTH}"
+                    )
+                validate_resource_path(relative)
+                try:
+                    value = os.stat(
+                        name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise SkillFormatError(
+                        "could not scan the complete skill folder"
+                    ) from exc
+                if stat.S_ISLNK(value.st_mode):
+                    raise SkillPathError(
+                        f"symlinks are not allowed in skill folders: {name}"
+                    )
+                if stat.S_ISDIR(value.st_mode):
+                    child = _open_pinned_directory_at(
+                        directory_fd,
+                        name,
+                        expected=(value.st_dev, value.st_ino),
+                    )
+                    try:
+                        scan(child, relative_parts)
+                    finally:
+                        os.close(child)
+                    continue
+                if not stat.S_ISREG(value.st_mode):
+                    raise SkillPathError(
+                        f"skill resources must be regular files: {name}"
+                    )
+                payload = _read_regular_file_at(
                     directory_fd,
                     name,
-                    expected=(value.st_dev, value.st_ino),
+                    max_bytes=MAX_SKILL_FILE_BYTES,
                 )
-                try:
-                    scan(child, relative_parts)
-                finally:
-                    os.close(child)
-                continue
-            if not stat.S_ISREG(value.st_mode):
-                raise SkillPathError(f"skill resources must be regular files: {name}")
-            payload = _read_regular_file_at(
-                directory_fd,
-                name,
-                max_bytes=MAX_SKILL_FILE_BYTES,
-            )
-            _validate_resource_payload(payload, source=relative)
-            file_count += 1
-            byte_count += len(payload)
-            if file_count > MAX_FOLDER_FILES:
-                raise SkillFormatError(f"skill folder exceeds {MAX_FOLDER_FILES} files")
-            if byte_count > MAX_FOLDER_BYTES:
-                raise SkillFormatError(f"skill folder exceeds {MAX_FOLDER_BYTES} bytes")
+                _validate_resource_payload(payload, source=relative)
+                file_count += 1
+                byte_count += len(payload)
+                if file_count > MAX_FOLDER_FILES:
+                    raise SkillFormatError(
+                        f"skill folder exceeds {MAX_FOLDER_FILES} files"
+                    )
+                if byte_count > MAX_FOLDER_BYTES:
+                    raise SkillFormatError(
+                        f"skill folder exceeds {MAX_FOLDER_BYTES} bytes"
+                    )
+        except OSError as exc:
+            raise SkillFormatError("could not scan the complete skill folder") from exc
+        finally:
+            entries.close()
 
     scan(folder_fd, ())
     primary = _read_regular_file_at(
@@ -1108,72 +1124,26 @@ def validate_skill_folder(folder: Path, *, source_root: Path) -> SkillDocument:
     if not folder.is_dir():
         raise SkillFormatError("skill candidate is not a directory")
     contained_path(source_root, folder.name)
-
-    entry_count = 0
-    file_count = 0
-    byte_count = 0
-
-    def reject_walk_error(error: OSError) -> None:
-        raise SkillFormatError("could not scan the complete skill folder") from error
-
-    for current, directories, files in os.walk(
-        folder,
-        followlinks=False,
-        onerror=reject_walk_error,
-    ):
-        current_path = Path(current)
-        for entry in (*directories, *files):
-            path = current_path / entry
-            relative = path.relative_to(folder).as_posix()
-            entry_count += 1
-            if entry_count > MAX_FOLDER_ENTRIES:
-                raise SkillFormatError(
-                    f"skill folder exceeds {MAX_FOLDER_ENTRIES} filesystem entries"
-                )
-            if len(PurePosixPath(relative).parts) > MAX_FOLDER_DEPTH:
-                raise SkillFormatError(
-                    f"skill folder exceeds maximum depth {MAX_FOLDER_DEPTH}"
-                )
-            validate_resource_path(relative)
-            if path.is_symlink():
-                raise SkillPathError(
-                    f"symlinks are not allowed in skill folders: {path.name}"
-                )
-        for filename in files:
-            path = current_path / filename
-            mode = path.stat().st_mode
-            if not stat.S_ISREG(mode):
-                raise SkillPathError(
-                    f"skill resources must be regular files: {filename}"
-                )
-            contained_path(folder, path.relative_to(folder).as_posix())
-            try:
-                payload = path.read_bytes()
-            except OSError as exc:
-                raise SkillFormatError(
-                    f"could not read regular file: {path.relative_to(folder).as_posix()}"
-                ) from exc
-            _validate_resource_payload(
-                payload,
-                source=path.relative_to(folder).as_posix(),
-            )
-            file_count += 1
-            byte_count += len(payload)
-            if file_count > MAX_FOLDER_FILES:
-                raise SkillFormatError(f"skill folder exceeds {MAX_FOLDER_FILES} files")
-            if byte_count > MAX_FOLDER_BYTES:
-                raise SkillFormatError(f"skill folder exceeds {MAX_FOLDER_BYTES} bytes")
-
-    primary = folder / SKILL_FILENAME
-    if not primary.is_file() or primary.is_symlink():
-        raise SkillFormatError(f"skill folder requires a regular {SKILL_FILENAME}")
-    document = parse_skill_markdown(primary.read_bytes(), source=str(primary))
-    if document.name != folder.name:
-        raise SkillFormatError(
-            f"frontmatter name {document.name!r} must match folder name {folder.name!r}"
+    try:
+        identity = folder.lstat()
+        root_fd = os.open(source_root, _DIRECTORY_FLAGS)
+    except OSError as exc:
+        raise SkillPathError("skill source changed during validation") from exc
+    try:
+        folder_fd = _open_pinned_directory_at(
+            root_fd,
+            folder.name,
+            expected=(identity.st_dev, identity.st_ino),
         )
-    validate_document_references(document, folder)
-    return document
+        try:
+            return validate_skill_folder_descriptor(
+                folder_fd,
+                folder_name=folder.name,
+            )
+        finally:
+            os.close(folder_fd)
+    finally:
+        os.close(root_fd)
 
 
 __all__ = [

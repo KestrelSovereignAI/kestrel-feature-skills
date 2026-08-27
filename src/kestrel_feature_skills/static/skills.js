@@ -276,7 +276,11 @@ function renderCatalog() {
     ui.errors.append(el('li', 'skills-risk', `Enablement database: ${state.catalog.enablement_error}`));
   }
   if (!state.catalog?.skills?.length) ui.list.append(el('li', 'skills-muted', 'No valid skill folders discovered.'));
-  if (state.selected && !(state.catalog?.skills || []).some((item) => item.name === state.selected)) clearSelection();
+  if (state.selected) {
+    const selected = (state.catalog?.skills || []).find((item) => item.name === state.selected);
+    if (selected) renderSkillControls(selected);
+    else clearSelection();
+  }
 }
 
 function clearSelection() {

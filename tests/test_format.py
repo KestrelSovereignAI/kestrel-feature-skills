@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -130,14 +131,10 @@ def test_folder_name_must_match_frontmatter(tmp_path):
 def test_folder_scan_error_rejects_candidate(tmp_path, monkeypatch):
     folder = write_skill(tmp_path)
 
-    def failing_walk(root, *, followlinks, onerror=None):
-        assert root == folder
-        assert followlinks is False
-        if onerror is not None:
-            onerror(PermissionError("subdirectory became unreadable"))
-        return iter(())
+    def failing_scan(_directory_fd):
+        raise PermissionError("subdirectory became unreadable")
 
-    monkeypatch.setattr("kestrel_feature_skills.format.os.walk", failing_walk)
+    monkeypatch.setattr(format_module.os, "scandir", failing_scan)
 
     with pytest.raises(SkillFormatError, match="scan"):
         validate_skill_folder(folder, source_root=tmp_path)
@@ -146,12 +143,17 @@ def test_folder_scan_error_rejects_candidate(tmp_path, monkeypatch):
 def test_folder_rejects_resource_path_that_is_not_strict_utf8(tmp_path, monkeypatch):
     folder = write_skill(tmp_path)
 
-    def walk_with_surrogate(root, *, followlinks, onerror=None):
-        assert root == folder
-        assert followlinks is False
-        return iter(((str(folder), ["resource-\udcff"], ["SKILL.md"]),))
+    class SurrogateEntries:
+        def __init__(self):
+            self.remaining = [SimpleNamespace(name="resource-\udcff")]
 
-    monkeypatch.setattr("kestrel_feature_skills.format.os.walk", walk_with_surrogate)
+        def __iter__(self):
+            return iter(self.remaining)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(format_module.os, "scandir", lambda _fd: SurrogateEntries())
 
     with pytest.raises(SkillFormatError, match="UTF-8"):
         validate_skill_folder(folder, source_root=tmp_path)
@@ -160,31 +162,54 @@ def test_folder_rejects_resource_path_that_is_not_strict_utf8(tmp_path, monkeypa
 def test_folder_rejects_path_longer_than_http_read_contract(tmp_path, monkeypatch):
     folder = write_skill(tmp_path)
     part = "a" * 200
-    rows = [(str(folder), [part], ["SKILL.md"])]
-    current = folder
-    for _ in range(5):
-        current /= part
-        rows.append((str(current), [part], []))
 
-    def walk_with_long_relative_path(root, *, followlinks, onerror=None):
-        assert root == folder
-        assert followlinks is False
-        return iter(rows)
+    class OneDirectory:
+        def __iter__(self):
+            return iter((SimpleNamespace(name=part),))
 
-    real_is_symlink = type(folder).is_symlink
+        def close(self):
+            return None
 
-    def synthetic_paths_are_not_symlinks(path):
-        if part in path.parts:
-            return False
-        return real_is_symlink(path)
+    next_descriptor = 10_000
+    real_close = os.close
 
+    def open_synthetic_child(*_args, **_kwargs):
+        nonlocal next_descriptor
+        next_descriptor += 1
+        return next_descriptor
+
+    def close_synthetic_child(descriptor):
+        if descriptor < 10_000:
+            real_close(descriptor)
+
+    monkeypatch.setattr(format_module.os, "scandir", lambda _fd: OneDirectory())
     monkeypatch.setattr(
-        "kestrel_feature_skills.format.os.walk", walk_with_long_relative_path
+        format_module.os,
+        "stat",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            st_mode=format_module.stat.S_IFDIR | 0o700,
+            st_dev=1,
+            st_ino=1,
+        ),
     )
-    monkeypatch.setattr(type(folder), "is_symlink", synthetic_paths_are_not_symlinks)
-
-    with pytest.raises(SkillFormatError, match="path exceeds 1024 UTF-8 bytes"):
-        validate_skill_folder(folder, source_root=tmp_path)
+    monkeypatch.setattr(
+        format_module,
+        "_open_pinned_directory_at",
+        open_synthetic_child,
+    )
+    monkeypatch.setattr(format_module.os, "close", close_synthetic_child)
+    directory_fd = os.open(
+        folder,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        with pytest.raises(SkillFormatError, match="path exceeds 1024 UTF-8 bytes"):
+            format_module.validate_skill_folder_descriptor(
+                directory_fd,
+                folder_name=folder.name,
+            )
+    finally:
+        real_close(directory_fd)
 
 
 @pytest.mark.parametrize(
@@ -1028,3 +1053,87 @@ def test_deep_directory_only_tree_is_bounded(tmp_path):
 
     with pytest.raises(SkillFormatError, match="depth"):
         validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_descriptor_scan_stops_lazy_enumeration_at_total_entry_limit(
+    tmp_path, monkeypatch
+):
+    folder = write_skill(tmp_path)
+    directory_fd = os.open(
+        folder,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+
+    class LazyEntries:
+        def __init__(self):
+            self.consumed = 0
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.consumed += 1
+            if self.consumed > MAX_FOLDER_ENTRIES + 1:
+                raise AssertionError("entry cap did not stop lazy enumeration")
+            return SimpleNamespace(name=f"resource-{self.consumed:04}")
+
+        def close(self):
+            self.closed = True
+
+    entries = LazyEntries()
+    monkeypatch.setattr(format_module.os, "scandir", lambda _fd: entries)
+    monkeypatch.setattr(
+        format_module.os,
+        "stat",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            st_mode=format_module.stat.S_IFREG | 0o600,
+            st_dev=1,
+            st_ino=1,
+        ),
+    )
+    monkeypatch.setattr(
+        format_module,
+        "_read_regular_file_at",
+        lambda *_args, **_kwargs: b"x",
+    )
+    monkeypatch.setattr(
+        format_module,
+        "MAX_FOLDER_FILES",
+        MAX_FOLDER_ENTRIES + 1,
+    )
+    try:
+        with pytest.raises(SkillFormatError, match="filesystem entries"):
+            format_module.validate_skill_folder_descriptor(
+                directory_fd,
+                folder_name=folder.name,
+            )
+    finally:
+        os.close(directory_fd)
+
+    assert entries.consumed == MAX_FOLDER_ENTRIES + 1
+    assert entries.closed
+
+
+def test_descriptor_scan_never_materializes_all_directory_names(tmp_path, monkeypatch):
+    value = document()
+    folder = write_skill(tmp_path, value)
+    directory_fd = os.open(
+        folder,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+
+    def unexpected_listdir(*_args, **_kwargs):
+        raise AssertionError("descriptor validation must enumerate lazily")
+
+    monkeypatch.setattr(format_module.os, "listdir", unexpected_listdir)
+    try:
+        assert (
+            format_module.validate_skill_folder_descriptor(
+                directory_fd,
+                folder_name=folder.name,
+            )
+            == value
+        )
+    finally:
+        os.close(directory_fd)

@@ -299,6 +299,46 @@ test.describe.serial('procedural skills contributed console', () => {
     await expect(page.locator('#panel-procedural-skills')).toBeVisible();
   });
 
+  test('catalog refresh updates selected state controls without losing the editor', async ({ page, request }) => {
+    await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
+      headers: headers(),
+      data: { enabled: false, priority: 100 },
+    });
+    await openPanel(page);
+    await page.getByRole('button', { name: SKILL_NAME }).click();
+    await page.getByRole('button', { name: 'SKILL.md' }).click();
+    const editor = page.getByLabel('Skill file editor');
+    const unsaved = `${await editor.inputValue()}\nUNSAVED-REFRESHED-STATE-SENTINEL\n`;
+    await editor.fill(unsaved);
+    try {
+      const externalUpdate = await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
+        headers: headers(),
+        data: { enabled: true, priority: 23 },
+      });
+      expect(externalUpdate.ok(), await externalUpdate.text()).toBeTruthy();
+      await page.evaluate(() => {
+        globalThis.dispatchEvent(new CustomEvent('capabilities:changed'));
+      });
+
+      await expect(page.getByLabel('Skill priority')).toHaveValue('23');
+      await expect(page.getByRole('button', { name: 'Disable', exact: true })).toBeVisible();
+      await expect(editor).toHaveValue(unsaved);
+
+      await page.getByLabel('Skill priority').fill('37');
+      await page.getByRole('button', { name: 'Set priority' }).click();
+      await expect(page.locator('[role="status"]')).toContainText(`Updated ${SKILL_NAME} priority to 37.`);
+      const catalog = await request.get(API_ROOT, { headers: headers() });
+      const skill = (await catalog.json()).skills.find((item) => item.name === SKILL_NAME);
+      expect(skill.enabled).toBe(true);
+      expect(skill.priority).toBe(37);
+    } finally {
+      await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
+        headers: headers(),
+        data: { enabled: false, priority: 100 },
+      });
+    }
+  });
+
   test('state controls stay serialized while an update is in flight', async ({ page, request }) => {
     await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
       headers: headers(),
