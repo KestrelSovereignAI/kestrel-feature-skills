@@ -34,6 +34,8 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
     rejected_names = (
         "kite-zero",
         "kite-oversized",
+        "kite-oversized-resource",
+        "kite-binary-resource",
         "kite-no-frontmatter",
         "kite-symlink",
         "kite-nested-link",
@@ -157,6 +159,20 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             folder = root / folder_name
             folder.mkdir()
             (folder / "SKILL.md").write_bytes(content)
+
+        invalid_resources = {
+            "kite-oversized-resource": b"x" * 262_145,
+            "kite-binary-resource": b"text-prefix\xff",
+        }
+        for folder_name, content in invalid_resources.items():
+            folder = root / folder_name
+            folder.mkdir()
+            (folder / "SKILL.md").write_text(
+                f'---\nname: "{folder_name}"\n'
+                'description: "Unreadable bundled resource"\n---\n\nProcedure.\n',
+                encoding="utf-8",
+            )
+            (folder / "reference.txt").write_bytes(content)
 
         escape_target = root.parent / "kite-outside.md"
         escape_target.write_text("outside\n", encoding="utf-8")
@@ -384,6 +400,15 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             },
         )
         assert invalid_git_ref.status_code == 422, invalid_git_ref.text
+        invalid_git_port = client.post(
+            f"{base}/install",
+            json={
+                "source_url": "https://example.com:not-a-port/skills.git",
+                "skill_name": "invalid-git-port",
+                "ref": "HEAD",
+            },
+        )
+        assert invalid_git_port.status_code == 422, invalid_git_port.text
 
         disabled = client.patch(
             f"{base}/{name}/state",

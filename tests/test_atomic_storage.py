@@ -19,6 +19,7 @@ from kestrel_feature_skills.errors import (
 from kestrel_feature_skills.format import (
     MAX_FOLDER_BYTES,
     MAX_FOLDER_FILES,
+    MAX_SKILL_FILE_BYTES,
     serialize_skill_markdown,
     validate_skill_folder,
 )
@@ -35,6 +36,18 @@ def payload(name="atomic"):
     return serialize_skill_markdown(
         SkillDocument(name, "Atomic write", "# Procedure\n\nWrite once.")
     ).encode("utf-8")
+
+
+def write_bounded_text_padding(root: Path, total_bytes: int) -> None:
+    """Fill a folder without violating the per-resource read contract."""
+
+    remaining = total_bytes
+    index = 0
+    while remaining:
+        chunk = min(remaining, MAX_SKILL_FILE_BYTES)
+        (root / f"padding-{index:02}.md").write_bytes(b"x" * chunk)
+        remaining -= chunk
+        index += 1
 
 
 def _write_resource_from_separate_process(root, lock_state, result):
@@ -907,8 +920,9 @@ def test_limit_crossing_primary_edit_preserves_the_original(tmp_path):
     original = primary.read_bytes()
     resources = folder / "resources"
     resources.mkdir()
-    (resources / "padding.md").write_bytes(
-        b"x" * (MAX_FOLDER_BYTES - len(original) - 16)
+    write_bounded_text_padding(
+        resources,
+        MAX_FOLDER_BYTES - len(original) - 16,
     )
     validate_skill_folder(folder, source_root=store.local_root)
     replacement = serialize_skill_markdown(
@@ -1031,7 +1045,7 @@ def test_install_rejects_generated_provenance_crossing_byte_limit(tmp_path):
     document = SkillDocument("byte-boundary", "Boundary", "Procedure.")
     primary = serialize_skill_markdown(document).encode("utf-8")
     (source / "SKILL.md").write_bytes(primary)
-    (source / "padding.md").write_bytes(b"x" * (MAX_FOLDER_BYTES - len(primary)))
+    write_bounded_text_padding(source, MAX_FOLDER_BYTES - len(primary))
     store = SkillStore(tmp_path / "local")
 
     with pytest.raises(SkillFormatError, match="exceeds.*bytes"):

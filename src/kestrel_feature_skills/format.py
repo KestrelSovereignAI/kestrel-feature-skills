@@ -84,6 +84,17 @@ def _utf8_bytes(value: str, *, label: str) -> bytes:
         raise SkillFormatError(f"{label} must be valid UTF-8 text") from exc
 
 
+def _validate_resource_payload(payload: bytes, *, source: str) -> None:
+    """Keep every inventoried file within the bounded UTF-8 read contract."""
+
+    if len(payload) > MAX_SKILL_FILE_BYTES:
+        raise SkillFormatError(f"{source} exceeds {MAX_SKILL_FILE_BYTES} bytes")
+    try:
+        payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SkillFormatError(f"{source} must be UTF-8 text") from exc
+
+
 def validate_skill_name(name: object) -> str:
     if not isinstance(name, str) or not SKILL_NAME_RE.fullmatch(name):
         raise SkillFormatError(
@@ -998,8 +1009,14 @@ def validate_skill_folder_descriptor(
                 continue
             if not stat.S_ISREG(value.st_mode):
                 raise SkillPathError(f"skill resources must be regular files: {name}")
+            payload = _read_regular_file_at(
+                directory_fd,
+                name,
+                max_bytes=MAX_SKILL_FILE_BYTES,
+            )
+            _validate_resource_payload(payload, source=relative)
             file_count += 1
-            byte_count += value.st_size
+            byte_count += len(payload)
             if file_count > MAX_FOLDER_FILES:
                 raise SkillFormatError(f"skill folder exceeds {MAX_FOLDER_FILES} files")
             if byte_count > MAX_FOLDER_BYTES:
@@ -1068,8 +1085,18 @@ def validate_skill_folder(folder: Path, *, source_root: Path) -> SkillDocument:
                     f"skill resources must be regular files: {filename}"
                 )
             contained_path(folder, path.relative_to(folder).as_posix())
+            try:
+                payload = path.read_bytes()
+            except OSError as exc:
+                raise SkillFormatError(
+                    f"could not read regular file: {path.relative_to(folder).as_posix()}"
+                ) from exc
+            _validate_resource_payload(
+                payload,
+                source=path.relative_to(folder).as_posix(),
+            )
             file_count += 1
-            byte_count += path.stat().st_size
+            byte_count += len(payload)
             if file_count > MAX_FOLDER_FILES:
                 raise SkillFormatError(f"skill folder exceeds {MAX_FOLDER_FILES} files")
             if byte_count > MAX_FOLDER_BYTES:

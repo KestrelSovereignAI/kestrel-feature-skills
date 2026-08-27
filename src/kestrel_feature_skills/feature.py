@@ -760,7 +760,28 @@ class ProceduralSkillsFeature(Feature):
         enabled: bool,
         priority: int | None = None,
     ) -> dict[str, object]:
-        _, enablement = self._require_services()
+        store, enablement = self._require_services()
+        name = validate_skill_name(name)
+        async with self._publication_state_claim(store, name):
+            # A publication or deletion in another feature instance may have
+            # completed while this caller waited. Resolve the state mutation
+            # against the catalog version protected by the same name claim.
+            await self._refresh_locked()
+            return await self._set_skill_state_with_publication_claim(
+                enablement=enablement,
+                name=name,
+                enabled=enabled,
+                priority=priority,
+            )
+
+    async def _set_skill_state_with_publication_claim(
+        self,
+        *,
+        enablement: SkillEnablementStore,
+        name: str,
+        enabled: bool,
+        priority: int | None,
+    ) -> dict[str, object]:
         record = SkillStore.get(self._snapshot, name)
         resolved_priority = (
             record.state.priority if priority is None else validate_priority(priority)
@@ -792,6 +813,24 @@ class ProceduralSkillsFeature(Feature):
 
     async def _delete_skill_locked(self, *, name: str) -> dict[str, object]:
         store, enablement = self._require_services()
+        name = validate_skill_name(name)
+        async with self._publication_state_claim(store, name):
+            # Re-resolve after waiting so a stale feature instance cannot
+            # delete a replacement that was published before it won the claim.
+            await self._refresh_locked()
+            return await self._delete_skill_with_publication_claim(
+                store=store,
+                enablement=enablement,
+                name=name,
+            )
+
+    async def _delete_skill_with_publication_claim(
+        self,
+        *,
+        store: SkillStore,
+        enablement: SkillEnablementStore,
+        name: str,
+    ) -> dict[str, object]:
         record = SkillStore.get(self._snapshot, name)
         node_id = self._node_id(name)
         store.require_local_record(record)

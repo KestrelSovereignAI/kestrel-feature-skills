@@ -12,7 +12,7 @@ import pytest
 import kestrel_feature_skills.git_source as git_source_module
 import kestrel_feature_skills.sources as sources_module
 from kestrel_feature_skills.errors import GitSourceError
-from kestrel_feature_skills.format import serialize_skill_markdown
+from kestrel_feature_skills.format import MAX_SKILL_FILE_BYTES, serialize_skill_markdown
 from kestrel_feature_skills.git_source import GitSkillSource, validate_remote_url
 from kestrel_feature_skills.models import SkillDocument, SkillProvenance, SkillState
 from kestrel_feature_skills.sources import (
@@ -66,6 +66,30 @@ def test_agent_local_shadows_host_shared_deterministically(tmp_path):
     assert snapshot.records[0].document.description == "local wins"
     assert snapshot.records[0].source_id == "agent-local"
     assert snapshot.shadowed["overlap"][0].source_id == "host-shared"
+
+
+@pytest.mark.parametrize(
+    "payload, message",
+    (
+        (b"x" * (MAX_SKILL_FILE_BYTES + 1), "exceeds"),
+        (b"text-prefix\xff", "UTF-8"),
+    ),
+)
+def test_discovery_rejects_resources_that_skill_read_cannot_open(
+    tmp_path, payload, message
+):
+    local = tmp_path / "local"
+    shared = tmp_path / "shared"
+    local.mkdir()
+    shared.mkdir()
+    folder = make_skill(local, "unreadable-resource", "Invalid resource")
+    (folder / "reference.txt").write_bytes(payload)
+
+    snapshot = catalog(local, shared).refresh()
+
+    assert snapshot.records == ()
+    assert len(snapshot.errors) == 1
+    assert message in snapshot.errors[0].error
 
 
 def test_enablement_and_priority_survive_catalog_reload(tmp_path):
@@ -411,6 +435,8 @@ def test_json_escaped_surrogates_are_rejected_in_documents_and_provenance(tmp_pa
         "http://example.com/skills.git",
         "https://user:secret@example.com/skills.git",
         "https://example.com/skills.git?token=secret",
+        "https://example.com:not-a-port/skills.git",
+        "https://example.com:99999/skills.git",
         "https://[",
         "file:///tmp/skills.git",
     ),

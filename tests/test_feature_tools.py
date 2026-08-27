@@ -165,6 +165,112 @@ async def test_same_name_install_waits_for_create_guard_and_publication(
 
 
 @pytest.mark.asyncio
+async def test_enable_waits_for_same_name_local_override_publication(
+    feature, tmp_path, monkeypatch
+):
+    name = "serialized-state-update"
+    shared_root = tmp_path / "shared-skills"
+    shared_folder = shared_root / name
+    shared_folder.mkdir(parents=True)
+    (shared_folder / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Host shared predecessor", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KESTREL_SHARED_SKILLS_DIR", str(shared_root))
+    creator = ProceduralSkillsFeature(feature.agent)
+    enabler = ProceduralSkillsFeature(feature.agent)
+    await creator.initialize()
+    await enabler.initialize()
+    guard_written = asyncio.Event()
+    release_creator = asyncio.Event()
+    original_prepare = creator._prepare_disabled_state
+
+    async def pause_after_guard(*args, **kwargs):
+        prepared = await original_prepare(*args, **kwargs)
+        guard_written.set()
+        await release_creator.wait()
+        return prepared
+
+    monkeypatch.setattr(creator, "_prepare_disabled_state", pause_after_guard)
+    creation = asyncio.create_task(
+        creator.create_skill(
+            name=name,
+            description="Agent-local replacement",
+            body="Procedure.",
+            enabled=False,
+            priority=7,
+        )
+    )
+    await asyncio.wait_for(guard_written.wait(), timeout=5)
+    state_update = asyncio.create_task(enabler.set_skill_state(name=name, enabled=True))
+    await asyncio.sleep(0.1)
+    update_waited = not state_update.done()
+    release_creator.set()
+    try:
+        created, updated = await asyncio.gather(creation, state_update)
+    finally:
+        release_creator.set()
+        await creator.shutdown()
+        await enabler.shutdown()
+
+    assert update_waited, "state update passed an in-flight same-name publication"
+    assert created["enabled"] is False
+    assert updated["enabled"] is True
+    assert (await feature._enablement.load())[name] == SkillState(True, 7)
+
+
+@pytest.mark.asyncio
+async def test_create_waits_for_same_name_delete_state_cleanup(feature, monkeypatch):
+    name = "serialized-delete-cleanup"
+    created = await feature.create_skill(
+        name=name,
+        description="Original local skill",
+        body="Procedure.",
+        enabled=True,
+        priority=13,
+    )
+    assert created["enabled"] is True
+    creator = ProceduralSkillsFeature(feature.agent)
+    await creator.initialize()
+    folder_removed = asyncio.Event()
+    release_delete = asyncio.Event()
+    original_delete_state = feature._enablement.delete
+
+    async def pause_before_state_cleanup(skill_name):
+        if skill_name == name:
+            folder_removed.set()
+            await release_delete.wait()
+        return await original_delete_state(skill_name)
+
+    monkeypatch.setattr(feature._enablement, "delete", pause_before_state_cleanup)
+    deletion = asyncio.create_task(feature.delete_skill(name=name))
+    await asyncio.wait_for(folder_removed.wait(), timeout=5)
+    replacement = asyncio.create_task(
+        creator.create_skill(
+            name=name,
+            description="Replacement local skill",
+            body="Procedure.",
+            priority=7,
+        )
+    )
+    await asyncio.sleep(0.1)
+    replacement_waited = not replacement.done()
+    release_delete.set()
+    try:
+        deleted, recreated = await asyncio.gather(deletion, replacement)
+    finally:
+        release_delete.set()
+        await creator.shutdown()
+
+    assert replacement_waited, "publication passed same-name delete state cleanup"
+    assert deleted["removed_file"] is True
+    assert recreated["priority"] == 7
+    assert (await feature._enablement.load())[name] == SkillState(False, 7)
+
+
+@pytest.mark.asyncio
 async def test_feature_catalog_rejects_replacement_of_pinned_local_root(
     feature, tmp_path
 ):

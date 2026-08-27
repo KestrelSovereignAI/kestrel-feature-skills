@@ -31,7 +31,9 @@ system-prompt catalog. The procedure body appears only after `skill_read`.
 Resources and scripts are opened explicitly, and there is no script execution
 surface in this package. `skill_read <name> <relative-path>` opens a file from
 the resource inventory as text; omitting the path returns the primary procedure
-body and inventory.
+body and inventory. Every inventoried file must be UTF-8 text and is capped at
+256 KiB so every successfully discovered resource remains readable through the
+advertised tool and Console surfaces.
 
 ## Sources and precedence
 
@@ -46,7 +48,8 @@ reports provenance, and a git install records the full source commit in
 `.kestrel-provenance.json`. Remote installs refuse redirects and use a partial
 sparse checkout of only the requested skill paths. They abort if checkout data
 crosses 32 MiB or 4,096 filesystem entries; the validated skill folder itself
-remains capped at 2 MiB and 512 entries.
+remains capped at 2 MiB and 512 entries, in addition to the 256 KiB per-file
+read limit.
 
 ## Permission rails
 

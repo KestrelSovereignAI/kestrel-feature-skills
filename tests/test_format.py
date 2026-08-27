@@ -156,6 +156,23 @@ def test_folder_rejects_resource_path_that_is_not_strict_utf8(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize(
+    "payload, message",
+    (
+        (b"x" * (MAX_SKILL_FILE_BYTES + 1), "exceeds"),
+        (b"text-prefix\xff", "UTF-8"),
+    ),
+)
+def test_folder_rejects_resources_that_skill_read_cannot_open(
+    tmp_path, payload, message
+):
+    folder = write_skill(tmp_path)
+    (folder / "reference.txt").write_bytes(payload)
+
+    with pytest.raises(SkillFormatError, match=message):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
     "destination",
     ["../secret.md", "/etc/passwd", "..%2fsecret.md", "scripts\\evil.py"],
 )

@@ -49,6 +49,10 @@ def validate_remote_url(url: object) -> str:
         )
     try:
         parsed = urlsplit(url)
+        # urllib deliberately defers malformed/out-of-range port checks until
+        # this property is read. Validate it before Git turns caller input into
+        # an upstream/tooling failure.
+        _ = parsed.port
     except ValueError as exc:
         raise GitInputError("git source URL is malformed") from exc
     if (
