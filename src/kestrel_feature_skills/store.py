@@ -45,13 +45,15 @@ from .paths import (
     lexical_contained_path,
     reject_symlink_chain,
 )
-from .sources import PROVENANCE_FILENAME, serialize_provenance
+from .sources import MAX_SOURCE_ENTRIES, PROVENANCE_FILENAME, serialize_provenance
 
 CLAIM_STALENESS_SECONDS = 60
 INTERNAL_DIRECTORY = ".kestrel-internal"
 MAX_EDITOR_FILE_BYTES = 262_144
 _MUTATION_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 _MUTATION_LOCKS_GUARD = threading.Lock()
+_SOURCE_PUBLICATION_LOCKS: dict[str, threading.RLock] = {}
+_SOURCE_PUBLICATION_LOCKS_GUARD = threading.Lock()
 _PUBLICATION_STATE_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 _PUBLICATION_STATE_LOCKS_GUARD = threading.Lock()
 _DIRECTORY_FLAGS = (
@@ -95,6 +97,54 @@ class PublicationStateClaim:
 
 
 @contextmanager
+def _serialized_source_publication(
+    root: Path,
+    internal_fd: int,
+    *,
+    enabled: bool,
+):
+    """Serialize source-capacity reservations across processes when requested."""
+
+    if not enabled:
+        yield
+        return
+    key = str(root)
+    with _SOURCE_PUBLICATION_LOCKS_GUARD:
+        thread_lock = _SOURCE_PUBLICATION_LOCKS.setdefault(key, threading.RLock())
+    with thread_lock:
+        lock_name = ".source-publication.lock"
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            descriptor = os.open(lock_name, flags, 0o600, dir_fd=internal_fd)
+        except OSError as exc:
+            raise SkillPathError("could not open the source publication lock") from exc
+        locked = False
+        try:
+            value = os.fstat(descriptor)
+            if not stat.S_ISREG(value.st_mode):
+                raise SkillPathError("source publication lock must be a regular file")
+            identity = (value.st_dev, value.st_ino)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            locked = True
+            if _identity_at(internal_fd, lock_name) != identity:
+                raise SkillPathError(
+                    "source publication lock changed while acquiring it"
+                )
+            yield
+        finally:
+            try:
+                if locked:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+@contextmanager
 def _serialized_skill_mutation(
     root: Path,
     internal_root: Path,
@@ -102,6 +152,7 @@ def _serialized_skill_mutation(
     *,
     root_identity: tuple[int, int],
     internal_root_identity: tuple[int, int],
+    source_publication: bool = False,
 ):
     """Serialize validation and publication across threads and processes."""
 
@@ -143,7 +194,12 @@ def _serialized_skill_mutation(
                         raise SkillPathError(
                             "skill mutation lock changed while acquiring it"
                         )
-                    yield root_fd, internal_fd
+                    with _serialized_source_publication(
+                        root,
+                        internal_fd,
+                        enabled=source_publication,
+                    ):
+                        yield root_fd, internal_fd
                 finally:
                     try:
                         if locked:
@@ -216,6 +272,20 @@ def _identity_at(directory_fd: int, name: str) -> tuple[int, int] | None:
     except FileNotFoundError:
         return None
     return value.st_dev, value.st_ino
+
+
+def _require_source_publication_capacity_at(root_fd: int) -> None:
+    """Fail before staging when one more immediate source entry cannot fit."""
+
+    entries = 0
+    with os.scandir(root_fd) as candidates:
+        for _candidate in candidates:
+            entries += 1
+            if entries >= MAX_SOURCE_ENTRIES:
+                raise SkillFormatError(
+                    "agent-local skill source is at source entry capacity "
+                    f"{MAX_SOURCE_ENTRIES}"
+                )
 
 
 def _claim_is_stale_at(directory_fd: int, name: str) -> bool:
@@ -929,7 +999,9 @@ class SkillStore:
             name,
             root_identity=self._local_root_identity,
             internal_root_identity=self._internal_root_identity,
+            source_publication=True,
         ) as (root_fd, _artifact_fd):
+            _require_source_publication_capacity_at(root_fd)
             folder = direct_child(
                 self.local_root,
                 name,
@@ -1377,7 +1449,9 @@ class SkillStore:
                 document.name,
                 root_identity=self._local_root_identity,
                 internal_root_identity=self._internal_root_identity,
+                source_publication=True,
             ) as (root_fd, _artifact_fd):
+                _require_source_publication_capacity_at(root_fd)
                 target = direct_child(
                     self.local_root,
                     document.name,

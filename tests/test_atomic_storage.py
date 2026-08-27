@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import kestrel_feature_skills.sources as sources_module
 import kestrel_feature_skills.store as store_module
 from kestrel_feature_skills.errors import (
     SkillConflictError,
@@ -992,6 +993,150 @@ def test_crash_orphaned_edit_artifacts_are_outside_skill_discovery(tmp_path):
     assert survivor.is_dir()
     assert [item.name for item in records] == ["crash-artifact-survivor"]
     assert errors == ()
+
+
+@pytest.mark.parametrize("operation", ("create", "install"))
+def test_publication_refuses_full_source_without_leaving_skill(
+    tmp_path, monkeypatch, operation
+):
+    store = SkillStore(tmp_path / "skills")
+    monkeypatch.setattr(sources_module, "MAX_SOURCE_ENTRIES", 3)
+    monkeypatch.setattr(store_module, "MAX_SOURCE_ENTRIES", 3, raising=False)
+    (store.local_root / "ordinary-one.txt").write_text("one", encoding="utf-8")
+    (store.local_root / "ordinary-two.txt").write_text("two", encoding="utf-8")
+    name = f"full-source-{operation}"
+
+    with pytest.raises(SkillFormatError, match="source.*capacity"):
+        if operation == "create":
+            store.create(SkillDocument(name, "Full source", "Procedure."))
+        else:
+            source = tmp_path / "source" / name
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_text(
+                serialize_skill_markdown(
+                    SkillDocument(name, "Full source", "Procedure.")
+                ),
+                encoding="utf-8",
+            )
+            store.install_folder(
+                source,
+                provenance=SkillProvenance(
+                    "git", "https://example.com/skills.git", f"main:{name}"
+                ),
+            )
+
+    assert not (store.local_root / name).exists()
+    assert {path.name for path in store.local_root.iterdir()} == {
+        INTERNAL_DIRECTORY,
+        "ordinary-one.txt",
+        "ordinary-two.txt",
+    }
+
+
+def test_concurrent_publications_share_one_source_capacity_reservation(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    monkeypatch.setattr(store_module, "MAX_SOURCE_ENTRIES", 2)
+    real_capacity_check = store_module._require_source_publication_capacity_at
+    first_checked = threading.Event()
+    release_first = threading.Event()
+    results = []
+    calls = 0
+
+    def pause_first_capacity_check(root_fd):
+        nonlocal calls
+        real_capacity_check(root_fd)
+        calls += 1
+        if calls == 1:
+            first_checked.set()
+            assert release_first.wait(timeout=5)
+
+    def create(name):
+        try:
+            store.create(SkillDocument(name, "Capacity race", "Procedure."))
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            results.append((name, exc))
+        else:
+            results.append((name, None))
+
+    monkeypatch.setattr(
+        store_module,
+        "_require_source_publication_capacity_at",
+        pause_first_capacity_check,
+    )
+    first = threading.Thread(target=create, args=("capacity-race-one",))
+    second = threading.Thread(target=create, args=("capacity-race-two",))
+    first.start()
+    assert first_checked.wait(timeout=5)
+    second.start()
+    try:
+        second.join(timeout=0.1)
+        assert second.is_alive()
+        assert calls == 1
+    finally:
+        release_first.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert len(results) == 2
+    assert sum(error is None for _name, error in results) == 1
+    failures = [error for _name, error in results if error is not None]
+    assert len(failures) == 1
+    assert isinstance(failures[0], SkillFormatError)
+    assert (
+        len(
+            [
+                path
+                for path in store.local_root.iterdir()
+                if not path.name.startswith(".")
+            ]
+        )
+        == 1
+    )
+
+
+def test_source_publication_rejects_nonregular_lock(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    lock = store._internal_root / ".source-publication.lock"
+    os.mkfifo(lock)
+
+    with pytest.raises(SkillPathError, match="source publication lock.*regular"):
+        store.create(SkillDocument("nonregular-source-lock", "Lock type", "Procedure."))
+
+    assert not (store.local_root / "nonregular-source-lock").exists()
+
+
+def test_source_publication_rejects_replaced_lock(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    lock = store._internal_root / ".source-publication.lock"
+    real_identity = store_module._identity_at
+    swapped = False
+
+    def replace_before_identity_check(directory_fd, name):
+        nonlocal swapped
+        if name == lock.name and not swapped:
+            swapped = True
+            lock.unlink()
+            lock.write_text("replacement", encoding="utf-8")
+        return real_identity(directory_fd, name)
+
+    monkeypatch.setattr(
+        store_module,
+        "_identity_at",
+        replace_before_identity_check,
+    )
+
+    with pytest.raises(SkillPathError, match="source publication lock changed"):
+        store.create(
+            SkillDocument("replaced-source-lock", "Lock identity", "Procedure.")
+        )
+
+    assert swapped
+    assert lock.read_text(encoding="utf-8") == "replacement"
+    assert not (store.local_root / "replaced-source-lock").exists()
 
 
 def test_concurrent_resource_edits_revalidate_the_serialized_folder(

@@ -45,6 +45,53 @@ EXPECTED_TOOLS = {
 }
 
 
+@pytest.mark.asyncio
+async def test_catalog_refresh_scans_without_blocking_the_event_loop(
+    feature, monkeypatch
+):
+    original_refresh = feature._catalog.refresh
+    release = threading.Event()
+    observed_release = []
+
+    def pause_catalog(states):
+        observed_release.append(release.wait(timeout=1))
+        return original_refresh(states)
+
+    monkeypatch.setattr(feature._catalog, "refresh", pause_catalog)
+    asyncio.get_running_loop().call_later(0.01, release.set)
+
+    await feature.refresh()
+
+    assert observed_release == [True]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_refresh_drains_catalog_worker_before_return(
+    feature, monkeypatch
+):
+    original_refresh = feature._catalog.refresh
+    started = threading.Event()
+    release = threading.Event()
+
+    def pause_catalog(states):
+        started.set()
+        assert release.wait(timeout=5)
+        return original_refresh(states)
+
+    monkeypatch.setattr(feature._catalog, "refresh", pause_catalog)
+    refresh = asyncio.create_task(feature.refresh())
+    assert await asyncio.to_thread(started.wait, 1)
+    refresh.cancel()
+    await asyncio.sleep(0.05)
+    try:
+        assert not refresh.done(), "cancellation escaped while catalog scan was active"
+    finally:
+        release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await refresh
+
+
 class UnexpectedGraphError(Exception):
     """A non-database graph failure used to prove best-effort containment."""
 

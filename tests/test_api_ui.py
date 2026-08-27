@@ -8,7 +8,11 @@ import pytest
 from fastapi import FastAPI
 from kestrel_sovereign.privacy import PrivacyConfig
 
-from kestrel_feature_skills.errors import GitSourceError, SkillPathError
+from kestrel_feature_skills.errors import (
+    GitSourceError,
+    SkillConflictError,
+    SkillPathError,
+)
 from kestrel_feature_skills.format import MAX_RESOURCE_PATH_BYTES
 
 
@@ -74,6 +78,24 @@ async def test_invalid_frontmatter_rejected_at_save_with_visible_reason(client):
     )
     assert response.status_code == 422
     assert "description" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_edit_api_maps_concurrent_writer_conflict_to_409(
+    client, feature, monkeypatch
+):
+    async def conflict(**_kwargs):
+        raise SkillConflictError("concurrent skill write is already in progress")
+
+    monkeypatch.setattr(feature, "edit_skill", conflict)
+
+    response = await client.put(
+        "/api/procedural-skills/conflicted/file",
+        json={"path": "SKILL.md", "content": "replacement"},
+    )
+
+    assert response.status_code == 409
+    assert "concurrent skill write" in response.json()["detail"]
 
 
 @pytest.mark.asyncio

@@ -192,6 +192,7 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
         except (
             SkillNotFoundError,
             SkillReadOnlyError,
+            SkillConflictError,
             SkillFormatError,
             SkillPathError,
             SkillPrivacyError,

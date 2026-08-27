@@ -239,6 +239,28 @@ class ProceduralSkillsFeature(Feature):
             self._enablement_error = None
         return await self._rebuild_snapshot_locked(states)
 
+    @staticmethod
+    async def _scan_catalog_until_stopped(
+        catalog: SkillCatalog,
+        states: dict[str, SkillState],
+    ) -> CatalogSnapshot:
+        """Keep cancellation scoped until the owned catalog scan has stopped."""
+
+        worker = asyncio.create_task(asyncio.to_thread(catalog.refresh, states))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            while True:
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:  # noqa: BLE001 - retrieve worker failure first
+                    break
+                else:
+                    break
+            raise
+
     async def _rebuild_snapshot_locked(
         self, states: dict[str, SkillState]
     ) -> CatalogSnapshot:
@@ -246,7 +268,10 @@ class ProceduralSkillsFeature(Feature):
 
         if self._catalog is None:
             raise RuntimeError("ProceduralSkillsFeature is not initialized")
-        self._snapshot = self._catalog.refresh(states)
+        self._snapshot = await self._scan_catalog_until_stopped(
+            self._catalog,
+            states,
+        )
         self._context_render = render_context_clause(
             self._snapshot,
             max_bytes=DEFAULT_CONTEXT_BUDGET_BYTES,
