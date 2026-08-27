@@ -36,6 +36,12 @@ _PROVENANCE_BOUNDS = {
 }
 
 
+def _json_safe_text(value: object) -> str:
+    """Preserve readable text while escaping filesystem surrogate code points."""
+
+    return str(value).encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
 class SkillSource(ABC):
     """A deterministic provider of validated skill folders."""
 
@@ -166,9 +172,9 @@ class DirectorySkillSource(SkillSource):
                 raise SkillPathError("skill source root changed during discovery")
         except (SkillError, OSError) as exc:
             error = DiscoveryError(
-                source_id=self.source_id,
-                locator=str(self.root),
-                error=f"could not resolve skill source root: {exc}",
+                source_id=_json_safe_text(self.source_id),
+                locator=_json_safe_text(self.root),
+                error=_json_safe_text(f"could not resolve skill source root: {exc}"),
             )
             return (), (error,)
         records: list[SkillRecord] = []
@@ -178,9 +184,9 @@ class DirectorySkillSource(SkillSource):
         except OSError as exc:
             return (), (
                 DiscoveryError(
-                    source_id=self.source_id,
-                    locator=str(self.root),
-                    error=f"could not enumerate source: {exc}",
+                    source_id=_json_safe_text(self.source_id),
+                    locator=_json_safe_text(self.root),
+                    error=_json_safe_text(f"could not enumerate source: {exc}"),
                 ),
             )
         for folder in candidates:
@@ -218,9 +224,9 @@ class DirectorySkillSource(SkillSource):
             except (SkillError, OSError) as exc:
                 errors.append(
                     DiscoveryError(
-                        source_id=self.source_id,
-                        locator=folder.name,
-                        error=str(exc),
+                        source_id=_json_safe_text(self.source_id),
+                        locator=_json_safe_text(folder.name),
+                        error=_json_safe_text(exc),
                     )
                 )
                 continue

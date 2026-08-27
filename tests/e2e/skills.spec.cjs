@@ -206,6 +206,29 @@ test.describe.serial('procedural skills contributed console', () => {
     await expect(page.getByTestId('skills-save')).toBeDisabled();
   });
 
+  test('route disappearance removes the stale panel and recovery restores it', async ({ page }) => {
+    await openPanel(page);
+    const tab = page.locator('.nav-tab[data-panel="procedural-skills"]');
+    await page.route(new RegExp(`${API_ROOT}$`), async (route) => {
+      await route.fulfill({
+        status: 404,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail: 'Feature route unavailable' }),
+      });
+    });
+
+    await page.evaluate(() => {
+      globalThis.dispatchEvent(new CustomEvent('capabilities:changed'));
+    });
+    await expect(tab).toHaveCount(0);
+
+    await page.unrouteAll({ behavior: 'wait' });
+    await page.evaluate(() => {
+      globalThis.dispatchEvent(new CustomEvent('capabilities:changed'));
+    });
+    await expect(tab).toBeVisible();
+  });
+
   test('Python editor exposes execution risk and has no run surface', async ({ page }) => {
     await openPanel(page);
     await page.getByRole('button', { name: SKILL_NAME }).click();

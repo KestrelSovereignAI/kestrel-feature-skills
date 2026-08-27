@@ -1,5 +1,5 @@
 import API from '/js/api.js';
-import { registerPanel } from '/js/ui-ext/panels.js';
+import { registerPanel, syncNav } from '/js/ui-ext/panels.js';
 import bus from '/js/ui-ext/bus.js';
 
 const PANEL_ID = 'procedural-skills';
@@ -13,6 +13,8 @@ const state = {
   selectionEpoch: 0,
   fileEpoch: 0,
   catalogEpoch: 0,
+  availabilityEpoch: 0,
+  available: true,
   ui: null,
 };
 
@@ -463,14 +465,31 @@ function confirmDelete(skill) {
   state.ui.deleteDialog.showModal();
 }
 
-registerPanel({
+const panelDefinition = {
   panelId: PANEL_ID,
   label: 'Skills',
   icon: 'ki ki-book-open',
   before: 'features',
-  gate: () => API.hasCapability('procedural-skills'),
+  gate: () => state.available,
   render: mount,
-});
+};
+
+registerPanel(panelDefinition);
+
+async function reconcileAvailability() {
+  const agent = currentAgent();
+  const epoch = ++state.availabilityEpoch;
+  state.available = false;
+  syncNav();
+  try {
+    await request('');
+  } catch (_) {
+    return;
+  }
+  if (epoch !== state.availabilityEpoch || currentAgent() !== agent) return;
+  state.available = true;
+  syncNav();
+}
 
 bus.on('panel:shown', (payload) => {
   if (payload?.panelId === PANEL_ID) {
@@ -484,6 +503,8 @@ bus.on('panel:hidden', (payload) => {
 });
 
 bus.on('agent:switch', () => {
+  state.availabilityEpoch += 1;
+  state.available = false;
   state.catalogEpoch += 1;
   state.catalog = null;
   if (state.ui?.createDialog.open) state.ui.createDialog.close('agent-switch');
@@ -491,7 +512,14 @@ bus.on('agent:switch', () => {
   if (state.ui?.deleteDialog) delete state.ui.deleteDialog.dataset.skill;
   clearSelection();
   renderCatalog();
-  if (state.active) loadCatalog();
+  syncNav();
+  void reconcileAvailability();
 });
 
-export { loadCatalog, reloadCatalog };
+if (typeof globalThis.addEventListener === 'function') {
+  globalThis.addEventListener('capabilities:changed', () => {
+    void reconcileAvailability();
+  });
+}
+
+export { loadCatalog, reconcileAvailability, reloadCatalog };

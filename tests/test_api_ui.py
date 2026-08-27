@@ -132,6 +132,29 @@ async def test_python_route_saves_text_and_reports_risk_without_execution(
 
 
 @pytest.mark.asyncio
+async def test_file_read_rejects_symlink_added_after_catalog_discovery(client, feature):
+    await client.post(
+        "/api/procedural-skills",
+        json={"name": "late-link", "description": "Late link", "body": "body"},
+    )
+    saved = await client.put(
+        "/api/procedural-skills/late-link/file",
+        json={"path": "scripts/tool.py", "content": "SECRET = True\n"},
+    )
+    assert saved.status_code == 200, saved.text
+    folder = feature.agent.procedural_skills_root / "late-link"
+    (folder / "notes.md").symlink_to(folder / "scripts" / "tool.py")
+
+    opened = await client.get(
+        "/api/procedural-skills/late-link/file",
+        params={"path": "notes.md"},
+    )
+
+    assert opened.status_code == 422
+    assert "symlink" in opened.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_reload_discovers_folder_without_restart(client, feature):
     folder = feature.agent.procedural_skills_root / "appeared"
     folder.mkdir()
@@ -210,7 +233,7 @@ def test_ui_bundle_contains_required_rails_and_no_run_control(feature):
     source = (static / "skills.js").read_text(encoding="utf-8")
     assert ui.modules == ["skills.js"]
     assert ui.css == ["skills.css"]
-    assert ui.capability == "procedural-skills"
+    assert ui.capability is None
     assert "registerPanel" in source
     assert "skills-delete-approval" in source
     assert "X-Kestrel-Allow-Destructive" in source
@@ -219,6 +242,8 @@ def test_ui_bundle_contains_required_rails_and_no_run_control(feature):
     assert "Save rejected:" in source
     assert "showModal" in source
     assert "agent:switch" in source
+    assert "capabilities:changed" in source
+    assert "reconcileAvailability" in source
     assert "editorOwner" in source
     assert "skill_run_script" not in source
     assert "/run" not in source

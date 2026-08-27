@@ -54,7 +54,6 @@ from .store import SkillStore
 logger = logging.getLogger(__name__)
 
 PROCEDURAL_SKILL_NODE_TYPE = "procedural_skill"
-SKILLS_CAPABILITY = "procedural-skills"
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
@@ -154,7 +153,10 @@ class ProceduralSkillsFeature(Feature):
             static_dir=str(_STATIC_DIR),
             modules=["skills.js"],
             css=["skills.css"],
-            capability=SKILLS_CAPABILITY,
+            # Core 0.53.x cannot derive a feature capability for an extracted
+            # class absent from its static registry. The module therefore
+            # probes its live, agent-scoped route and gates its own panel.
+            capability=None,
         )
 
     def get_feature_permission_defaults(self) -> FeaturePermissionDefaults:
@@ -983,6 +985,5 @@ class ProceduralSkillsFeature(Feature):
 
 __all__ = [
     "PROCEDURAL_SKILL_NODE_TYPE",
-    "SKILLS_CAPABILITY",
     "ProceduralSkillsFeature",
 ]

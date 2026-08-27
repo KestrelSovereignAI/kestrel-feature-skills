@@ -31,7 +31,6 @@ from .format import (
 )
 from .models import CatalogSnapshot, SkillDocument, SkillProvenance, SkillRecord
 from .paths import (
-    contained_path,
     direct_child,
     lexical_contained_path,
     reject_symlink_chain,
@@ -326,13 +325,29 @@ class SkillStore:
 
     def read_file(self, record: SkillRecord, relative_path: str) -> str:
         folder = self._require_real_folder(record)
-        path = contained_path(folder, relative_path, must_exist=True)
-        if path.is_symlink() or not path.is_file():
-            raise SkillPathError("requested skill path must be a regular file")
-        if path.stat().st_size > MAX_EDITOR_FILE_BYTES:
-            raise SkillFormatError(f"file exceeds {MAX_EDITOR_FILE_BYTES} bytes")
+        path = lexical_contained_path(folder, relative_path, must_exist=True)
+        reject_symlink_chain(folder, path)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
-            return path.read_text(encoding="utf-8")
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise SkillPathError(
+                "requested skill path must be a regular file without symlinks"
+            ) from exc
+        try:
+            value = os.fstat(descriptor)
+            if not stat.S_ISREG(value.st_mode):
+                raise SkillPathError("requested skill path must be a regular file")
+            if value.st_size > MAX_EDITOR_FILE_BYTES:
+                raise SkillFormatError(f"file exceeds {MAX_EDITOR_FILE_BYTES} bytes")
+            with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                payload = handle.read(MAX_EDITOR_FILE_BYTES + 1)
+            if len(payload) > MAX_EDITOR_FILE_BYTES:
+                raise SkillFormatError(f"file exceeds {MAX_EDITOR_FILE_BYTES} bytes")
+        finally:
+            os.close(descriptor)
+        try:
+            return payload.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise SkillFormatError("the editor only opens UTF-8 text files") from exc
 

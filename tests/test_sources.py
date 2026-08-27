@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -204,6 +205,46 @@ def test_source_root_disappearing_during_resolution_is_a_visible_error(
     assert records == ()
     assert len(errors) == 1
     assert "source root" in errors[0].error
+
+
+def test_discovery_error_with_non_utf8_locator_remains_json_serializable(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    local.mkdir()
+    malformed = SimpleNamespace(
+        name="bad-\udcff",
+        is_dir=lambda: True,
+        is_symlink=lambda: False,
+        lstat=lambda: SimpleNamespace(st_dev=1, st_ino=2),
+    )
+    real_iterdir = Path.iterdir
+
+    def fake_iterdir(path):
+        if path == local:
+            return iter((malformed,))
+        return real_iterdir(path)
+
+    def reject_candidate(candidate, *, source_root):
+        raise sources_module.SkillFormatError(f"invalid folder {candidate.name}")
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    monkeypatch.setattr(sources_module, "validate_skill_folder", reject_candidate)
+    source = DirectorySkillSource(
+        root=local,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=AGENT_LOCAL_PRECEDENCE,
+    )
+
+    records, errors = source.discover()
+    payload = {"errors": [error.to_dict() for error in errors]}
+
+    assert records == ()
+    assert len(errors) == 1
+    assert errors[0].locator == "bad-\\udcff"
+    assert "invalid folder bad-\\udcff" in errors[0].error
+    json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 def test_unknown_provenance_metadata_is_visible_error(tmp_path):
