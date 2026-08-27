@@ -535,7 +535,9 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert invalid_state.status_code == 422, invalid_state.text
 
         unknown_name = "kite-never-published-state"
-        unknown_claim = root / f".{unknown_name}.publication-state.lock"
+        unknown_claim = (
+            root / ".kestrel-internal" / f".{unknown_name}.publication-state.lock"
+        )
         unknown_claim.unlink(missing_ok=True)
         unknown_state = client.patch(
             f"{base}/{unknown_name}/state",

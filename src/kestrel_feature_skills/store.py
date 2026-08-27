@@ -48,6 +48,7 @@ from .paths import (
 from .sources import PROVENANCE_FILENAME, serialize_provenance
 
 CLAIM_STALENESS_SECONDS = 60
+INTERNAL_DIRECTORY = ".kestrel-internal"
 MAX_EDITOR_FILE_BYTES = 262_144
 _MUTATION_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 _MUTATION_LOCKS_GUARD = threading.Lock()
@@ -96,9 +97,11 @@ class PublicationStateClaim:
 @contextmanager
 def _serialized_skill_mutation(
     root: Path,
+    internal_root: Path,
     name: str,
     *,
     root_identity: tuple[int, int],
+    internal_root_identity: tuple[int, int],
 ):
     """Serialize validation and publication across threads and processes."""
 
@@ -107,37 +110,48 @@ def _serialized_skill_mutation(
         thread_lock = _MUTATION_LOCKS.setdefault(key, threading.RLock())
     with thread_lock:
         root_fd = _open_directory(root, expected=root_identity)
-        lock_name = f".{name}.mutation.lock"
-        flags = (
-            os.O_RDWR
-            | os.O_CREAT
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-        )
         try:
+            internal_fd = _open_directory(
+                internal_root,
+                expected=internal_root_identity,
+            )
             try:
-                descriptor = os.open(lock_name, flags, 0o600, dir_fd=root_fd)
-            except OSError as exc:
-                raise SkillPathError("could not open the skill mutation lock") from exc
-            locked = False
-            try:
-                value = os.fstat(descriptor)
-                if not stat.S_ISREG(value.st_mode):
-                    raise SkillPathError("skill mutation lock must be a regular file")
-                lock_identity = (value.st_dev, value.st_ino)
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
-                locked = True
-                if _identity_at(root_fd, lock_name) != lock_identity:
-                    raise SkillPathError(
-                        "skill mutation lock changed while acquiring it"
-                    )
-                yield root_fd
-            finally:
+                lock_name = f".{name}.mutation.lock"
+                flags = (
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0)
+                )
                 try:
-                    if locked:
-                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    descriptor = os.open(lock_name, flags, 0o600, dir_fd=internal_fd)
+                except OSError as exc:
+                    raise SkillPathError(
+                        "could not open the skill mutation lock"
+                    ) from exc
+                locked = False
+                try:
+                    value = os.fstat(descriptor)
+                    if not stat.S_ISREG(value.st_mode):
+                        raise SkillPathError(
+                            "skill mutation lock must be a regular file"
+                        )
+                    lock_identity = (value.st_dev, value.st_ino)
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    locked = True
+                    if _identity_at(internal_fd, lock_name) != lock_identity:
+                        raise SkillPathError(
+                            "skill mutation lock changed while acquiring it"
+                        )
+                    yield root_fd, internal_fd
                 finally:
-                    os.close(descriptor)
+                    try:
+                        if locked:
+                            fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    finally:
+                        os.close(descriptor)
+            finally:
+                os.close(internal_fd)
         finally:
             os.close(root_fd)
 
@@ -153,13 +167,25 @@ def _unlock_claim(descriptor: int | None) -> None:
 
 def _write_tmp(path: Path, payload: bytes) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    created = os.fstat(descriptor)
+    created_identity = (created.st_dev, created.st_ino)
+    completed = False
     try:
         with os.fdopen(descriptor, "wb", closefd=False) as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        completed = True
     finally:
         os.close(descriptor)
+        if not completed:
+            try:
+                current = path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if (current.st_dev, current.st_ino) == created_identity:
+                    path.unlink(missing_ok=True)
 
 
 def _write_tmp_at(directory_fd: int, name: str, payload: bytes) -> None:
@@ -169,13 +195,19 @@ def _write_tmp_at(directory_fd: int, name: str, payload: bytes) -> None:
         0o600,
         dir_fd=directory_fd,
     )
+    created = os.fstat(descriptor)
+    created_identity = (created.st_dev, created.st_ino)
+    completed = False
     try:
         with os.fdopen(descriptor, "wb", closefd=False) as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        completed = True
     finally:
         os.close(descriptor)
+        if not completed and _identity_at(directory_fd, name) == created_identity:
+            _unlink_at(directory_fd, name)
 
 
 def _identity_at(directory_fd: int, name: str) -> tuple[int, int] | None:
@@ -287,12 +319,15 @@ def _unlink_at(directory_fd: int, name: str) -> None:
 
 
 def _reap_temporary_hardlinks_at(
-    directory_fd: int, *, expected: tuple[int, int]
+    directory_fd: int,
+    *,
+    expected: tuple[int, int],
+    temporary_prefix: str = ".SKILL.md.tmp.",
 ) -> None:
     """Remove only crashed-writer temporaries hardlinked to a stale claim."""
 
     for name in os.listdir(directory_fd):
-        if not name.startswith(".SKILL.md.tmp."):
+        if not name.startswith(temporary_prefix):
             continue
         if _identity_at(directory_fd, name) != expected:
             continue
@@ -305,45 +340,58 @@ def _reap_temporary_hardlinks_at(
 
 
 def _atomic_write_primary_at(
-    directory_fd: int, folder_name: str, payload: bytes, *, overwrite: bool
+    directory_fd: int,
+    folder_name: str,
+    payload: bytes,
+    *,
+    overwrite: bool,
+    artifact_directory_fd: int | None = None,
 ) -> None:
-    """Apply the primary hardlink-claim protocol inside one pinned directory."""
+    """Apply the primary hardlink-claim protocol using private artifacts."""
 
     if len(payload) > MAX_SKILL_FILE_BYTES:
         raise SkillFormatError(f"{SKILL_FILENAME} exceeds {MAX_SKILL_FILE_BYTES} bytes")
     if not overwrite and _identity_at(directory_fd, SKILL_FILENAME) is not None:
         raise SkillConflictError(f"skill already exists: {folder_name}")
-    temporary = f".SKILL.md.tmp.{uuid.uuid4().hex}"
-    claim = ".SKILL.md.claim"
+    artifact_fd = (
+        artifact_directory_fd if artifact_directory_fd is not None else directory_fd
+    )
+    if artifact_directory_fd is None:
+        temporary_prefix = ".SKILL.md.tmp."
+        claim = ".SKILL.md.claim"
+    else:
+        temporary_prefix = f".{folder_name}.primary.tmp."
+        claim = f".{folder_name}.primary.claim"
+    temporary = f"{temporary_prefix}{uuid.uuid4().hex}"
     owned_claim: tuple[int, int] | None = None
     claim_lock: int | None = None
-    _write_tmp_at(directory_fd, temporary, payload)
-    temporary_identity = _identity_at(directory_fd, temporary)
+    _write_tmp_at(artifact_fd, temporary, payload)
+    temporary_identity = _identity_at(artifact_fd, temporary)
     if temporary_identity is None:  # pragma: no cover - fsync'd file vanished
-        _unlink_at(directory_fd, temporary)
+        _unlink_at(artifact_fd, temporary)
         raise OSError("skill writer temporary file vanished before claiming")
     try:
         try:
             os.link(
                 temporary,
                 claim,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
+                src_dir_fd=artifact_fd,
+                dst_dir_fd=artifact_fd,
                 follow_symlinks=False,
             )
             owned_claim = temporary_identity
-            claim_lock = _lock_claim_at(directory_fd, claim, expected=owned_claim)
+            claim_lock = _lock_claim_at(artifact_fd, claim, expected=owned_claim)
             if claim_lock is None:
                 raise SkillConflictError(
                     f"skill write could not lock its claim for {folder_name}"
                 )
         except FileExistsError:
-            if not _claim_is_stale_at(directory_fd, claim):
+            if not _claim_is_stale_at(artifact_fd, claim):
                 raise SkillConflictError(
                     f"concurrent skill write is already in progress for {folder_name}"
                 ) from None
-            stale_identity = _identity_at(directory_fd, claim)
-            stale_lock = _lock_claim_at(directory_fd, claim, expected=stale_identity)
+            stale_identity = _identity_at(artifact_fd, claim)
+            stale_lock = _lock_claim_at(artifact_fd, claim, expected=stale_identity)
             if stale_lock is None:
                 raise SkillConflictError(
                     f"active skill writer still owns the stale claim for {folder_name}"
@@ -351,23 +399,24 @@ def _atomic_write_primary_at(
             try:
                 if (
                     stale_identity is None
-                    or _identity_at(directory_fd, claim) != stale_identity
-                    or not _claim_is_stale_at(directory_fd, claim)
+                    or _identity_at(artifact_fd, claim) != stale_identity
+                    or not _claim_is_stale_at(artifact_fd, claim)
                 ):
                     raise SkillConflictError(
                         f"stale skill claim changed during recovery for {folder_name}"
                     )
                 _reap_temporary_hardlinks_at(
-                    directory_fd,
+                    artifact_fd,
                     expected=stale_identity,
+                    temporary_prefix=temporary_prefix,
                 )
-                os.unlink(claim, dir_fd=directory_fd)
+                os.unlink(claim, dir_fd=artifact_fd)
                 try:
                     os.link(
                         temporary,
                         claim,
-                        src_dir_fd=directory_fd,
-                        dst_dir_fd=directory_fd,
+                        src_dir_fd=artifact_fd,
+                        dst_dir_fd=artifact_fd,
                         follow_symlinks=False,
                     )
                     owned_claim = temporary_identity
@@ -375,14 +424,14 @@ def _atomic_write_primary_at(
                     raise SkillConflictError(
                         f"concurrent skill write won stale-claim recovery for {folder_name}"
                     ) from exc
-                claim_lock = _lock_claim_at(directory_fd, claim, expected=owned_claim)
+                claim_lock = _lock_claim_at(artifact_fd, claim, expected=owned_claim)
                 if claim_lock is None:
                     raise SkillConflictError(
                         f"skill write could not lock its reclaimed claim for {folder_name}"
                     )
             finally:
                 _unlock_claim(stale_lock)
-        if owned_claim is None or _identity_at(directory_fd, claim) != owned_claim:
+        if owned_claim is None or _identity_at(artifact_fd, claim) != owned_claim:
             raise SkillConflictError(
                 f"skill write lost its reclaimed claim for {folder_name}"
             )
@@ -390,7 +439,7 @@ def _atomic_write_primary_at(
             os.replace(
                 temporary,
                 SKILL_FILENAME,
-                src_dir_fd=directory_fd,
+                src_dir_fd=artifact_fd,
                 dst_dir_fd=directory_fd,
             )
         else:
@@ -398,7 +447,7 @@ def _atomic_write_primary_at(
                 os.link(
                     temporary,
                     SKILL_FILENAME,
-                    src_dir_fd=directory_fd,
+                    src_dir_fd=artifact_fd,
                     dst_dir_fd=directory_fd,
                     follow_symlinks=False,
                 )
@@ -407,9 +456,9 @@ def _atomic_write_primary_at(
                     f"skill already exists: {folder_name}"
                 ) from exc
     finally:
-        _unlink_at(directory_fd, temporary)
-        if owned_claim is not None and _identity_at(directory_fd, claim) == owned_claim:
-            _unlink_at(directory_fd, claim)
+        _unlink_at(artifact_fd, temporary)
+        if owned_claim is not None and _identity_at(artifact_fd, claim) == owned_claim:
+            _unlink_at(artifact_fd, claim)
         _unlock_claim(claim_lock)
 
 
@@ -556,20 +605,34 @@ def _open_parent_at(
         raise
 
 
-def _atomic_replace_file_at(directory_fd: int, name: str, payload: bytes) -> None:
+def _atomic_replace_file_at(
+    directory_fd: int,
+    name: str,
+    payload: bytes,
+    *,
+    artifact_directory_fd: int | None = None,
+    artifact_label: str | None = None,
+) -> None:
     if len(payload) > MAX_EDITOR_FILE_BYTES:
         raise SkillFormatError(f"editor file exceeds {MAX_EDITOR_FILE_BYTES} bytes")
-    temporary = f".tmp.{uuid.uuid4().hex}"
-    _write_tmp_at(directory_fd, temporary, payload)
+    artifact_fd = (
+        artifact_directory_fd if artifact_directory_fd is not None else directory_fd
+    )
+    temporary = (
+        f".{validate_skill_name(artifact_label)}.resource.tmp.{uuid.uuid4().hex}"
+        if artifact_label is not None
+        else f".tmp.{uuid.uuid4().hex}"
+    )
+    _write_tmp_at(artifact_fd, temporary, payload)
     try:
         os.replace(
             temporary,
             name,
-            src_dir_fd=directory_fd,
+            src_dir_fd=artifact_fd,
             dst_dir_fd=directory_fd,
         )
     finally:
-        _unlink_at(directory_fd, temporary)
+        _unlink_at(artifact_fd, temporary)
 
 
 def _copy_regular_file_at(source: Path, directory_fd: int, name: str) -> None:
@@ -695,6 +758,29 @@ class SkillStore:
         descriptor = _open_directory(local_root, expected=root_identity)
         try:
             try:
+                os.mkdir(INTERNAL_DIRECTORY, mode=0o700, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            try:
+                internal_stat = os.stat(
+                    INTERNAL_DIRECTORY,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise SkillPathError(
+                    "skill internal directory could not be inspected"
+                ) from exc
+            if not stat.S_ISDIR(internal_stat.st_mode):
+                raise SkillPathError("skill internal path must be a real directory")
+            internal_identity = (internal_stat.st_dev, internal_stat.st_ino)
+            internal_descriptor = _open_directory_at(
+                descriptor,
+                INTERNAL_DIRECTORY,
+                expected=internal_identity,
+            )
+            os.close(internal_descriptor)
+            try:
                 resolved_root = local_root.resolve(strict=True)
             except OSError as exc:
                 raise SkillPathError(
@@ -720,10 +806,18 @@ class SkillStore:
                 expected=root_identity,
             )
             os.close(lexical_verification)
+            internal_root = resolved_root / INTERNAL_DIRECTORY
+            internal_verification = _open_directory(
+                internal_root,
+                expected=internal_identity,
+            )
+            os.close(internal_verification)
         finally:
             os.close(descriptor)
         self.local_root = resolved_root
         self._local_root_identity = root_identity
+        self._internal_root = internal_root
+        self._internal_root_identity = internal_identity
 
     @property
     def local_root_identity(self) -> tuple[int, int]:
@@ -744,6 +838,7 @@ class SkillStore:
             return None
 
         root_fd: int | None = None
+        internal_fd: int | None = None
         descriptor: int | None = None
         locked = False
         claimed = False
@@ -751,6 +846,10 @@ class SkillStore:
             root_fd = _open_directory(
                 self.local_root,
                 expected=self._local_root_identity,
+            )
+            internal_fd = _open_directory(
+                self._internal_root,
+                expected=self._internal_root_identity,
             )
             lock_name = f".{name}.publication-state.lock"
             flags = (
@@ -760,7 +859,7 @@ class SkillStore:
                 | getattr(os, "O_CLOEXEC", 0)
             )
             try:
-                descriptor = os.open(lock_name, flags, 0o600, dir_fd=root_fd)
+                descriptor = os.open(lock_name, flags, 0o600, dir_fd=internal_fd)
             except OSError as exc:
                 raise SkillPathError(
                     "could not open the skill publication-state lock"
@@ -776,13 +875,15 @@ class SkillStore:
             except BlockingIOError:
                 return None
             locked = True
-            if _identity_at(root_fd, lock_name) != lock_identity:
+            if _identity_at(internal_fd, lock_name) != lock_identity:
                 raise SkillPathError(
                     "skill publication-state lock changed while acquiring it"
                 )
             claimed = True
             return PublicationStateClaim(descriptor, thread_lock)
         finally:
+            if internal_fd is not None:
+                os.close(internal_fd)
             if root_fd is not None:
                 os.close(root_fd)
             if not claimed:
@@ -824,9 +925,11 @@ class SkillStore:
 
         with _serialized_skill_mutation(
             self.local_root,
+            self._internal_root,
             name,
             root_identity=self._local_root_identity,
-        ) as root_fd:
+            internal_root_identity=self._internal_root_identity,
+        ) as (root_fd, _artifact_fd):
             folder = direct_child(
                 self.local_root,
                 name,
@@ -956,9 +1059,11 @@ class SkillStore:
             raise SkillFormatError("editor content must be valid UTF-8 text") from exc
         with _serialized_skill_mutation(
             self.local_root,
+            self._internal_root,
             record.name,
             root_identity=self._local_root_identity,
-        ) as root_fd:
+            internal_root_identity=self._internal_root_identity,
+        ) as (root_fd, artifact_fd):
             self._require_local(record)
             snapshot = _inspect_child_at(
                 root_fd,
@@ -990,6 +1095,7 @@ class SkillStore:
                     record.name,
                     payload,
                     overwrite=True,
+                    artifact_directory_fd=artifact_fd,
                 )
             finally:
                 os.close(descriptor)
@@ -1016,9 +1122,11 @@ class SkillStore:
         )
         with _serialized_skill_mutation(
             self.local_root,
+            self._internal_root,
             name,
             root_identity=self._local_root_identity,
-        ) as root_fd:
+            internal_root_identity=self._internal_root_identity,
+        ) as (root_fd, _artifact_fd):
             if _identity_at(root_fd, name) is None:
                 return
             if isinstance(identity, CreatedSkillPublication):
@@ -1134,9 +1242,11 @@ class SkillStore:
             raise SkillFormatError("editor content must be valid UTF-8 text") from exc
         with _serialized_skill_mutation(
             self.local_root,
+            self._internal_root,
             record.name,
             root_identity=self._local_root_identity,
-        ) as root_fd:
+            internal_root_identity=self._internal_root_identity,
+        ) as (root_fd, artifact_fd):
             folder = self._require_local(record)
             path = lexical_contained_path(folder, relative.as_posix(), must_exist=False)
             reject_symlink_chain(folder, path)
@@ -1177,7 +1287,13 @@ class SkillStore:
                     create=True,
                 )
                 try:
-                    _atomic_replace_file_at(parent_fd, filename, payload)
+                    _atomic_replace_file_at(
+                        parent_fd,
+                        filename,
+                        payload,
+                        artifact_directory_fd=artifact_fd,
+                        artifact_label=record.name,
+                    )
                 finally:
                     os.close(parent_fd)
             finally:
@@ -1257,9 +1373,11 @@ class SkillStore:
 
             with _serialized_skill_mutation(
                 self.local_root,
+                self._internal_root,
                 document.name,
                 root_identity=self._local_root_identity,
-            ) as root_fd:
+                internal_root_identity=self._internal_root_identity,
+            ) as (root_fd, _artifact_fd):
                 target = direct_child(
                     self.local_root,
                     document.name,
@@ -1407,9 +1525,11 @@ class SkillStore:
     def delete(self, record: SkillRecord) -> None:
         with _serialized_skill_mutation(
             self.local_root,
+            self._internal_root,
             record.name,
             root_identity=self._local_root_identity,
-        ) as root_fd:
+            internal_root_identity=self._internal_root_identity,
+        ) as (root_fd, _artifact_fd):
             expected = self._require_local(record)
             try:
                 current = expected.lstat()
@@ -1496,6 +1616,7 @@ class SkillStore:
 
 __all__ = [
     "CLAIM_STALENESS_SECONDS",
+    "INTERNAL_DIRECTORY",
     "MAX_EDITOR_FILE_BYTES",
     "SkillStore",
     "atomic_replace_file",

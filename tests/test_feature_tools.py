@@ -632,7 +632,7 @@ async def test_unknown_state_update_does_not_create_publication_claim(
 
     assert attempted_claims == []
     assert not (
-        feature.agent.procedural_skills_root / ".never-published.publication-state.lock"
+        feature._store._internal_root / ".never-published.publication-state.lock"
     ).exists()
 
 

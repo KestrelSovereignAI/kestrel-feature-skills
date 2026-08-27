@@ -24,9 +24,10 @@ from kestrel_feature_skills.format import (
     validate_skill_folder,
 )
 from kestrel_feature_skills.models import SkillDocument, SkillProvenance, SkillRecord
-from kestrel_feature_skills.sources import DirectorySkillSource
+from kestrel_feature_skills.sources import MAX_SOURCE_ENTRIES, DirectorySkillSource
 from kestrel_feature_skills.store import (
     CLAIM_STALENESS_SECONDS,
+    INTERNAL_DIRECTORY,
     SkillStore,
     atomic_write_primary,
 )
@@ -54,7 +55,9 @@ def _write_resource_from_separate_process(root, lock_state, result):
     """Discover and mutate a just-published skill from another process."""
 
     try:
-        lock_path = Path(root) / ".cross-process-create.mutation.lock"
+        lock_path = (
+            Path(root) / INTERNAL_DIRECTORY / ".cross-process-create.mutation.lock"
+        )
         descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             try:
@@ -302,6 +305,44 @@ def test_constructor_refuses_local_root_directory_swap_during_pinning(
 
     assert displaced.is_dir()
     assert replacement_marker.read_text(encoding="utf-8") == "replacement"
+
+
+def test_constructor_refuses_internal_directory_symlink(tmp_path):
+    root = tmp_path / "skills"
+    outside = tmp_path / "outside-internal"
+    root.mkdir()
+    outside.mkdir()
+    (root / INTERNAL_DIRECTORY).symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(SkillPathError, match="internal"):
+        SkillStore(root)
+
+
+def test_mutation_refuses_replaced_internal_directory(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("internal-root-race", "Original", "Procedure."))
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    original = (folder / "SKILL.md").read_bytes()
+    displaced = tmp_path / "displaced-internal"
+    store._internal_root.rename(displaced)
+    replacement = store._internal_root
+    replacement.mkdir()
+
+    with pytest.raises(SkillPathError):
+        store.edit_primary(
+            record,
+            serialize_skill_markdown(
+                SkillDocument("internal-root-race", "Edited", "Changed.")
+            ),
+        )
+
+    assert (folder / "SKILL.md").read_bytes() == original
+    assert list(replacement.iterdir()) == []
 
 
 def test_create_pins_publication_if_local_root_is_replaced_mid_write(
@@ -676,6 +717,73 @@ def test_stale_fifo_claim_is_rejected_without_waiting_for_a_writer(
     assert lock_operations == []
 
 
+def test_primary_write_failure_does_not_leave_public_artifact_or_quarantine(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(
+        SkillDocument("primary-write-failure", "Original", "Procedure.")
+    )
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    original = (folder / "SKILL.md").read_bytes()
+    internal_identity = (
+        store._internal_root.stat().st_dev,
+        store._internal_root.stat().st_ino,
+    )
+    real_write = store_module._write_tmp_at
+    real_fsync = store_module.os.fsync
+    failing_internal_write = False
+    injected = False
+
+    def track_internal_write(directory_fd, name, payload):
+        nonlocal failing_internal_write
+        directory = os.fstat(directory_fd)
+        failing_internal_write = bool(
+            (directory.st_dev, directory.st_ino) == internal_identity
+            and name.startswith(".primary-write-failure.primary.tmp.")
+        )
+        try:
+            return real_write(directory_fd, name, payload)
+        finally:
+            failing_internal_write = False
+
+    def fail_internal_fsync(descriptor):
+        nonlocal injected
+        if failing_internal_write:
+            injected = True
+            raise OSError("simulated primary write failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(store_module, "_write_tmp_at", track_internal_write)
+    monkeypatch.setattr(store_module.os, "fsync", fail_internal_fsync)
+
+    with pytest.raises(OSError, match="primary write failure"):
+        store.edit_primary(
+            record,
+            serialize_skill_markdown(
+                SkillDocument("primary-write-failure", "Edited", "Changed.")
+            ),
+        )
+
+    assert injected
+    assert (folder / "SKILL.md").read_bytes() == original
+    assert list(folder.glob(".SKILL.md.tmp.*")) == []
+    assert list(store._internal_root.glob(".primary-write-failure.primary.tmp.*")) == []
+    records, errors = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()
+    assert [item.name for item in records] == ["primary-write-failure"]
+    assert errors == ()
+
+
 def test_active_writer_claim_cannot_be_stolen_during_final_publication(
     tmp_path, monkeypatch
 ):
@@ -763,6 +871,127 @@ def test_limit_crossing_resource_edit_is_not_published(tmp_path):
 
     assert not rejected.exists()
     assert validate_skill_folder(folder, source_root=store.local_root).name == "bounded"
+
+
+def test_resource_write_failure_does_not_inventory_public_temporary(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(
+        SkillDocument("resource-write-failure", "Original", "Procedure.")
+    )
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    internal_identity = (
+        store._internal_root.stat().st_dev,
+        store._internal_root.stat().st_ino,
+    )
+    real_write = store_module._write_tmp_at
+    real_fsync = store_module.os.fsync
+    failing_internal_write = False
+    injected = False
+
+    def track_internal_write(directory_fd, name, payload):
+        nonlocal failing_internal_write
+        directory = os.fstat(directory_fd)
+        failing_internal_write = bool(
+            (directory.st_dev, directory.st_ino) == internal_identity
+            and name.startswith(".resource-write-failure.resource.tmp.")
+        )
+        try:
+            return real_write(directory_fd, name, payload)
+        finally:
+            failing_internal_write = False
+
+    def fail_internal_fsync(descriptor):
+        nonlocal injected
+        if failing_internal_write:
+            injected = True
+            raise OSError("simulated resource write failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(store_module, "_write_tmp_at", track_internal_write)
+    monkeypatch.setattr(store_module.os, "fsync", fail_internal_fsync)
+
+    with pytest.raises(OSError, match="resource write failure"):
+        store.write_file(record, "notes.md", "Replacement.")
+
+    assert injected
+    assert not (folder / "notes.md").exists()
+    assert list(folder.glob(".tmp.*")) == []
+    assert (
+        list(store._internal_root.glob(".resource-write-failure.resource.tmp.*")) == []
+    )
+    records, errors = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()
+    assert [item.name for item in records] == ["resource-write-failure"]
+    assert errors == ()
+
+
+def test_normal_lock_accumulation_does_not_consume_source_entry_budget(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    survivor = store.create(
+        SkillDocument("lock-budget-survivor", "Survivor", "Procedure.")
+    )
+    for index in range((MAX_SOURCE_ENTRIES // 2) + 1):
+        name = f"cycled-{index:04}"
+        claim = store.try_acquire_publication_state_claim(name)
+        assert claim is not None
+        claim.release()
+        with store_module._serialized_skill_mutation(
+            store.local_root,
+            store._internal_root,
+            name,
+            root_identity=store.local_root_identity,
+            internal_root_identity=store._internal_root_identity,
+        ):
+            pass
+
+    records, errors = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()
+
+    assert survivor.is_dir()
+    assert list(store.local_root.glob(".*.mutation.lock")) == []
+    assert list(store.local_root.glob(".*.publication-state.lock")) == []
+    assert [item.name for item in records] == ["lock-budget-survivor"]
+    assert errors == ()
+
+
+def test_crash_orphaned_edit_artifacts_are_outside_skill_discovery(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    survivor = store.create(
+        SkillDocument("crash-artifact-survivor", "Survivor", "Procedure.")
+    )
+    (store._internal_root / ".crash-artifact-survivor.primary.tmp.crashed").write_text(
+        "incomplete primary",
+        encoding="utf-8",
+    )
+    (store._internal_root / ".crash-artifact-survivor.resource.tmp.crashed").write_text(
+        "incomplete resource", encoding="utf-8"
+    )
+
+    records, errors = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()
+
+    assert survivor.is_dir()
+    assert [item.name for item in records] == ["crash-artifact-survivor"]
+    assert errors == ()
 
 
 def test_concurrent_resource_edits_revalidate_the_serialized_folder(

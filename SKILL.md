@@ -69,4 +69,6 @@
 - Local Markdown links must resolve inside their skill folder.
 - Frontmatter accepts a strict scalar subset and exactly `name` + `description`.
 - Remote installs require HTTPS with no embedded credentials.
+- Mutation locks and crash-safe edit artifacts stay in the private internal
+  directory, outside published skill folders and source enumeration.
 - There is no script runner, subprocess route, or implicit execution path.

@@ -56,6 +56,10 @@ read limit. Each configured source root is also capped at 4,096 immediate
 entries before sorting or per-skill validation, so reload work remains bounded
 even when the directory contains non-skill or hidden files.
 
+Mutation locks and crash-safe edit temporaries live below the single hidden
+`<agent-data>/skills/.kestrel-internal/` directory. They are never placed in a
+published skill folder or charged individually against source discovery.
+
 ## Permission rails
 
 The package declares permission defaults through the SDK contribution contract:
