@@ -14,7 +14,7 @@ from types import MappingProxyType
 
 from .errors import SkillError, SkillFormatError, SkillPathError
 from .format import validate_skill_folder_descriptor, validate_skill_name
-from .git_source import validate_ref, validate_remote_url
+from .git_source import is_full_object_id, validate_ref, validate_remote_url
 from .models import (
     CatalogSnapshot,
     DiscoveryError,
@@ -136,9 +136,7 @@ def _validated_provenance(provenance: SkillProvenance) -> SkillProvenance:
     )
     if validated.kind != "git":
         return validated
-    if not isinstance(validated.revision, str) or not re.fullmatch(
-        r"[0-9a-f]{40}", validated.revision
-    ):
+    if not is_full_object_id(validated.revision):
         raise SkillFormatError(
             "Git provenance revision must be a full lowercase commit hash"
         )
@@ -221,7 +219,7 @@ def _load_provenance_at(
         raise SkillFormatError(
             f"{PROVENANCE_FILENAME} has unsupported field(s): {', '.join(sorted(unknown))}"
         )
-    return _validated_provenance(
+    provenance = _validated_provenance(
         SkillProvenance(
             kind=payload.get("kind"),
             source_id=payload.get("source_id"),
@@ -230,6 +228,14 @@ def _load_provenance_at(
             remote_url=payload.get("remote_url"),
         )
     )
+    if (
+        provenance.kind == "git"
+        and provenance.locator.rpartition(":")[2] != folder_name
+    ):
+        raise SkillFormatError(
+            "Git provenance locator skill name must match its containing folder"
+        )
+    return provenance
 
 
 def serialize_provenance(provenance: SkillProvenance) -> bytes:

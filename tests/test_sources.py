@@ -13,7 +13,11 @@ import kestrel_feature_skills.git_source as git_source_module
 import kestrel_feature_skills.sources as sources_module
 from kestrel_feature_skills.errors import GitSourceError
 from kestrel_feature_skills.format import MAX_SKILL_FILE_BYTES, serialize_skill_markdown
-from kestrel_feature_skills.git_source import GitSkillSource, validate_remote_url
+from kestrel_feature_skills.git_source import (
+    GitSkillSource,
+    validate_ref,
+    validate_remote_url,
+)
 from kestrel_feature_skills.models import SkillDocument, SkillProvenance, SkillState
 from kestrel_feature_skills.sources import (
     AGENT_LOCAL_PRECEDENCE,
@@ -177,7 +181,8 @@ def test_enablement_and_priority_survive_catalog_reload(tmp_path):
     assert first == second
 
 
-def test_git_provenance_sidecar_survives_reload(tmp_path):
+@pytest.mark.parametrize("revision", ("a" * 40, "b" * 64))
+def test_git_provenance_sidecar_survives_reload(tmp_path, revision):
     local = tmp_path / "local"
     shared = tmp_path / "shared"
     local.mkdir()
@@ -187,7 +192,7 @@ def test_git_provenance_sidecar_survives_reload(tmp_path):
         kind="git",
         source_id="https://example.com/skills.git",
         locator="main:installed",
-        revision="a" * 40,
+        revision=revision,
         remote_url="https://example.com/skills.git",
     )
     (folder / PROVENANCE_FILENAME).write_bytes(serialize_provenance(provenance))
@@ -345,6 +350,7 @@ def test_host_shared_git_provenance_keeps_host_precedence(tmp_path):
         ),
         ({"source_id": "https://example.com/other.git"}, "source_id"),
         ({"locator": "missing-skill-name"}, "locator"),
+        ({"locator": "main:other-skill"}, "locator"),
     ),
 )
 def test_invalid_git_provenance_is_rejected_before_resolution(
@@ -688,8 +694,20 @@ def test_git_source_rejects_control_or_unencodable_url_text(url):
         validate_remote_url(url)
 
 
-def test_git_source_detects_when_recorded_commit_changes(monkeypatch):
-    revisions = iter(("a" * 40, "b" * 40))
+@pytest.mark.parametrize(
+    "ref",
+    ("main/", "feature//x", "release.lock", "foo/.bar", "foo."),
+)
+def test_git_source_rejects_git_invalid_ref_spellings(ref):
+    with pytest.raises(GitSourceError, match="ref"):
+        validate_ref(ref)
+
+
+@pytest.mark.parametrize("object_id_length", (40, 64))
+def test_git_source_detects_when_recorded_commit_changes(
+    monkeypatch, object_id_length
+):
+    revisions = iter(("a" * object_id_length, "b" * object_id_length))
 
     def fake_git(argv, *, timeout=120):
         assert argv[:2] == ["ls-remote", "--exit-code"]
@@ -701,12 +719,12 @@ def test_git_source_detects_when_recorded_commit_changes(monkeypatch):
     assert not source.has_changed(
         url="https://example.com/skills.git",
         ref="main",
-        installed_revision="a" * 40,
+        installed_revision="a" * object_id_length,
     )
     assert source.has_changed(
         url="https://example.com/skills.git",
         ref="main",
-        installed_revision="a" * 40,
+        installed_revision="a" * object_id_length,
     )
 
 
@@ -803,6 +821,40 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
         max_entries,
     )
     assert checkout.ref == "HEAD"
+
+
+def test_git_checkout_accepts_sha256_object_ids(tmp_path, monkeypatch):
+    target = tmp_path / "checkout"
+    revision = "a" * 64
+
+    def fake_git(argv, **_kwargs):
+        if argv[0] == "clone":
+            make_skill(target / "skills", "remote", "SHA-256 repository")
+            return ""
+        if "ls-tree" in argv:
+            return f"100644 blob {'b' * 64} 128\tskills/remote/SKILL.md\x00"
+        return revision
+
+    monkeypatch.setattr(git_source_module, "_run_git", fake_git)
+
+    checkout = GitSkillSource().checkout(
+        url="https://example.com/skills.git",
+        ref="HEAD",
+        skill_name="remote",
+        target=target,
+    )
+
+    assert checkout.revision == revision
+
+
+def test_sparse_listing_rejects_mixed_object_formats():
+    listing = (
+        f"040000 tree {'a' * 40} -\tremote/scripts\x00"
+        f"100644 blob {'b' * 64} 128\tremote/SKILL.md\x00"
+    )
+
+    with pytest.raises(GitSourceError, match="mixed object formats"):
+        git_source_module._validate_sparse_tree_listing(listing)
 
 
 def test_git_checkout_rejects_oversized_sparse_blob_before_materialization(
@@ -1061,10 +1113,20 @@ def test_git_runner_terminates_subprocess_when_cancelled(tmp_path, monkeypatch):
     assert "cancel" in str(errors[0])
 
 
-def test_git_checkout_materializes_only_the_requested_folder(tmp_path, monkeypatch):
+@pytest.mark.parametrize("object_format", ("sha1", "sha256"))
+def test_git_checkout_materializes_only_the_requested_folder(
+    tmp_path, monkeypatch, object_format
+):
     origin = tmp_path / "origin"
     origin.mkdir()
-    git_source_module._run_git(["init", "--initial-branch=main", str(origin)])
+    git_source_module._run_git(
+        [
+            "init",
+            "--initial-branch=main",
+            f"--object-format={object_format}",
+            str(origin),
+        ]
+    )
     git_source_module._run_git(
         ["-C", str(origin), "config", "uploadpack.allowFilter", "true"]
     )
@@ -1112,5 +1174,6 @@ def test_git_checkout_materializes_only_the_requested_folder(tmp_path, monkeypat
     )
 
     assert checkout.skill_folder == target / "skills" / "remote"
+    assert len(checkout.revision) == (40 if object_format == "sha1" else 64)
     assert (checkout.skill_folder / "SKILL.md").is_file()
     assert not (target / "unrelated").exists()

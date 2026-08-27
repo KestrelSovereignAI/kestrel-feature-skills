@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -69,6 +70,8 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
     unapproved_install = "permission-sentinel"
     hidden_retry_name = "kite-hidden-retry"
     bounded_edit_name = "kite-bounded-edit"
+    sha256_provenance_name = "kite-sha256-provenance"
+    mismatched_provenance_name = "kite-mismatched-provenance"
     for rejected_name in rejected_names:
         shutil.rmtree(root / rejected_name, ignore_errors=True)
     shutil.rmtree(root / code_example_name, ignore_errors=True)
@@ -76,6 +79,8 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
     shutil.rmtree(root / unapproved_install, ignore_errors=True)
     shutil.rmtree(root / hidden_retry_name, ignore_errors=True)
     shutil.rmtree(root / bounded_edit_name, ignore_errors=True)
+    shutil.rmtree(root / sha256_provenance_name, ignore_errors=True)
+    shutil.rmtree(root / mismatched_provenance_name, ignore_errors=True)
     for orphan in root.glob(f".{hidden_retry_name}.create.*"):
         shutil.rmtree(orphan, ignore_errors=True)
     (root.parent / "kite-outside.md").unlink(missing_ok=True)
@@ -447,14 +452,52 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             "escaped angle notes\n", encoding="utf-8"
         )
 
+        for provenance_name, locator_name, revision in (
+            (sha256_provenance_name, sha256_provenance_name, "a" * 64),
+            (mismatched_provenance_name, "another-skill", "b" * 40),
+        ):
+            provenance_folder = root / provenance_name
+            provenance_folder.mkdir()
+            (provenance_folder / "SKILL.md").write_text(
+                f'---\nname: "{provenance_name}"\n'
+                'description: "Live Git provenance validation"\n---\n\nProcedure.\n',
+                encoding="utf-8",
+            )
+            (provenance_folder / ".kestrel-provenance.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "kind": "git",
+                        "source_id": "https://example.com/skills.git",
+                        "locator": f"main:{locator_name}",
+                        "revision": revision,
+                        "remote_url": "https://example.com/skills.git",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
         reloaded = client.post(f"{base}/reload")
         assert reloaded.status_code == 200, reloaded.text
         payload = reloaded.json()
         errors = {item["locator"]: item["error"] for item in payload["errors"]}
         assert set(rejected_names) <= errors.keys()
         discovered = {skill["name"] for skill in payload["skills"]}
-        assert {name, code_example_name, commonmark_control_name} <= discovered
+        assert {
+            name,
+            code_example_name,
+            commonmark_control_name,
+            sha256_provenance_name,
+        } <= discovered
         assert all(rejected_name not in discovered for rejected_name in rejected_names)
+        assert mismatched_provenance_name not in discovered
+        assert "containing folder" in errors[mismatched_provenance_name]
+        sha256_record = next(
+            skill
+            for skill in payload["skills"]
+            if skill["name"] == sha256_provenance_name
+        )
+        assert sha256_record["provenance"]["revision"] == "a" * 64
 
         hidden_orphan = root / f".{hidden_retry_name}.create.crashed"
         hidden_orphan.mkdir()
@@ -564,6 +607,15 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             },
         )
         assert invalid_git_ref.status_code == 422, invalid_git_ref.text
+        invalid_git_structure = client.post(
+            f"{base}/install",
+            json={
+                "source_url": "https://example.com/skills.git",
+                "skill_name": "invalid-git-structure",
+                "ref": "main/",
+            },
+        )
+        assert invalid_git_structure.status_code == 422, invalid_git_structure.text
         invalid_git_port = client.post(
             f"{base}/install",
             json={
@@ -630,6 +682,8 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         shutil.rmtree(root / code_example_name, ignore_errors=True)
         shutil.rmtree(root / commonmark_control_name, ignore_errors=True)
         shutil.rmtree(root / unapproved_install, ignore_errors=True)
+        shutil.rmtree(root / sha256_provenance_name, ignore_errors=True)
+        shutil.rmtree(root / mismatched_provenance_name, ignore_errors=True)
         for orphan in root.glob(f".{hidden_retry_name}.create.*"):
             shutil.rmtree(orphan, ignore_errors=True)
         escape_target.unlink(missing_ok=True)

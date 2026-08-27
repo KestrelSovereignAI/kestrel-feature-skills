@@ -18,7 +18,7 @@ from .errors import GitInputError, GitSourceError, SkillNotFoundError
 from .format import validate_skill_folder, validate_skill_name
 
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
-_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _URL_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 MAX_GIT_TRANSFER_BYTES = 32 * 1024 * 1024
 MAX_GIT_TRANSFER_ENTRIES = 4096
@@ -70,9 +70,29 @@ def validate_remote_url(url: object) -> str:
 
 
 def validate_ref(ref: object) -> str:
-    if not isinstance(ref, str) or not _REF_RE.fullmatch(ref) or ".." in ref:
+    if not isinstance(ref, str):
+        raise GitInputError("git ref contains unsupported characters")
+    components = ref.split("/")
+    if (
+        not _REF_RE.fullmatch(ref)
+        or ".." in ref
+        or "//" in ref
+        or ref.endswith(("/", "."))
+        or any(
+            not component
+            or component.startswith(".")
+            or component.endswith(".lock")
+            for component in components
+        )
+    ):
         raise GitInputError("git ref contains unsupported characters")
     return ref
+
+
+def is_full_object_id(value: object) -> bool:
+    """Return whether ``value`` is a full SHA-1 or SHA-256 Git object ID."""
+
+    return isinstance(value, str) and _OBJECT_ID_RE.fullmatch(value) is not None
 
 
 def _tree_limit_exceeded(root: Path, *, max_bytes: int, max_entries: int) -> str | None:
@@ -171,11 +191,12 @@ def _read_git_output(handle: BinaryIO) -> str:
     return payload.decode("utf-8", errors="replace")
 
 
-def _validate_sparse_tree_listing(listing: str) -> None:
+def _validate_sparse_tree_listing(listing: str) -> int | None:
     """Reject a sparse tree whose logical checkout cannot fit the hard bounds."""
 
     total_bytes = 0
     total_entries = 0
+    object_id_length: int | None = None
     for raw_entry in listing.split("\x00"):
         if not raw_entry:
             continue
@@ -188,10 +209,16 @@ def _validate_sparse_tree_listing(listing: str) -> None:
             ) from exc
         if (
             not re.fullmatch(r"[0-7]{6}", mode)
-            or not _COMMIT_RE.fullmatch(object_id)
+            or not is_full_object_id(object_id)
             or not path
         ):
             raise GitSourceError("git source returned malformed sparse tree metadata")
+        if object_id_length is None:
+            object_id_length = len(object_id)
+        elif len(object_id) != object_id_length:
+            raise GitSourceError(
+                "git source returned mixed object formats in sparse tree metadata"
+            )
         total_entries += 1
         if total_entries > MAX_GIT_TRANSFER_ENTRIES:
             raise GitSourceError(
@@ -217,6 +244,7 @@ def _validate_sparse_tree_listing(listing: str) -> None:
             raise GitSourceError("git source skill folders cannot contain submodules")
         elif object_type != "tree" or size_text != "-":
             raise GitSourceError("git source returned malformed sparse tree metadata")
+    return object_id_length
 
 
 def _run_git(
@@ -381,7 +409,7 @@ class GitSkillSource:
             max_entries=MAX_GIT_TRANSFER_ENTRIES,
             cancel_event=cancel_event,
         )
-        _validate_sparse_tree_listing(sparse_listing)
+        listing_object_id_length = _validate_sparse_tree_listing(sparse_listing)
         sparse_paths = [f"/{skill_name}/", f"/skills/{skill_name}/"]
         _run_git(
             [
@@ -409,7 +437,10 @@ class GitSkillSource:
             ["-C", str(target), "rev-parse", "HEAD"],
             cancel_event=cancel_event,
         )
-        if not _COMMIT_RE.fullmatch(revision):
+        if not is_full_object_id(revision) or (
+            listing_object_id_length is not None
+            and len(revision) != listing_object_id_length
+        ):
             raise GitSourceError("git checkout returned an invalid commit identity")
         candidates = (target / "skills" / skill_name, target / skill_name)
         folder = next(
@@ -437,11 +468,18 @@ class GitSkillSource:
         )
         direct: list[str] = []
         peeled: list[str] = []
+        object_id_length: int | None = None
         for line in output.splitlines():
             fields = line.split()
-            if len(fields) != 2 or not _COMMIT_RE.fullmatch(fields[0]):
+            if len(fields) != 2 or not is_full_object_id(fields[0]):
                 raise GitSourceError(
                     f"remote ref {ref!r} returned an invalid commit identity"
+                )
+            if object_id_length is None:
+                object_id_length = len(fields[0])
+            elif len(fields[0]) != object_id_length:
+                raise GitSourceError(
+                    f"remote ref {ref!r} returned mixed object formats"
                 )
             (peeled if fields[1].endswith("^{}") else direct).append(fields[0])
         revisions = peeled or direct
@@ -450,7 +488,7 @@ class GitSkillSource:
         return revisions[0]
 
     def has_changed(self, *, url: str, ref: str, installed_revision: str) -> bool:
-        if not _COMMIT_RE.fullmatch(installed_revision):
+        if not is_full_object_id(installed_revision):
             raise GitSourceError("installed revision is not a full commit hash")
         return self.remote_revision(url=url, ref=ref) != installed_revision
 
@@ -461,6 +499,7 @@ __all__ = [
     "MAX_GIT_TRANSFER_ENTRIES",
     "GitCheckout",
     "GitSkillSource",
+    "is_full_object_id",
     "validate_ref",
     "validate_remote_url",
 ]

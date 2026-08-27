@@ -116,6 +116,24 @@ test.describe.serial('procedural skills contributed console', () => {
     }
   });
 
+  test('admin add rejects a trailing skill-name separator before HTTP', async ({ page, request }) => {
+    const name = 'e2e-invalid-';
+    await openPanel(page);
+    await page.getByTestId('skills-add').click();
+    const dialog = page.getByTestId('skills-create-dialog');
+    const nameInput = dialog.getByLabel('New skill name');
+    await nameInput.fill(name);
+    await dialog.getByLabel('New skill description').fill('Must stay client-side');
+    await dialog.getByLabel('New skill procedure').fill('# Procedure\n\n1. Refuse this name.');
+    await dialog.getByRole('button', { name: 'Create disabled skill' }).click();
+
+    await expect(dialog).toBeVisible();
+    expect(await nameInput.evaluate((input) => input.validity.patternMismatch)).toBe(true);
+    expect(await nameInput.evaluate((input) => input.validationMessage)).not.toBe('');
+    const catalog = await request.get(API_ROOT, { headers: headers() });
+    expect((await catalog.json()).skills.some((skill) => skill.name === name)).toBe(false);
+  });
+
   test('Markdown save rejects invalid frontmatter and survives reload', async ({ page }) => {
     await openPanel(page);
     await page.getByRole('button', { name: SKILL_NAME }).click();

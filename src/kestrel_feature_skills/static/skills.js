@@ -139,7 +139,7 @@ function buildCreateDialog() {
   const name = el('input');
   name.name = 'name';
   name.required = true;
-  name.pattern = '[a-z0-9][a-z0-9_-]{0,63}';
+  name.pattern = '[a-z0-9](?:[a-z0-9_\\-]{0,62}[a-z0-9])?';
   name.placeholder = 'skill-name';
   name.setAttribute('aria-label', 'New skill name');
   const description = el('input');

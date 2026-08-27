@@ -123,6 +123,7 @@ async def test_create_api_rejects_non_integer_priority_before_writing(
     (
         ("http://example.com/skills.git", "HEAD"),
         ("https://example.com/skills.git", "bad..ref"),
+        ("https://example.com/skills.git", "main/"),
     ),
 )
 async def test_install_api_maps_invalid_git_input_to_422(client, source_url, ref):
@@ -416,6 +417,7 @@ def test_ui_bundle_contains_required_rails_and_no_run_control(feature):
     assert ui.css == ["skills.css"]
     assert ui.capability is None
     assert "registerPanel" in source
+    assert "name.pattern = '[a-z0-9](?:[a-z0-9_\\\\-]{0,62}[a-z0-9])?'" in source
     assert "skills-delete-approval" in source
     assert "X-Kestrel-Allow-Destructive" in source
     assert "python-execution-risk" in source
