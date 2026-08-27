@@ -44,6 +44,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-percent-link",
         "kite-malformed-link",
         "kite-malformed-angle-nested",
+        "kite-malformed-paren-nested",
         "kite-script-autolink",
         "kite-container-link",
         "kite-literal-separator",
@@ -239,6 +240,14 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             '---\nname: "kite-malformed-angle-nested"\n'
             'description: "Malformed angle nested-link attempt"\n---\n\n'
             "Read [outer](<broken [outside](../kite-outside.md)).\n",
+            encoding="utf-8",
+        )
+        malformed_paren_folder = root / "kite-malformed-paren-nested"
+        malformed_paren_folder.mkdir()
+        (malformed_paren_folder / "SKILL.md").write_text(
+            '---\nname: "kite-malformed-paren-nested"\n'
+            'description: "Malformed parenthesis nested-link attempt"\n---\n\n'
+            "Read [outer]((broken [outside](../kite-outside.md)).\n",
             encoding="utf-8",
         )
         script_autolink_folder = root / "kite-script-autolink"

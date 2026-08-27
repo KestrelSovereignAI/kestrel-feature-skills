@@ -759,6 +759,7 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
 
         start = cursor
         parenthesis_depth = 0
+        completed = False
         while cursor < len(body):
             if body[cursor] == "\\" and cursor + 1 < len(body):
                 cursor += 2
@@ -771,6 +772,7 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
                 if parenthesis_depth == 0:
                     destinations.append(body[start:cursor])
                     cursor += 1
+                    completed = True
                     break
                 parenthesis_depth -= 1
                 cursor += 1
@@ -780,9 +782,13 @@ def _inline_markdown_destinations(body: str) -> tuple[str, ...]:
                 if suffix_end is not None:
                     destinations.append(body[start:cursor])
                     cursor = suffix_end
+                    completed = True
                 break
             cursor += 1
-        index = cursor
+        # A destination with unmatched parentheses is literal CommonMark, so a
+        # nested label inside it can still form a live link. Re-enter the
+        # rejected destination instead of skipping every nested candidate.
+        index = cursor if completed else start + 1
     return tuple(destinations)
 
 

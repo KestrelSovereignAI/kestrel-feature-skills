@@ -221,6 +221,24 @@ def _unlink_at(directory_fd: int, name: str) -> None:
         pass
 
 
+def _reap_temporary_hardlinks_at(
+    directory_fd: int, *, expected: tuple[int, int]
+) -> None:
+    """Remove only crashed-writer temporaries hardlinked to a stale claim."""
+
+    for name in os.listdir(directory_fd):
+        if not name.startswith(".SKILL.md.tmp."):
+            continue
+        if _identity_at(directory_fd, name) != expected:
+            continue
+        # Same-name feature writers are serialized while recovery holds the
+        # mutation lock, and UUID temporary names are never reused. Repeat the
+        # identity check immediately before unlinking so an unrelated orphan
+        # or current writer's temporary is always preserved.
+        if _identity_at(directory_fd, name) == expected:
+            _unlink_at(directory_fd, name)
+
+
 def _atomic_write_primary_at(
     directory_fd: int, folder_name: str, payload: bytes, *, overwrite: bool
 ) -> None:
@@ -274,6 +292,10 @@ def _atomic_write_primary_at(
                     raise SkillConflictError(
                         f"stale skill claim changed during recovery for {folder_name}"
                     )
+                _reap_temporary_hardlinks_at(
+                    directory_fd,
+                    expected=stale_identity,
+                )
                 os.unlink(claim, dir_fd=directory_fd)
                 try:
                     os.link(

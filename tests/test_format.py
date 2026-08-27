@@ -582,6 +582,30 @@ def test_malformed_angle_destination_cannot_hide_nested_live_link(
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "body, message",
+    (
+        ("[outer]((broken [escape](../secret.md))", "traversal"),
+        (
+            "[outer]((broken [execute](javascript:alert(1)))",
+            "unsupported link scheme",
+        ),
+    ),
+)
+def test_malformed_parenthesized_destination_cannot_hide_nested_live_link(
+    tmp_path, body, message
+):
+    value = SkillDocument(
+        "nested-parenthesis-escape",
+        "Nested parenthesis escape",
+        body,
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match=message):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_escaped_angle_destination_terminator_is_part_of_path(tmp_path):
     value = SkillDocument(
         "escaped-angle", "Escaped angle destination", r"[notes](<foo\>bar.md>)"

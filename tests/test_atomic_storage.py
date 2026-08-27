@@ -441,6 +441,25 @@ def test_stale_claim_is_reclaimed(tmp_path):
     assert not claim.exists()
 
 
+def test_stale_claim_reaps_the_crashed_writers_temporary_hardlink(tmp_path):
+    folder = tmp_path / "atomic"
+    folder.mkdir()
+    atomic_write_primary(folder, payload(), overwrite=False)
+    crashed_temporary = folder / ".SKILL.md.tmp.crashed-writer"
+    crashed_temporary.write_bytes(payload("crashed"))
+    claim = folder / ".SKILL.md.claim"
+    os.link(crashed_temporary, claim)
+    stale = time.time() - CLAIM_STALENESS_SECONDS - 5
+    os.utime(claim, (stale, stale))
+
+    atomic_write_primary(folder, payload(), overwrite=True)
+
+    assert not claim.exists()
+    assert not crashed_temporary.exists()
+    assert not list(folder.glob(".SKILL.md.tmp.*"))
+    assert validate_skill_folder(folder, source_root=tmp_path).name == "atomic"
+
+
 def test_two_edits_serialize_on_same_claim(tmp_path, monkeypatch):
     folder = tmp_path / "atomic"
     folder.mkdir()
