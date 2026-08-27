@@ -91,7 +91,7 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
         try:
             async with feature.persistent_read():
                 return feature.catalog_payload()
-        except (DatabaseError, OSError, RuntimeError) as exc:
+        except (SkillPathError, DatabaseError, OSError, RuntimeError) as exc:
             raise _http_error(exc) from exc
 
     @router.post("/reload")
@@ -99,7 +99,7 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
         try:
             async with feature.persistent_read(refresh=True):
                 return feature.catalog_payload()
-        except (DatabaseError, OSError, RuntimeError) as exc:
+        except (SkillPathError, DatabaseError, OSError, RuntimeError) as exc:
             raise _http_error(exc) from exc
 
     @router.post("")

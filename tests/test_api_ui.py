@@ -8,7 +8,7 @@ import pytest
 from fastapi import FastAPI
 from kestrel_sovereign.privacy import PrivacyConfig
 
-from kestrel_feature_skills.errors import GitSourceError
+from kestrel_feature_skills.errors import GitSourceError, SkillPathError
 from kestrel_feature_skills.format import MAX_RESOURCE_PATH_BYTES
 
 
@@ -256,6 +256,29 @@ async def test_catalog_route_rehydrates_after_persistent_privacy_returns(
     assert catalog.json()["skills"][0]["name"] == "privacy-ui"
     assert opened.status_code == 200
     assert "Privacy UI" in opened.json()["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path"),
+    (("get", "/api/procedural-skills"), ("post", "/api/procedural-skills/reload")),
+)
+async def test_catalog_rehydration_maps_invalid_persistent_root_to_422(
+    method, path, client, feature, monkeypatch
+):
+    feature.agent.privacy_config = PrivacyConfig(storage="none")
+    await feature.refresh()
+    feature.agent.privacy_config = PrivacyConfig(storage="full")
+
+    def reject_invalid_root():
+        raise SkillPathError("skills root became a symlink")
+
+    monkeypatch.setattr(feature, "_ensure_persistent_services", reject_invalid_root)
+
+    response = await getattr(client, method)(path)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "skills root became a symlink"
 
 
 @pytest.mark.asyncio

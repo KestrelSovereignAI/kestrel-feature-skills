@@ -299,6 +299,99 @@ test.describe.serial('procedural skills contributed console', () => {
     await expect(page.locator('#panel-procedural-skills')).toBeVisible();
   });
 
+  test('state controls stay serialized while an update is in flight', async ({ page, request }) => {
+    await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
+      headers: headers(),
+      data: { enabled: false, priority: 100 },
+    });
+    await openPanel(page);
+    await page.getByRole('button', { name: SKILL_NAME }).click();
+    let releasePatch;
+    const patchReleased = new Promise((resolve) => { releasePatch = resolve; });
+    let markCommitted;
+    const patchCommitted = new Promise((resolve) => { markCommitted = resolve; });
+    await page.route(new RegExp(`${API_ROOT}/${SKILL_NAME}/state$`), async (route) => {
+      const response = await route.fetch();
+      markCommitted();
+      await patchReleased;
+      await route.fulfill({ response });
+    });
+    try {
+      await page.getByRole('button', { name: 'Enable', exact: true }).click();
+      await patchCommitted;
+      await expect(page.getByLabel('Skill priority')).toBeDisabled();
+      await expect(page.getByRole('button', { name: 'Set priority' })).toBeDisabled();
+      releasePatch();
+      await expect(page.locator('[role="status"]')).toContainText(`Enabled ${SKILL_NAME}`);
+      await expect(page.getByLabel('Skill priority')).toBeEnabled();
+      await page.getByLabel('Skill priority').fill('37');
+      await page.getByRole('button', { name: 'Set priority' }).click();
+      await expect(page.locator('[role="status"]')).toContainText(`Updated ${SKILL_NAME} priority to 37.`);
+      const catalog = await request.get(API_ROOT, { headers: headers() });
+      const skill = (await catalog.json()).skills.find((item) => item.name === SKILL_NAME);
+      expect(skill.enabled).toBe(true);
+      expect(skill.priority).toBe(37);
+    } finally {
+      releasePatch();
+      await page.unrouteAll({ behavior: 'ignoreErrors' });
+      await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
+        headers: headers(),
+        data: { enabled: false, priority: 100 },
+      });
+    }
+  });
+
+  test('state completion preserves a newer skill selection and unsaved edit', async ({ page, request }) => {
+    const newer = 'e2e-state-race-newer';
+    await request.delete(`${API_ROOT}/${newer}`, { headers: headers() });
+    await request.post(API_ROOT, {
+      headers: headers(),
+      data: {
+        name: newer,
+        description: 'Newer state-race selection',
+        body: '# Procedure\n\nKeep this unsaved edit.',
+        enabled: false,
+      },
+    });
+    await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
+      headers: headers(),
+      data: { enabled: false, priority: 100 },
+    });
+    await openPanel(page);
+    await page.getByRole('button', { name: SKILL_NAME }).click();
+    let releasePatch;
+    const patchReleased = new Promise((resolve) => { releasePatch = resolve; });
+    let markCommitted;
+    const patchCommitted = new Promise((resolve) => { markCommitted = resolve; });
+    await page.route(new RegExp(`${API_ROOT}/${SKILL_NAME}/state$`), async (route) => {
+      const response = await route.fetch();
+      markCommitted();
+      await patchReleased;
+      await route.fulfill({ response });
+    });
+    try {
+      await page.getByRole('button', { name: 'Enable', exact: true }).click();
+      await patchCommitted;
+      await page.getByRole('button', { name: newer }).click();
+      await page.getByRole('button', { name: 'SKILL.md' }).click();
+      const editor = page.getByLabel('Skill file editor');
+      const unsaved = `${await editor.inputValue()}\nUNSAVED-STATE-RACE-SENTINEL\n`;
+      await editor.fill(unsaved);
+      releasePatch();
+      await expect(page.locator('[role="status"]')).toContainText(`Enabled ${SKILL_NAME}`);
+      await expect(page.getByRole('button', { name: newer })).toHaveAttribute('aria-current', 'true');
+      await expect(editor).toHaveValue(unsaved);
+    } finally {
+      releasePatch();
+      await page.unrouteAll({ behavior: 'ignoreErrors' });
+      await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
+        headers: headers(),
+        data: { enabled: false, priority: 100 },
+      });
+      await request.delete(`${API_ROOT}/${newer}`, { headers: headers() });
+    }
+  });
+
   test('privacy indicator transition clears a concealed persisted editor', async ({ page }) => {
     await openPanel(page);
     await page.getByRole('button', { name: SKILL_NAME }).click();

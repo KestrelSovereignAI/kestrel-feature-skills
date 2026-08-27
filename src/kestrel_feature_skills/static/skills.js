@@ -14,6 +14,7 @@ const state = {
   fileEpoch: 0,
   catalogEpoch: 0,
   availabilityEpoch: 0,
+  stateUpdateOwner: null,
   available: true,
   restoreOnAvailability: false,
   ui: null,
@@ -64,6 +65,13 @@ function setStatus(message, isError = false) {
   if (!state.ui) return;
   state.ui.status.textContent = message || '';
   state.ui.status.style.color = isError ? 'var(--error-color, #c0392b)' : '';
+}
+
+function setStateControlsDisabled(disabled) {
+  if (!state.ui) return;
+  for (const control of state.ui.controls.querySelectorAll('[data-state-control]')) {
+    control.disabled = disabled;
+  }
 }
 
 function mount(container) {
@@ -305,17 +313,7 @@ async function selectSkill(name) {
   renderCatalog();
   const skill = (state.catalog?.skills || []).find((item) => item.name === name);
   if (!skill || !state.ui) return;
-  state.ui.title.textContent = skill.name;
-  state.ui.meta.textContent = `${skill.description} · ${skill.source_kind} · ${skill.token_cost} estimated tokens`;
-  const toggle = button(skill.enabled ? 'Disable' : 'Enable', () => setEnabled(skill, !skill.enabled));
-  const priority = el('input');
-  priority.type = 'number';
-  priority.value = String(skill.priority);
-  priority.setAttribute('aria-label', 'Skill priority');
-  const savePriority = button('Set priority', () => setEnabled(skill, skill.enabled, Number(priority.value)));
-  const remove = button('Delete', () => confirmDelete(skill), 'skills-button skills-danger');
-  remove.disabled = !skill.editable;
-  state.ui.controls.replaceChildren(toggle, priority, savePriority, remove);
+  renderSkillControls(skill);
   try {
     const data = await request(`/${encodeURIComponent(name)}/tree`);
     if (
@@ -331,6 +329,25 @@ async function selectSkill(name) {
       && currentAgent() === agent
     ) setStatus(detail(error), true);
   }
+}
+
+function renderSkillControls(skill) {
+  if (!state.ui) return;
+  state.ui.title.textContent = skill.name;
+  state.ui.meta.textContent = `${skill.description} · ${skill.source_kind} · ${skill.token_cost} estimated tokens`;
+  const toggle = button(skill.enabled ? 'Disable' : 'Enable', () => setEnabled(skill, !skill.enabled));
+  toggle.dataset.stateControl = 'true';
+  const priority = el('input');
+  priority.type = 'number';
+  priority.value = String(skill.priority);
+  priority.setAttribute('aria-label', 'Skill priority');
+  priority.dataset.stateControl = 'true';
+  const savePriority = button('Set priority', () => setEnabled(skill, skill.enabled, Number(priority.value)));
+  savePriority.dataset.stateControl = 'true';
+  const remove = button('Delete', () => confirmDelete(skill), 'skills-button skills-danger');
+  remove.disabled = !skill.editable;
+  state.ui.controls.replaceChildren(toggle, priority, savePriority, remove);
+  setStateControlsDisabled(Boolean(state.stateUpdateOwner));
 }
 
 function renderTree(entries) {
@@ -459,7 +476,16 @@ async function saveFile() {
 }
 
 async function setEnabled(skill, enabled, priority = null) {
+  if (state.stateUpdateOwner) return;
   const agent = currentAgent();
+  const owner = {
+    agent,
+    selected: state.selected,
+    selectionEpoch: state.selectionEpoch,
+    skill: skill.name,
+  };
+  state.stateUpdateOwner = owner;
+  setStateControlsDisabled(true);
   try {
     await request(`/${encodeURIComponent(skill.name)}/state`, {
       method: 'PATCH',
@@ -469,12 +495,24 @@ async function setEnabled(skill, enabled, priority = null) {
     if (currentAgent() !== agent) return;
     await loadCatalog();
     if (currentAgent() !== agent) return;
-    await selectSkill(skill.name);
+    if (
+      state.selectionEpoch === owner.selectionEpoch
+      && state.selected === owner.selected
+      && state.selected === owner.skill
+    ) {
+      const refreshed = (state.catalog?.skills || []).find((item) => item.name === owner.skill);
+      if (refreshed) renderSkillControls(refreshed);
+    }
     setStatus(priority === null
       ? `${enabled ? 'Enabled' : 'Disabled'} ${skill.name}.`
       : `Updated ${skill.name} priority to ${priority}.`);
   } catch (error) {
     if (currentAgent() === agent) setStatus(detail(error), true);
+  } finally {
+    if (state.stateUpdateOwner === owner) {
+      state.stateUpdateOwner = null;
+      if (currentAgent() === agent) setStateControlsDisabled(false);
+    }
   }
 }
 
@@ -562,6 +600,7 @@ bus.on('panel:hidden', (payload) => {
 
 bus.on('agent:switch', (payload) => {
   state.availabilityEpoch += 1;
+  state.stateUpdateOwner = null;
   state.restoreOnAvailability ||= panelIsSelected();
   state.available = false;
   state.catalogEpoch += 1;
