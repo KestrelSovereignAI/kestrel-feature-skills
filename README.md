@@ -82,12 +82,13 @@ the existing `bootstrap_config` table under an isolated
 prevents older core bootstrap loaders from treating a procedure as a full-text
 bootstrap file; this package does not create a competing configuration table.
 
-## Context-seam status
+## Context contribution
 
-The package includes and tests the deterministic, descriptions-only context
-renderer. Registering it with Sovereign is intentionally gated on epic #3018's
-SDK/core contribution-seam tickets (#3021–#3026). This repository does not ship
-a lookalike hook or per-turn fallback while that contract is unavailable.
+The package registers its deterministic, descriptions-only renderer through
+the SDK context-clause contract introduced by epic #3018. Sovereign resolves
+those bytes only at lifecycle or configuration transitions, retains an
+immutable cache between turns, and owns prompt budgeting and audit accounting.
+There is no lookalike hook or per-turn feature callback.
 
 ## Installation
 

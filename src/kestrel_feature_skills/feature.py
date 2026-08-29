@@ -48,6 +48,7 @@ from .format import SKILL_FILENAME, validate_skill_name
 from .git_source import GitCheckout, GitSkillSource
 from .models import (
     CatalogSnapshot,
+    ContextRender,
     SkillDocument,
     SkillProvenance,
     SkillRecord,
@@ -242,13 +243,29 @@ class ProceduralSkillsFeature(Feature):
             )
         refresh(self)
 
+    def _replace_context_render(self, replacement: ContextRender) -> None:
+        """Publish new bytes atomically enough for a later retry."""
+
+        previous = self._context_render
+        self._context_render = replacement
+        if replacement.text == previous.text:
+            return
+        try:
+            self._publish_context_transition()
+        except BaseException:
+            # The core registry still owns ``previous``. Retain that exact
+            # local value so a subsequent refresh sees a difference and retries
+            # publication instead of treating the failed update as committed.
+            self._context_render = previous
+            raise
+
     @property
     def snapshot(self) -> CatalogSnapshot:
         return CatalogSnapshot() if self._privacy_hidden() else self._snapshot
 
     @property
     def context_clause_text(self) -> str:
-        """The memoized, byte-stable text awaiting the SDK contribution seam."""
+        """The memoized, byte-stable text published through the SDK seam."""
 
         return "" if self._privacy_hidden() else self._context_render.text
 
@@ -332,13 +349,12 @@ class ProceduralSkillsFeature(Feature):
             self._catalog,
             states,
         )
-        prior_context = self._context_render.text
-        self._context_render = render_context_clause(
-            self._snapshot,
-            max_bytes=DEFAULT_CONTEXT_BUDGET_BYTES,
+        self._replace_context_render(
+            render_context_clause(
+                self._snapshot,
+                max_bytes=DEFAULT_CONTEXT_BUDGET_BYTES,
+            )
         )
-        if self._context_render.text != prior_context:
-            self._publish_context_transition()
         records_by_name = {record.name: record for record in self._snapshot.records}
         desired_payloads = {
             name: self._index_payload(self._index_node(record))
@@ -414,15 +430,12 @@ class ProceduralSkillsFeature(Feature):
             )
 
     def _hide_persistent_state(self) -> None:
-        prior_context = self._context_render.text
         self._db = None
         self._enablement = None
         self._store = None
         self._catalog = None
         self._snapshot = CatalogSnapshot()
-        self._context_render = render_context_clause(self._snapshot)
-        if self._context_render.text != prior_context:
-            self._publish_context_transition()
+        self._replace_context_render(render_context_clause(self._snapshot))
         self._states = {}
         self._enablement_error = (
             "persistent procedural skills are unavailable in the current privacy mode"

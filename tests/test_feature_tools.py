@@ -2869,3 +2869,34 @@ async def test_enablement_transition_publishes_fresh_core_owned_clause(feature):
     assert "Published description only" in published[0]
     assert "PROCEDURE-BODY-MUST-STAY-OUT" not in published[0]
     assert published[1] == ""
+
+
+@pytest.mark.asyncio
+async def test_failed_context_publication_remains_retryable(feature):
+    created = await feature.skill_create(
+        "retry-context",
+        "Retry this description",
+        "Procedure remains private",
+    )
+    assert created.status is ToolResultStatus.OK
+    await feature._enablement.set("retry-context", enabled=True, priority=7)
+    feature.agent.feature_contribution_runtime = SimpleNamespace(
+        is_active=lambda candidate: candidate is feature
+    )
+
+    def fail_refresh(_candidate):
+        raise RuntimeError("simulated core publication failure")
+
+    feature.agent.refresh_feature_context_clauses = fail_refresh
+    with pytest.raises(RuntimeError, match="simulated core publication failure"):
+        await feature.refresh()
+    assert feature.context_clause_text == ""
+
+    published = []
+    feature.agent.refresh_feature_context_clauses = lambda candidate: published.append(
+        candidate.context_clause_text
+    )
+    await feature.refresh()
+
+    assert len(published) == 1
+    assert "Retry this description" in published[0]

@@ -8,6 +8,7 @@ from kestrel_sovereign.agent.context_builder import ContextBuilder
 from kestrel_sovereign.features.bootstrap.loader import BootstrapLoader
 from kestrel_sovereign.features.contribution_runtime import FeatureContributionRuntime
 from kestrel_sovereign.operator import OperatorRuntimeRegistry
+from kestrel_sovereign.privacy import PrivacyConfig
 from kestrel_sovereign.signals import SourceRegistry
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.waits import WaitRegistry
@@ -268,6 +269,18 @@ async def test_real_core_context_seam_tracks_enablement_without_disclosing_body(
     )
     assert "Description reaches the next prompt" not in squeezed.prompt
     assert "procedural-skills" in squeezed.dropped_clauses
+
+    feature.agent.privacy_config = PrivacyConfig(storage="none")
+    runtime.refresh_all_context_clauses()
+    assert (
+        builder.build_system_prompt("GOVERNANCE", include_briefing=False).encode()
+        == baseline
+    )
+    feature.agent.privacy_config = PrivacyConfig(storage="full")
+    runtime.refresh_all_context_clauses()
+    assert "Description reaches the next prompt" in builder.build_system_prompt(
+        "GOVERNANCE", include_briefing=False
+    )
 
     disabled = await feature.skill_disable("seam-proof")
     assert disabled.status is ToolResultStatus.OK
