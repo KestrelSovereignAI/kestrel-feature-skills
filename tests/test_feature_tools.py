@@ -782,9 +782,7 @@ async def test_indexing_preserves_non_skill_node_at_deterministic_id(feature):
 
 
 @pytest.mark.asyncio
-async def test_sqlite_graph_cas_preserves_non_skill_node_at_index_id(
-    feature, tmp_path
-):
+async def test_sqlite_graph_cas_preserves_non_skill_node_at_index_id(feature, tmp_path):
     name = "sqlite-graph-id-collision"
     agent_id = "did:test:sqlite-graph-id-collision"
     graph = AsyncGraphStore(feature.agent._raw_storage.db, agent_id=agent_id)
@@ -857,9 +855,7 @@ async def test_unchanged_refresh_does_not_reindex_graph_node(feature):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("damage", ("missing", "corrupt"))
-async def test_unchanged_refresh_repairs_externally_damaged_graph_node(
-    feature, damage
-):
+async def test_unchanged_refresh_repairs_externally_damaged_graph_node(feature, damage):
     name = f"repair-{damage}-index"
     await feature.skill_create(name, "Repair graph index", "body")
     node_id = feature._node_id(name)
@@ -2840,7 +2836,36 @@ async def test_nested_metadata_like_resources_remain_in_inventory(feature):
         assert result.data["content"] == content
 
 
-def test_context_renderer_is_not_registered_through_a_fake_legacy_hook(feature):
+def test_context_renderer_is_registered_through_sdk_contract(feature):
     assert feature.context_clause_text == render_context_clause(feature.snapshot).text
-    assert not hasattr(feature, "get_context_clause_registrations")
+    registrations = feature.get_context_clause_registrations()
+    assert len(registrations) == 1
+    registration = registrations[0]
+    assert registration.owner == feature.contribution_owner
+    assert registration.name == "procedural-skills"
+    assert registration.renderer() == feature.context_clause_text
     assert feature.get_hooks() == []
+
+
+@pytest.mark.asyncio
+async def test_enablement_transition_publishes_fresh_core_owned_clause(feature):
+    published = []
+    feature.agent.feature_contribution_runtime = SimpleNamespace(
+        is_active=lambda candidate: candidate is feature
+    )
+    feature.agent.refresh_feature_context_clauses = lambda candidate: published.append(
+        candidate.context_clause_text
+    )
+    await feature.skill_create(
+        "published-context",
+        "Published description only",
+        "PROCEDURE-BODY-MUST-STAY-OUT",
+    )
+
+    await feature.skill_enable("published-context", priority=7)
+    await feature.skill_disable("published-context")
+
+    assert len(published) == 2
+    assert "Published description only" in published[0]
+    assert "PROCEDURE-BODY-MUST-STAY-OUT" not in published[0]
+    assert published[1] == ""

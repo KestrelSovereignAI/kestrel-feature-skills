@@ -3,8 +3,14 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.agent.context_builder import ContextBuilder
 from kestrel_sovereign.features.bootstrap.loader import BootstrapLoader
+from kestrel_sovereign.features.contribution_runtime import FeatureContributionRuntime
+from kestrel_sovereign.operator import OperatorRuntimeRegistry
+from kestrel_sovereign.signals import SourceRegistry
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.waits import WaitRegistry
 
 from kestrel_feature_skills.context import render_context_clause
 from kestrel_feature_skills.enablement import SkillEnablementStore
@@ -197,3 +203,75 @@ def test_priority_change_is_the_only_order_change():
     ).included
     assert baseline == ("a", "b")
     assert changed == ("b", "a")
+
+
+@pytest.mark.asyncio
+async def test_real_core_context_seam_tracks_enablement_without_disclosing_body(
+    feature, tmp_path
+):
+    """Exercise the published SDK contract through Sovereign's real runtime."""
+
+    runtime = FeatureContributionRuntime(
+        operator_registry=OperatorRuntimeRegistry(),
+        wait_registry=WaitRegistry(),
+        source_registry=SourceRegistry(),
+    )
+    feature.agent.feature_contribution_runtime = runtime
+    feature.agent.refresh_feature_context_clauses = runtime.refresh_context_clauses
+
+    prompt_root = tmp_path / "prompt-root"
+    prompt_root.mkdir()
+    baseline_builder = ContextBuilder(
+        feature.agent.storage,
+        agent_data_path=prompt_root,
+    )
+    baseline = baseline_builder.build_system_prompt(
+        "GOVERNANCE",
+        include_briefing=False,
+    ).encode()
+
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    builder = ContextBuilder(
+        feature.agent.storage,
+        agent_data_path=prompt_root,
+        context_clause_registry=runtime.context_clause_registry,
+    )
+
+    # Installed but empty is exactly the feature-absent prompt.
+    assert (
+        builder.build_system_prompt("GOVERNANCE", include_briefing=False).encode()
+        == baseline
+    )
+
+    created = await feature.skill_create(
+        "seam-proof",
+        "Description reaches the next prompt",
+        "PRIVATE PROCEDURE BODY MUST NOT REACH THE PROMPT",
+    )
+    enabled = await feature.skill_enable("seam-proof", priority=7)
+    assert created.status is ToolResultStatus.OK
+    assert enabled.status is ToolResultStatus.OK
+
+    first = builder.build_system_prompt("GOVERNANCE", include_briefing=False)
+    second = builder.build_system_prompt("GOVERNANCE", include_briefing=False)
+    assert first.encode() == second.encode()
+    assert "Description reaches the next prompt" in first
+    assert "PRIVATE PROCEDURE BODY" not in first
+    tracked = builder.build_system_prompt_with_tracking(
+        "GOVERNANCE", include_briefing=False
+    )
+    assert "procedural-skills" in tracked.injected_clauses
+    squeezed = builder.build_system_prompt_with_tracking(
+        "GOVERNANCE",
+        include_briefing=False,
+        budget_bytes=len(first.encode()) - 1,
+    )
+    assert "Description reaches the next prompt" not in squeezed.prompt
+    assert "procedural-skills" in squeezed.dropped_clauses
+
+    disabled = await feature.skill_disable("seam-proof")
+    assert disabled.status is ToolResultStatus.OK
+    assert (
+        builder.build_system_prompt("GOVERNANCE", include_briefing=False).encode()
+        == baseline
+    )

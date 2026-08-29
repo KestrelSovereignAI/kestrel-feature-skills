@@ -15,6 +15,7 @@ from typing import Any
 
 from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.features.contributions import (
+    ContextClauseRegistration,
     FeaturePermissionDefaults,
     PermissionLevel,
 )
@@ -148,6 +149,12 @@ class ProceduralSkillsFeature(Feature):
         self._catalog: SkillCatalog | None = None
         self._snapshot = CatalogSnapshot()
         self._context_render = render_context_clause(self._snapshot)
+        self._context_clause_registration = ContextClauseRegistration(
+            owner=self.contribution_owner,
+            name="procedural-skills",
+            priority=100,
+            renderer=self._render_contributed_context,
+        )
         self._states: dict[str, SkillState] = {}
         self._enablement_error: str | None = None
         self._indexed_names: frozenset[str] = frozenset()
@@ -210,6 +217,30 @@ class ProceduralSkillsFeature(Feature):
                 "skill_install": PermissionLevel.ALWAYS_ASK,
             },
         )
+
+    def get_context_clause_registrations(
+        self,
+    ) -> tuple[ContextClauseRegistration, ...]:
+        return (self._context_clause_registration,)
+
+    def _render_contributed_context(self) -> str:
+        """Resolve bytes only when core performs a lifecycle transition."""
+
+        return self.context_clause_text
+
+    def _publish_context_transition(self) -> None:
+        """Refresh core's immutable cache after persisted config changes."""
+
+        runtime = getattr(self.agent, "feature_contribution_runtime", None)
+        is_active = getattr(runtime, "is_active", None)
+        if not callable(is_active) or not is_active(self):
+            return
+        refresh = getattr(self.agent, "refresh_feature_context_clauses", None)
+        if not callable(refresh):
+            raise RuntimeError(
+                "active procedural skills require core context-clause refresh support"
+            )
+        refresh(self)
 
     @property
     def snapshot(self) -> CatalogSnapshot:
@@ -301,10 +332,13 @@ class ProceduralSkillsFeature(Feature):
             self._catalog,
             states,
         )
+        prior_context = self._context_render.text
         self._context_render = render_context_clause(
             self._snapshot,
             max_bytes=DEFAULT_CONTEXT_BUDGET_BYTES,
         )
+        if self._context_render.text != prior_context:
+            self._publish_context_transition()
         records_by_name = {record.name: record for record in self._snapshot.records}
         desired_payloads = {
             name: self._index_payload(self._index_node(record))
@@ -380,12 +414,15 @@ class ProceduralSkillsFeature(Feature):
             )
 
     def _hide_persistent_state(self) -> None:
+        prior_context = self._context_render.text
         self._db = None
         self._enablement = None
         self._store = None
         self._catalog = None
         self._snapshot = CatalogSnapshot()
         self._context_render = render_context_clause(self._snapshot)
+        if self._context_render.text != prior_context:
+            self._publish_context_transition()
         self._states = {}
         self._enablement_error = (
             "persistent procedural skills are unavailable in the current privacy mode"
@@ -1044,8 +1081,7 @@ class ProceduralSkillsFeature(Feature):
                 self._enablement_error is None and name not in self._states
             )
             if not (
-                enablement_cleanup_observed_absent
-                or final_refresh_observed_absent
+                enablement_cleanup_observed_absent or final_refresh_observed_absent
             ):
                 config_deleted = False
                 errors.insert(0, enablement_cleanup_error)
@@ -1365,9 +1401,9 @@ class ProceduralSkillsFeature(Feature):
                 )
                 return False
             persisted = await storage.get_node(node.node_id)
-            if persisted is None or self._index_payload(persisted) != self._index_payload(
-                node
-            ):
+            if persisted is None or self._index_payload(
+                persisted
+            ) != self._index_payload(node):
                 logger.warning(
                     "Procedural_skill index for %s changed during verification",
                     record.name,
