@@ -13,14 +13,37 @@ KITE_URL = os.environ.get("KESTREL_KITE_URL")
 KITE_KEY = os.environ.get("KESTREL_KITE_API_KEY")
 KITE_ROOT = os.environ.get("KESTREL_KITE_SKILLS_ROOT")
 KITE_DB = os.environ.get("KESTREL_KITE_DB")
+KITE_HOSTED_PROVIDER = os.environ.get("KESTREL_KITE_HOSTED_PROVIDER")
+KITE_HOSTED_MODEL = os.environ.get("KESTREL_KITE_HOSTED_MODEL")
+
+_ALLOWED_HOSTED_MODELS = {
+    ("anthropic:api", "claude-haiku-4-5"),
+    ("anthropic:api", "claude-haiku-4-5-20251001"),
+    ("openai:api", "gpt-5.6-luna"),
+    ("openai:plan", "gpt-5.6-luna"),
+}
 
 pytestmark = pytest.mark.skipif(
-    not all((KITE_URL, KITE_KEY, KITE_ROOT, KITE_DB)),
-    reason="isolated Kite HTTP environment is not configured",
+    not all(
+        (
+            KITE_URL,
+            KITE_KEY,
+            KITE_ROOT,
+            KITE_DB,
+            KITE_HOSTED_PROVIDER,
+            KITE_HOSTED_MODEL,
+        )
+    ),
+    reason="isolated Kite HTTP environment and hosted model pin are not configured",
 )
 
 
 def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
+    hosted_identity = (str(KITE_HOSTED_PROVIDER), str(KITE_HOSTED_MODEL))
+    assert hosted_identity in _ALLOWED_HOSTED_MODELS, (
+        "Kite live verification must use hosted GPT-5.6 Luna or Claude Haiku; "
+        f"received {hosted_identity!r}"
+    )
     base = f"{KITE_URL}/api/agents/kite/api/procedural-skills"
     headers = {
         "X-API-Key": str(KITE_KEY),
@@ -185,6 +208,26 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert "<system>" not in context["text"]
         assert secret_body not in context["text"]
         assert "scripts/" not in context["text"]
+
+        hosted_invoke = client.post(
+            f"{KITE_URL}/api/agents/kite/api/agent/invoke",
+            json={
+                "input": (
+                    f"Read the enabled procedural skill named {name}. Return the "
+                    "exact uppercase token on the first nonblank body line of its "
+                    "SKILL.md, with no extra text."
+                ),
+                "provider": KITE_HOSTED_PROVIDER,
+                "model": KITE_HOSTED_MODEL,
+                "session_id": "kite-skills-hosted-3018",
+            },
+            timeout=180,
+        )
+        assert hosted_invoke.status_code == 200, hosted_invoke.text
+        hosted_payload = hosted_invoke.json()
+        assert hosted_payload["provider"] == KITE_HOSTED_PROVIDER, hosted_payload
+        assert hosted_payload["model"] == KITE_HOSTED_MODEL, hosted_payload
+        assert secret_body in hosted_payload["response"], hosted_payload
 
         read = client.get(f"{base}/{name}/file", params={"path": "SKILL.md"})
         assert read.status_code == 200

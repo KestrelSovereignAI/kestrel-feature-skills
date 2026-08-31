@@ -110,4 +110,7 @@ uv build
 
 Live-path verification follows Kestrel's Kite runbook and drives the feature
 through `/api/agents/kite/api/agent/invoke`, in addition to its scoped HTTP and
-Console surfaces.
+Console surfaces. The live test requires `KESTREL_KITE_HOSTED_PROVIDER` and
+`KESTREL_KITE_HOSTED_MODEL`; it accepts only hosted Claude Haiku or GPT-5.6
+Luna routes and asserts that the invoke response reports the exact pinned
+provider and model. It never accepts a local-model fallback as release evidence.
