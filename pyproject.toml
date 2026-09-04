@@ -18,7 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.115,<1",
-    "kestrel-sovereign>=0.53.8,<0.54",
+    "kestrel-sovereign>=0.53.10,<0.54",
     "kestrel-sovereign-sdk>=0.37.1,<0.38",
 ]
 
