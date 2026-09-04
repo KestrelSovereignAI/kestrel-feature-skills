@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -97,6 +98,40 @@ def _same_resolved_folder(left: SkillRecord, right: SkillRecord) -> bool:
         and left.folder_identity is not None
         and left.folder_identity == right.folder_identity
     )
+
+
+def _deletion_record(
+    snapshot: CatalogSnapshot,
+    resolved_record: SkillRecord,
+) -> SkillRecord:
+    """Return the exact local record a delete action would remove."""
+
+    if resolved_record.editable:
+        return resolved_record
+    return next(
+        (
+            candidate
+            for candidate in snapshot.shadowed_records.get(resolved_record.name, ())
+            if candidate.source_kind == "agent-local"
+        ),
+        resolved_record,
+    )
+
+
+def _require_expected_revision(
+    record: SkillRecord,
+    expected_revision: str | None,
+    *,
+    operation: str,
+) -> None:
+    """Reject an operator mutation against content/state it did not observe."""
+
+    if expected_revision is None:
+        return
+    if not hmac.compare_digest(record.revision, expected_revision):
+        raise SkillConflictError(
+            f"skill {record.name!r} changed before {operation}; reload and retry"
+        )
 
 
 def _agent_id(agent: object) -> str:
@@ -611,7 +646,8 @@ class ProceduralSkillsFeature(Feature):
         self, record: SkillRecord, included: set[str]
     ) -> dict[str, object]:
         shadows = self._snapshot.shadowed.get(record.name, ())
-        shadowed_records = self._snapshot.shadowed_records.get(record.name, ())
+        deletion_record = _deletion_record(self._snapshot, record)
+        deletable = deletion_record.editable
         return {
             "name": record.name,
             "description": record.document.description,
@@ -625,8 +661,9 @@ class ProceduralSkillsFeature(Feature):
             "source_id": record.source_id,
             "source_kind": record.source_kind,
             "editable": record.editable,
-            "deletable": record.editable
-            or any(item.source_kind == "agent-local" for item in shadowed_records),
+            "deletable": deletable,
+            "revision": record.revision,
+            "delete_revision": deletion_record.revision if deletable else None,
             "provenance": record.provenance.to_dict(),
             "shadowed": [provenance.to_dict() for provenance in shadows],
         }
@@ -779,6 +816,7 @@ class ProceduralSkillsFeature(Feature):
             "priority": record.state.priority,
             "indexed": name in self._indexed_names,
             "state_error": state_error,
+            "revision": record.revision,
         }
 
     async def _rollback_created_publication(
@@ -898,15 +936,28 @@ class ProceduralSkillsFeature(Feature):
         return previous_state, state
 
     async def edit_skill(
-        self, *, name: str, relative_path: str, content: str
+        self,
+        *,
+        name: str,
+        relative_path: str,
+        content: str,
+        expected_revision: str | None = None,
     ) -> dict[str, object]:
         async with self._persistent_mutation():
             return await self._edit_skill_locked(
-                name=name, relative_path=relative_path, content=content
+                name=name,
+                relative_path=relative_path,
+                content=content,
+                expected_revision=expected_revision,
             )
 
     async def _edit_skill_locked(
-        self, *, name: str, relative_path: str, content: str
+        self,
+        *,
+        name: str,
+        relative_path: str,
+        content: str,
+        expected_revision: str | None = None,
     ) -> dict[str, object]:
         store, _ = self._require_services()
         name = validate_skill_name(name)
@@ -919,10 +970,18 @@ class ProceduralSkillsFeature(Feature):
                     f"skill {name!r} changed or became invalid before editing; "
                     "reload and repair its folder"
                 )
-            if not _same_resolved_folder(cached, record):
+            if (
+                not _same_resolved_folder(cached, record)
+                or cached.revision != record.revision
+            ):
                 raise SkillConflictError(
                     f"resolved source changed before editing {name}; reload and retry"
                 )
+            _require_expected_revision(
+                record,
+                expected_revision,
+                operation="editing",
+            )
             store.write_file(record, relative_path, content)
             await self._refresh_locked()
             resolved = self._snapshot.by_name().get(name)
@@ -940,6 +999,7 @@ class ProceduralSkillsFeature(Feature):
             "name": name,
             "path": relative_path,
             "indexed": name in self._indexed_names,
+            "revision": resolved.revision,
         }
 
     async def set_skill_state(
@@ -948,10 +1008,14 @@ class ProceduralSkillsFeature(Feature):
         name: str,
         enabled: bool,
         priority: int | None = None,
+        expected_revision: str | None = None,
     ) -> dict[str, object]:
         async with self._persistent_mutation():
             return await self._set_skill_state_locked(
-                name=name, enabled=enabled, priority=priority
+                name=name,
+                enabled=enabled,
+                priority=priority,
+                expected_revision=expected_revision,
             )
 
     async def _set_skill_state_locked(
@@ -960,6 +1024,7 @@ class ProceduralSkillsFeature(Feature):
         name: str,
         enabled: bool,
         priority: int | None = None,
+        expected_revision: str | None = None,
     ) -> dict[str, object]:
         store, enablement = self._require_services()
         name = validate_skill_name(name)
@@ -978,6 +1043,7 @@ class ProceduralSkillsFeature(Feature):
                 name=name,
                 enabled=enabled,
                 priority=priority,
+                expected_revision=expected_revision,
             )
 
     async def _set_skill_state_with_publication_claim(
@@ -987,8 +1053,14 @@ class ProceduralSkillsFeature(Feature):
         name: str,
         enabled: bool,
         priority: int | None,
+        expected_revision: str | None,
     ) -> dict[str, object]:
         record = SkillStore.get(self._snapshot, name)
+        _require_expected_revision(
+            record,
+            expected_revision,
+            operation="changing state",
+        )
         resolved_priority = (
             record.state.priority if priority is None else validate_priority(priority)
         )
@@ -1011,13 +1083,27 @@ class ProceduralSkillsFeature(Feature):
             "priority": refreshed.state.priority,
             "indexed": name in self._indexed_names,
             "context_bytes": len(self._context_render.text.encode("utf-8")),
+            "revision": refreshed.revision,
         }
 
-    async def delete_skill(self, *, name: str) -> dict[str, object]:
+    async def delete_skill(
+        self,
+        *,
+        name: str,
+        expected_revision: str | None = None,
+    ) -> dict[str, object]:
         async with self._persistent_mutation():
-            return await self._delete_skill_locked(name=name)
+            return await self._delete_skill_locked(
+                name=name,
+                expected_revision=expected_revision,
+            )
 
-    async def _delete_skill_locked(self, *, name: str) -> dict[str, object]:
+    async def _delete_skill_locked(
+        self,
+        *,
+        name: str,
+        expected_revision: str | None = None,
+    ) -> dict[str, object]:
         store, enablement = self._require_services()
         name = validate_skill_name(name)
         async with self._publication_state_claim(store, name):
@@ -1028,6 +1114,7 @@ class ProceduralSkillsFeature(Feature):
                 store=store,
                 enablement=enablement,
                 name=name,
+                expected_revision=expected_revision,
             )
 
     async def _delete_skill_with_publication_claim(
@@ -1036,20 +1123,17 @@ class ProceduralSkillsFeature(Feature):
         store: SkillStore,
         enablement: SkillEnablementStore,
         name: str,
+        expected_revision: str | None,
     ) -> dict[str, object]:
         resolved_record = SkillStore.get(self._snapshot, name)
-        record = resolved_record
-        deleting_shadowed_local = False
-        if not record.editable:
-            local_candidates = tuple(
-                candidate
-                for candidate in self._snapshot.shadowed_records.get(name, ())
-                if candidate.source_kind == "agent-local"
-            )
-            if local_candidates:
-                record = local_candidates[0]
-                deleting_shadowed_local = True
+        record = _deletion_record(self._snapshot, resolved_record)
+        deleting_shadowed_local = record is not resolved_record
         store.require_local_record(record)
+        _require_expected_revision(
+            record,
+            expected_revision,
+            operation="deletion",
+        )
         if deleting_shadowed_local:
             store.delete(record)
             await self._refresh_locked()
@@ -1384,6 +1468,7 @@ class ProceduralSkillsFeature(Feature):
             "body": record.document.body,
             "resources": resources,
             "provenance": record.provenance.to_dict(),
+            "revision": record.revision,
         }
 
     def read_file(self, *, name: str, relative_path: str) -> dict[str, object]:
@@ -1398,6 +1483,7 @@ class ProceduralSkillsFeature(Feature):
             "editable": store.file_is_editable(record, relative_path),
             "language": "python" if execution_risk else "markdown",
             "execution_risk": execution_risk,
+            "revision": record.revision,
         }
 
     def tree(self, *, name: str) -> tuple[dict[str, object], ...]:

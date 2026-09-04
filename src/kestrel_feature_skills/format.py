@@ -487,6 +487,7 @@ def _analyze_markdown(
                     "Markdown container nesting exceeds validation complexity limit"
                 )
             content = stripped
+        explicit_container_marker = quote_depth > 0
 
         if quote_depth != list_quote_depth:
             list_levels = []
@@ -522,7 +523,23 @@ def _analyze_markdown(
             absolute_indent = active_level or 0
             marker_cursor = content_offset
             paragraph_may_interrupt = paragraph_open
-            while marker := _list_marker_prefix(content, marker_cursor):
+            while True:
+                while (
+                    stripped := _strip_blockquote_prefix(content[marker_cursor:])
+                ) is not None:
+                    quote_depth += 1
+                    explicit_container_marker = True
+                    if (
+                        quote_depth + len(retained_levels)
+                        > MAX_MARKDOWN_CONTAINER_DEPTH
+                    ):
+                        raise SkillFormatError(
+                            "Markdown container nesting exceeds validation complexity limit"
+                        )
+                    content = content[:marker_cursor] + stripped
+                marker = _list_marker_prefix(content, marker_cursor)
+                if marker is None:
+                    break
                 consumed, continuation_columns, marker_text = marker
                 interrupts_paragraph = False
                 if paragraph_may_interrupt:
@@ -548,12 +565,26 @@ def _analyze_markdown(
                 active_level = absolute_indent
                 marker_cursor = remaining_start
                 paragraph_may_interrupt = False
+                explicit_container_marker = True
             content = content[marker_cursor:]
 
         list_levels = retained_levels
         final_ids = tuple(item_id for _indent, item_id in retained_levels)
         container = (quote_depth, final_ids)
         continued_container = (quote_depth, continued_ids)
+        # A missing quote/list marker may lazily continue an open paragraph.
+        # Resolve that before four-column indentation can mask a live link as
+        # top-level code. Explicit new containers never use this exception.
+        if (
+            paragraph_open
+            and paragraph_container is not None
+            and container != paragraph_container
+            and not explicit_container_marker
+            and content.strip()
+            and _indent_prefix(content, 4) is not None
+        ):
+            container = paragraph_container
+            continued_container = paragraph_container
         offset = len(masked)
         masked.extend(f"{content}{ending}")
         line_length = len(content) + len(ending)

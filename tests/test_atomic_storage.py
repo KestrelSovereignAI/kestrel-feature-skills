@@ -27,7 +27,7 @@ from kestrel_feature_skills.format import (
     validate_skill_folder,
 )
 from kestrel_feature_skills.models import SkillDocument, SkillProvenance, SkillRecord
-from kestrel_feature_skills.sources import MAX_SOURCE_ENTRIES, DirectorySkillSource
+from kestrel_feature_skills.sources import DirectorySkillSource
 from kestrel_feature_skills.store import (
     CLAIM_STALENESS_SECONDS,
     INTERNAL_DIRECTORY,
@@ -72,7 +72,12 @@ def _write_resource_from_separate_process(root, lock_state, result):
 
     try:
         lock_path = (
-            Path(root) / INTERNAL_DIRECTORY / ".cross-process-create.mutation.lock"
+            Path(root)
+            / INTERNAL_DIRECTORY
+            / store_module._mutation_lock_name(
+                Path(root).resolve(),
+                "cross-process-create",
+            )
         )
         descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
@@ -1066,7 +1071,7 @@ def test_normal_lock_accumulation_does_not_consume_source_entry_budget(tmp_path)
     survivor = store.create(
         SkillDocument("lock-budget-survivor", "Survivor", "Procedure.")
     )
-    for index in range((MAX_SOURCE_ENTRIES // 2) + 1):
+    for index in range(5_000):
         name = f"cycled-{index:04}"
         claim = store.try_acquire_publication_state_claim(name)
         assert claim is not None
@@ -1090,6 +1095,12 @@ def test_normal_lock_accumulation_does_not_consume_source_entry_budget(tmp_path)
     assert survivor.is_dir()
     assert list(store.local_root.glob(".*.mutation.lock")) == []
     assert list(store.local_root.glob(".*.publication-state.lock")) == []
+    assert len(list(store._internal_root.glob(".mutation-bucket-*.lock"))) <= 256
+    assert (
+        len(list(store._internal_root.glob(".publication-state-bucket-*.lock"))) <= 256
+    )
+    assert len(store_module._MUTATION_LOCKS) == 256
+    assert len(store_module._PUBLICATION_STATE_LOCKS) == 256
     assert [item.name for item in records] == ["lock-budget-survivor"]
     assert errors == ()
 
@@ -1860,9 +1871,7 @@ def test_created_publication_rollback_restores_changed_contents(tmp_path):
         store.rollback_created(folder, identity=publication)
 
     assert marker.read_text(encoding="utf-8") == "must survive"
-    assert not tuple(
-        store.local_root.glob(".changed-created-rollback.delete.*")
-    )
+    assert not tuple(store.local_root.glob(".changed-created-rollback.delete.*"))
 
 
 def test_install_rejects_generated_provenance_crossing_byte_limit(tmp_path):
@@ -2268,12 +2277,17 @@ def test_delete_pins_quarantined_folder_during_recursive_removal(tmp_path, monke
     record = source.discover()[0][0]
     displaced = tmp_path / "displaced-recursive-original"
     replacement_marker = None
-    real_rmtree = shutil.rmtree
+    real_open_directory_at = store_module._open_directory_at
     swapped = False
 
-    def swap_quarantine_before_recursive_removal(path, *args, **kwargs):
+    def swap_quarantine_before_recursive_removal(
+        parent_fd,
+        name,
+        *,
+        expected=None,
+    ):
         nonlocal replacement_marker, swapped
-        if not swapped:
+        if name.startswith(".delete-recursive-race.delete.") and not swapped:
             swapped = True
             quarantines = list(store.local_root.glob(".delete-recursive-race.delete.*"))
             assert len(quarantines) == 1
@@ -2282,24 +2296,71 @@ def test_delete_pins_quarantined_folder_during_recursive_removal(tmp_path, monke
             quarantine.mkdir()
             replacement_marker = quarantine / "replacement-must-survive.md"
             replacement_marker.write_text("replacement", encoding="utf-8")
-        return real_rmtree(path, *args, **kwargs)
+        return real_open_directory_at(parent_fd, name, expected=expected)
 
     monkeypatch.setattr(
-        store_module.shutil,
-        "rmtree",
+        store_module,
+        "_open_directory_at",
         swap_quarantine_before_recursive_removal,
     )
     try:
-        with pytest.raises(SkillPathError, match="changed during deletion"):
+        with pytest.raises(SkillPathError, match="changed after validation"):
             store.delete(record)
 
         assert replacement_marker is not None
         assert replacement_marker.read_text(encoding="utf-8") == "replacement"
         assert displaced.is_dir()
     finally:
-        real_rmtree(displaced, ignore_errors=True)
+        shutil.rmtree(displaced, ignore_errors=True)
         for quarantine in store.local_root.glob(".delete-recursive-race.delete.*"):
-            real_rmtree(quarantine, ignore_errors=True)
+            shutil.rmtree(quarantine, ignore_errors=True)
+
+
+def test_delete_preserves_nested_directory_swapped_after_identity_check(
+    tmp_path,
+    monkeypatch,
+):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("delete-nested-race", "Original", "Procedure."))
+    resources = folder / "resources"
+    resources.mkdir()
+    (resources / "original.md").write_text("original", encoding="utf-8")
+    replacement = tmp_path / "outside-replacement"
+    replacement.mkdir()
+    (replacement / "replacement.md").write_text("replacement", encoding="utf-8")
+    displaced = tmp_path / "displaced-nested-original"
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    real_rename_no_replace = store_module._rename_directory_no_replace_at
+    real_rename = os.rename
+    swapped = False
+
+    def swap_nested_before_quarantine(directory_fd, source_name, destination_name):
+        nonlocal swapped
+        if source_name == "resources" and not swapped:
+            swapped = True
+            real_rename(source_name, displaced, src_dir_fd=directory_fd)
+            real_rename(replacement, source_name, dst_dir_fd=directory_fd)
+        return real_rename_no_replace(directory_fd, source_name, destination_name)
+
+    monkeypatch.setattr(
+        store_module,
+        "_rename_directory_no_replace_at",
+        swap_nested_before_quarantine,
+    )
+
+    with pytest.raises(SkillPathError, match="nested skill entry changed"):
+        store.delete(record)
+
+    assert swapped
+    assert (displaced / "original.md").read_text(encoding="utf-8") == "original"
+    preserved = list(store.local_root.rglob("replacement.md"))
+    assert len(preserved) == 1
+    assert preserved[0].read_text(encoding="utf-8") == "replacement"
 
 
 def test_delete_preserves_quarantined_folder_if_recursive_removal_fails(
@@ -2319,10 +2380,14 @@ def test_delete_preserves_quarantined_folder_if_recursive_removal_fails(
     )
     record = source.discover()[0][0]
 
-    def fail_removal(*_args, **_kwargs):
-        raise OSError("simulated recursive removal failure")
+    real_rename_no_replace = store_module._rename_directory_no_replace_at
 
-    monkeypatch.setattr(store_module.shutil, "rmtree", fail_removal)
+    def fail_removal(directory_fd, source_name, destination_name):
+        if source_name == "resources":
+            raise OSError("simulated recursive removal failure")
+        return real_rename_no_replace(directory_fd, source_name, destination_name)
+
+    monkeypatch.setattr(store_module, "_rename_directory_no_replace_at", fail_removal)
 
     with pytest.raises(OSError, match="simulated recursive removal failure") as caught:
         store.delete(record)
@@ -2335,6 +2400,26 @@ def test_delete_preserves_quarantined_folder_if_recursive_removal_fails(
         "preserved as .delete-restore.delete." in note
         for note in caught.value.__notes__
     )
+
+
+def test_delete_accepts_a_maximum_length_resource_component(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(
+        SkillDocument("delete-long-resource", "Long resource", "Procedure.")
+    )
+    resource = folder / f"{'a' * 252}.md"
+    assert len(resource.name.encode()) == 255
+    resource.write_text("long resource", encoding="utf-8")
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+
+    store.delete(record)
+
+    assert not folder.exists()
 
 
 @pytest.mark.parametrize("operation", ("primary", "resource"))

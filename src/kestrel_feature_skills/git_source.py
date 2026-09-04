@@ -79,9 +79,7 @@ def validate_ref(ref: object) -> str:
         or "//" in ref
         or ref.endswith(("/", "."))
         or any(
-            not component
-            or component.startswith(".")
-            or component.endswith(".lock")
+            not component or component.startswith(".") or component.endswith(".lock")
             for component in components
         )
     ):

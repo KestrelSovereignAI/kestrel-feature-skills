@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -13,7 +14,11 @@ from pathlib import Path
 from types import MappingProxyType
 
 from .errors import SkillError, SkillFormatError, SkillPathError
-from .format import validate_skill_folder_descriptor, validate_skill_name
+from .format import (
+    ValidatedSkillFolder,
+    inspect_skill_folder_descriptor,
+    validate_skill_name,
+)
 from .git_source import is_full_object_id, validate_ref, validate_remote_url
 from .models import (
     CatalogSnapshot,
@@ -43,6 +48,40 @@ def _json_safe_text(value: object) -> str:
     """Preserve readable text while escaping filesystem surrogate code points."""
 
     return str(value).encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+def _folder_revision(
+    snapshot: ValidatedSkillFolder,
+    folder_identity: tuple[int, int],
+) -> str:
+    """Bind an opaque revision to one folder generation and all validated bytes."""
+
+    digest = hashlib.sha256(b"kestrel-skill-folder-revision-v1\0")
+    for value in folder_identity:
+        encoded = str(value).encode("ascii")
+        digest.update(len(encoded).to_bytes(2, "big"))
+        digest.update(encoded)
+    for entry in sorted(snapshot.entries, key=lambda item: item.path):
+        path = entry.path.encode("utf-8")
+        digest.update(len(path).to_bytes(4, "big"))
+        digest.update(path)
+        if entry.payload is None:
+            digest.update(b"D")
+            continue
+        digest.update(b"F")
+        digest.update(len(entry.payload).to_bytes(8, "big"))
+        digest.update(entry.payload)
+    return digest.hexdigest()
+
+
+def _configured_revision(content_revision: str, state: SkillState) -> str:
+    """Include mutable enablement state in the operator-visible revision."""
+
+    digest = hashlib.sha256(b"kestrel-skill-record-revision-v1\0")
+    digest.update(content_revision.encode("ascii"))
+    digest.update(b"\0enabled=" + (b"1" if state.enabled else b"0"))
+    digest.update(b"\0priority=" + str(state.priority).encode("ascii"))
+    return digest.hexdigest()
 
 
 class SkillSource(ABC):
@@ -356,10 +395,11 @@ class DirectorySkillSource(SkillSource):
                         raise SkillPathError(
                             "skill folder changed identity during discovery"
                         )
-                    document = validate_skill_folder_descriptor(
+                    snapshot = inspect_skill_folder_descriptor(
                         folder_fd,
                         folder_name=folder_name,
                     )
+                    document = snapshot.document
                     provenance = _load_provenance_at(
                         self,
                         folder_fd,
@@ -406,12 +446,12 @@ class DirectorySkillSource(SkillSource):
                         source_kind=self.kind,
                         precedence=(
                             REMOTE_PRECEDENCE
-                            if provenance.kind == "git"
-                            and self.kind == "agent-local"
+                            if provenance.kind == "git" and self.kind == "agent-local"
                             else self.precedence
                         ),
                         provenance=provenance,
                         folder_identity=folder_identity,
+                        revision=_folder_revision(snapshot, folder_identity),
                     )
                 )
         finally:
@@ -448,7 +488,11 @@ class SkillCatalog:
             key=lambda item: (item.precedence, item.name, item.source_id),
         ):
             state = states.get(record.name, SkillState())
-            configured = replace(record, state=state)
+            configured = replace(
+                record,
+                state=state,
+                revision=_configured_revision(record.revision, state),
+            )
             if record.name not in resolved:
                 resolved[record.name] = configured
             else:

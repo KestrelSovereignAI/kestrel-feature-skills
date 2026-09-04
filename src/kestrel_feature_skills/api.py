@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from kestrel_sdk.storage.database import DatabaseError
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
@@ -22,6 +22,8 @@ from .errors import (
     SkillReadOnlyError,
 )
 from .format import MAX_RESOURCE_PATH_BYTES
+
+_REVISION_PATTERN = r"^[0-9a-f]{64}$"
 
 if TYPE_CHECKING:
     from .feature import ProceduralSkillsFeature
@@ -182,12 +184,23 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
             raise _http_error(exc) from exc
 
     @router.put("/{name}/file")
-    async def write_file(name: str, request: EditFileRequest) -> dict[str, object]:
+    async def write_file(
+        name: str,
+        request: EditFileRequest,
+        expected_revision: str = Header(
+            ...,
+            alias="If-Match",
+            min_length=64,
+            max_length=64,
+            pattern=_REVISION_PATTERN,
+        ),
+    ) -> dict[str, object]:
         try:
             return await feature.edit_skill(
                 name=name,
                 relative_path=request.path,
                 content=request.content,
+                expected_revision=expected_revision,
             )
         except (
             SkillNotFoundError,
@@ -203,15 +216,27 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
             raise _http_error(exc) from exc
 
     @router.patch("/{name}/state")
-    async def set_state(name: str, request: SkillStateRequest) -> dict[str, object]:
+    async def set_state(
+        name: str,
+        request: SkillStateRequest,
+        expected_revision: str = Header(
+            ...,
+            alias="If-Match",
+            min_length=64,
+            max_length=64,
+            pattern=_REVISION_PATTERN,
+        ),
+    ) -> dict[str, object]:
         try:
             return await feature.set_skill_state(
                 name=name,
                 enabled=request.enabled,
                 priority=request.priority,
+                expected_revision=expected_revision,
             )
         except (
             SkillNotFoundError,
+            SkillConflictError,
             SkillFormatError,
             SkillPathError,
             EnablementUnavailableError,
@@ -223,15 +248,28 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
             raise _http_error(exc) from exc
 
     @router.delete("/{name}", dependencies=[Depends(enforce_destructive_op)])
-    async def delete_skill(name: str) -> dict[str, object]:
+    async def delete_skill(
+        name: str,
+        expected_revision: str = Header(
+            ...,
+            alias="If-Match",
+            min_length=64,
+            max_length=64,
+            pattern=_REVISION_PATTERN,
+        ),
+    ) -> dict[str, object]:
         # Core's server-side destructive rail is load-bearing. The package UI
         # attaches its audited opt-in header only after explicit confirmation;
         # agent-initiated deletion separately uses the ALWAYS_ASK tool rail.
         try:
-            return await feature.delete_skill(name=name)
+            return await feature.delete_skill(
+                name=name,
+                expected_revision=expected_revision,
+            )
         except (
             SkillNotFoundError,
             SkillReadOnlyError,
+            SkillConflictError,
             SkillFormatError,
             SkillPathError,
             SkillPrivacyError,

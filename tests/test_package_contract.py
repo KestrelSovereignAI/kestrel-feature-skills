@@ -65,8 +65,13 @@ def test_publish_workflow_gates_the_exact_tag_before_trusted_upload():
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     assert "uses: ./.github/workflows/ci.yml" in publish
-    assert "ref: ${{ inputs.ref || github.ref }}" in publish
-    assert 'tag_version="${tag_name#v}"' in publish
+    assert publish.count("ref: ${{ needs.resolve.outputs.sha }}") == 2
+    assert 'sha=$(git rev-parse --verify "refs/tags/$tag_name^{commit}")' in publish
+    assert "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" in publish
+    assert "Tag or commit to publish" not in publish
+    assert "if: startsWith" not in publish
+    assert 'test "$(git rev-parse HEAD)" = "$RELEASE_SHA"' in publish
+    assert 'tag_version="${RELEASE_TAG#v}"' in publish
     assert "environment: pypi" in publish
     assert "id-token: write" in publish
     assert "workflow_call:" in ci

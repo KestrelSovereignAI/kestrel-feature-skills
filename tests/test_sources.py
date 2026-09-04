@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -432,23 +433,23 @@ def test_discovery_rejects_folder_moved_outside_root_then_replaced_by_symlink(
     outside.mkdir()
     folder = make_skill(local, "raced", "Race containment")
     moved = outside / folder.name
-    real_validate = sources_module.validate_skill_folder_descriptor
+    real_inspect = sources_module.inspect_skill_folder_descriptor
     swapped = False
 
-    def validate_then_swap(descriptor, *, folder_name):
+    def inspect_then_swap(descriptor, *, folder_name):
         nonlocal swapped
-        document = real_validate(descriptor, folder_name=folder_name)
+        snapshot = real_inspect(descriptor, folder_name=folder_name)
         if folder_name == folder.name and not swapped:
             candidate = local / folder_name
             candidate.rename(moved)
             candidate.symlink_to(moved, target_is_directory=True)
             swapped = True
-        return document
+        return snapshot
 
     monkeypatch.setattr(
         sources_module,
-        "validate_skill_folder_descriptor",
-        validate_then_swap,
+        "inspect_skill_folder_descriptor",
+        inspect_then_swap,
     )
 
     snapshot = catalog(local, shared).refresh()
@@ -458,6 +459,33 @@ def test_discovery_rejects_folder_moved_outside_root_then_replaced_by_symlink(
     assert any(
         word in snapshot.errors[0].error for word in ("changed", "escape", "symlink")
     )
+
+
+def test_record_revision_binds_folder_generation_content_and_state(tmp_path):
+    local = tmp_path / "local"
+    shared = tmp_path / "shared"
+    local.mkdir()
+    shared.mkdir()
+    folder = make_skill(local, "revision-bound", "Revision bound")
+    source_catalog = catalog(local, shared)
+
+    initial = source_catalog.refresh().by_name()["revision-bound"].revision
+    (folder / "notes.md").write_text("notes", encoding="utf-8")
+    content_changed = source_catalog.refresh().by_name()["revision-bound"].revision
+    enabled = (
+        source_catalog.refresh({"revision-bound": SkillState(True, 7)})
+        .by_name()["revision-bound"]
+        .revision
+    )
+    shutil.rmtree(folder)
+    folder = make_skill(local, "revision-bound", "Revision bound")
+    (folder / "notes.md").write_text("notes", encoding="utf-8")
+    recreated = source_catalog.refresh().by_name()["revision-bound"].revision
+
+    assert all(
+        len(value) == 64 for value in (initial, content_changed, enabled, recreated)
+    )
+    assert len({initial, content_changed, enabled, recreated}) == 4
 
 
 def test_source_root_disappearing_during_resolution_is_a_visible_error(
@@ -704,9 +732,7 @@ def test_git_source_rejects_git_invalid_ref_spellings(ref):
 
 
 @pytest.mark.parametrize("object_id_length", (40, 64))
-def test_git_source_detects_when_recorded_commit_changes(
-    monkeypatch, object_id_length
-):
+def test_git_source_detects_when_recorded_commit_changes(monkeypatch, object_id_length):
     revisions = iter(("a" * object_id_length, "b" * object_id_length))
 
     def fake_git(argv, *, timeout=120):

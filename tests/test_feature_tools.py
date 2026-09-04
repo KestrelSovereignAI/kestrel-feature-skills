@@ -682,9 +682,9 @@ async def test_unknown_state_update_does_not_create_publication_claim(
         await feature.set_skill_state(name="never-published", enabled=True)
 
     assert attempted_claims == []
-    assert not (
-        feature._store._internal_root / ".never-published.publication-state.lock"
-    ).exists()
+    assert not list(
+        feature._store._internal_root.glob(".publication-state-bucket-*.lock")
+    )
 
 
 @pytest.mark.asyncio

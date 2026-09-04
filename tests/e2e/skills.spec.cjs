@@ -17,8 +17,31 @@ function headers(extra = {}) {
   };
 }
 
+async function catalogSkill(request, name) {
+  const response = await request.get(API_ROOT, { headers: headers() });
+  expect(response.ok(), await response.text()).toBeTruthy();
+  return (await response.json()).skills.find((skill) => skill.name === name) || null;
+}
+
+async function deleteFixture(request, name) {
+  const skill = await catalogSkill(request, name);
+  if (!skill?.delete_revision) return null;
+  return request.delete(`${API_ROOT}/${name}`, {
+    headers: headers({ 'If-Match': skill.delete_revision }),
+  });
+}
+
+async function patchState(request, name, data) {
+  const skill = await catalogSkill(request, name);
+  expect(skill, `expected ${name} in catalog before state mutation`).not.toBeNull();
+  return request.patch(`${API_ROOT}/${name}/state`, {
+    headers: headers({ 'If-Match': skill.revision }),
+    data,
+  });
+}
+
 async function resetFixture(request) {
-  await request.delete(`${API_ROOT}/${SKILL_NAME}`, { headers: headers() });
+  await deleteFixture(request, SKILL_NAME);
   const created = await request.post(API_ROOT, {
     headers: headers(),
     data: {
@@ -29,8 +52,9 @@ async function resetFixture(request) {
     },
   });
   expect(created.ok(), await created.text()).toBeTruthy();
+  const skill = await catalogSkill(request, SKILL_NAME);
   const script = await request.put(`${API_ROOT}/${SKILL_NAME}/file`, {
-    headers: headers(),
+    headers: headers({ 'If-Match': skill.revision }),
     data: {
       path: 'scripts/risk.py',
       content: 'raise RuntimeError("must never execute from the editor")\n',
@@ -78,7 +102,7 @@ test.describe.serial('procedural skills contributed console', () => {
   });
 
   test.afterAll(async ({ request }) => {
-    await request.delete(`${API_ROOT}/${SKILL_NAME}`, { headers: headers() });
+    await deleteFixture(request, SKILL_NAME);
   });
 
   test('navigator renders the folder tree and opens SKILL.md', async ({ page }) => {
@@ -97,7 +121,7 @@ test.describe.serial('procedural skills contributed console', () => {
 
   test('admin add creates a disabled skill through the modal', async ({ page, request }) => {
     const name = 'e2e-added';
-    await request.delete(`${API_ROOT}/${name}`, { headers: headers() });
+    await deleteFixture(request, name);
     try {
       await openPanel(page);
       await page.getByTestId('skills-add').click();
@@ -112,7 +136,7 @@ test.describe.serial('procedural skills contributed console', () => {
       const created = (await catalog.json()).skills.find((skill) => skill.name === name);
       expect(created.enabled).toBe(false);
     } finally {
-      await request.delete(`${API_ROOT}/${name}`, { headers: headers() });
+      await deleteFixture(request, name);
     }
   });
 
@@ -159,7 +183,7 @@ test.describe.serial('procedural skills contributed console', () => {
     const first = 'e2e-race-first';
     const second = 'e2e-race-second';
     for (const [name, description] of [[first, 'First race sentinel'], [second, 'Second race sentinel']]) {
-      await request.delete(`${API_ROOT}/${name}`, { headers: headers() });
+      await deleteFixture(request, name);
       const created = await request.post(API_ROOT, {
         headers: headers(),
         data: { name, description, body: `# Procedure\n\n${description}`, enabled: false },
@@ -201,8 +225,8 @@ test.describe.serial('procedural skills contributed console', () => {
     } finally {
       releaseRead?.();
       await page.unrouteAll({ behavior: 'ignoreErrors' });
-      await request.delete(`${API_ROOT}/${first}`, { headers: headers() });
-      await request.delete(`${API_ROOT}/${second}`, { headers: headers() });
+      await deleteFixture(request, first);
+      await deleteFixture(request, second);
     }
   });
 
@@ -318,10 +342,7 @@ test.describe.serial('procedural skills contributed console', () => {
   });
 
   test('catalog refresh updates selected state controls without losing the editor', async ({ page, request }) => {
-    await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
-      headers: headers(),
-      data: { enabled: false, priority: 100 },
-    });
+    await patchState(request, SKILL_NAME, { enabled: false, priority: 100 });
     await openPanel(page);
     await page.getByRole('button', { name: SKILL_NAME }).click();
     await page.getByRole('button', { name: 'SKILL.md' }).click();
@@ -329,10 +350,11 @@ test.describe.serial('procedural skills contributed console', () => {
     const unsaved = `${await editor.inputValue()}\nUNSAVED-REFRESHED-STATE-SENTINEL\n`;
     await editor.fill(unsaved);
     try {
-      const externalUpdate = await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
-        headers: headers(),
-        data: { enabled: true, priority: 23 },
-      });
+      const externalUpdate = await patchState(
+        request,
+        SKILL_NAME,
+        { enabled: true, priority: 23 },
+      );
       expect(externalUpdate.ok(), await externalUpdate.text()).toBeTruthy();
       await page.evaluate(() => {
         globalThis.dispatchEvent(new CustomEvent('capabilities:changed'));
@@ -350,18 +372,12 @@ test.describe.serial('procedural skills contributed console', () => {
       expect(skill.enabled).toBe(true);
       expect(skill.priority).toBe(37);
     } finally {
-      await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
-        headers: headers(),
-        data: { enabled: false, priority: 100 },
-      });
+      await patchState(request, SKILL_NAME, { enabled: false, priority: 100 });
     }
   });
 
   test('state controls stay serialized while an update is in flight', async ({ page, request }) => {
-    await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
-      headers: headers(),
-      data: { enabled: false, priority: 100 },
-    });
+    await patchState(request, SKILL_NAME, { enabled: false, priority: 100 });
     await openPanel(page);
     await page.getByRole('button', { name: SKILL_NAME }).click();
     let releasePatch;
@@ -392,16 +408,13 @@ test.describe.serial('procedural skills contributed console', () => {
     } finally {
       releasePatch();
       await page.unrouteAll({ behavior: 'ignoreErrors' });
-      await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
-        headers: headers(),
-        data: { enabled: false, priority: 100 },
-      });
+      await patchState(request, SKILL_NAME, { enabled: false, priority: 100 });
     }
   });
 
   test('state completion preserves a newer skill selection and unsaved edit', async ({ page, request }) => {
     const newer = 'e2e-state-race-newer';
-    await request.delete(`${API_ROOT}/${newer}`, { headers: headers() });
+    await deleteFixture(request, newer);
     await request.post(API_ROOT, {
       headers: headers(),
       data: {
@@ -411,10 +424,7 @@ test.describe.serial('procedural skills contributed console', () => {
         enabled: false,
       },
     });
-    await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
-      headers: headers(),
-      data: { enabled: false, priority: 100 },
-    });
+    await patchState(request, SKILL_NAME, { enabled: false, priority: 100 });
     await openPanel(page);
     await page.getByRole('button', { name: SKILL_NAME }).click();
     let releasePatch;
@@ -442,11 +452,8 @@ test.describe.serial('procedural skills contributed console', () => {
     } finally {
       releasePatch();
       await page.unrouteAll({ behavior: 'ignoreErrors' });
-      await request.patch(`${API_ROOT}/${SKILL_NAME}/state`, {
-        headers: headers(),
-        data: { enabled: false, priority: 100 },
-      });
-      await request.delete(`${API_ROOT}/${newer}`, { headers: headers() });
+      await patchState(request, SKILL_NAME, { enabled: false, priority: 100 });
+      await deleteFixture(request, newer);
     }
   });
 
@@ -539,6 +546,64 @@ test.describe.serial('procedural skills contributed console', () => {
       await expect(page.getByRole('button', { name })).toBeVisible();
     } finally {
       await fs.rm(folder, { recursive: true, force: true });
+    }
+  });
+
+  test('stale delete approval cannot remove a same-named replacement', async ({ page, request }) => {
+    await openPanel(page);
+    await page.getByRole('button', { name: SKILL_NAME }).click();
+    await page.getByRole('button', { name: 'Delete', exact: true }).click();
+    const dialog = page.getByTestId('skills-delete-approval');
+    await expect(dialog).toBeVisible();
+    await deleteFixture(request, SKILL_NAME);
+    const replacement = await request.post(API_ROOT, {
+      headers: headers(),
+      data: {
+        name: SKILL_NAME,
+        description: 'Replacement must survive stale approval',
+        body: '# Procedure\n\nReplacement.',
+        enabled: false,
+      },
+    });
+    expect(replacement.ok(), await replacement.text()).toBeTruthy();
+    try {
+      await dialog.getByTestId('skills-delete-confirm').click();
+      await expect(dialog).not.toBeVisible();
+      await expect(page.locator('[role="status"]')).toContainText('changed before deletion');
+      const preserved = await catalogSkill(request, SKILL_NAME);
+      expect(preserved.description).toBe('Replacement must survive stale approval');
+    } finally {
+      await resetFixture(request);
+    }
+  });
+
+  test('partial cleanup is visibly reported as an error', async ({ page }) => {
+    await openPanel(page);
+    await page.getByRole('button', { name: SKILL_NAME }).click();
+    await page.route(new RegExp(`${API_ROOT}/${SKILL_NAME}$`), async (route) => {
+      if (route.request().method() !== 'DELETE') return route.continue();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          name: SKILL_NAME,
+          removed_file: true,
+          config_deleted: false,
+          graph_deleted: false,
+          errors: ['enablement row cleanup failed', 'graph index cleanup failed'],
+          resolved_skill_retained: false,
+          remaining_source_kind: null,
+        }),
+      });
+    });
+    try {
+      await page.getByRole('button', { name: 'Delete', exact: true }).click();
+      await page.getByTestId('skills-delete-confirm').click();
+      await expect(page.locator('[role="status"]')).toContainText('cleanup is incomplete');
+      await expect(page.locator('[role="status"]')).toContainText('graph index cleanup failed');
+      await expect(page.getByRole('button', { name: SKILL_NAME })).toBeVisible();
+    } finally {
+      await page.unrouteAll({ behavior: 'ignoreErrors' });
     }
   });
 

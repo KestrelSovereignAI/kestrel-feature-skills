@@ -91,6 +91,34 @@ def _usage_snapshot(
     )
 
 
+def _skill_record(
+    client: httpx.Client,
+    base: str,
+    name: str,
+) -> dict[str, object] | None:
+    response = client.get(base)
+    assert response.status_code == 200, response.text
+    return next(
+        (item for item in response.json()["skills"] if item["name"] == name),
+        None,
+    )
+
+
+def _revision_headers(
+    client: httpx.Client,
+    base: str,
+    name: str,
+    *,
+    deletion: bool = False,
+) -> dict[str, str]:
+    record = _skill_record(client, base, name)
+    assert record is not None, f"{name} is absent from the live catalog"
+    field = "delete_revision" if deletion else "revision"
+    revision = record[field]
+    assert isinstance(revision, str) and len(revision) == 64
+    return {"If-Match": revision}
+
+
 def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
     hosted_identity = (str(KITE_HOSTED_PROVIDER), str(KITE_HOSTED_MODEL))
     assert hosted_identity in _ALLOWED_HOSTED_MODELS, (
@@ -126,6 +154,8 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-malformed-paren-nested",
         "kite-script-autolink",
         "kite-container-link",
+        "kite-list-quote-reference",
+        "kite-lazy-quote-link",
         "kite-literal-separator",
         "kite-fence-exit",
         "kite-list-reference",
@@ -176,9 +206,15 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         )
         assert onboarding.status_code == 200, onboarding.text
         assert "GENESIS AUDIT PENDING" not in onboarding.json()["response"]
+        existing = _skill_record(client, base, name)
         client.delete(
             f"{base}/{name}",
-            headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
+            headers={
+                "If-Match": (
+                    str(existing["delete_revision"]) if existing else "0" * 64
+                ),
+                "X-Kestrel-Allow-Destructive": "kite-test-cleanup",
+            },
         )
         response = client.post(
             base,
@@ -192,6 +228,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert response.status_code == 200, response.text
         resource = client.put(
             f"{base}/{name}/file",
+            headers=_revision_headers(client, base, name),
             json={"path": "references.md", "content": resource_body},
         )
         assert resource.status_code == 200, resource.text
@@ -199,6 +236,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert len(long_resource.encode("utf-8")) == 255
         long_resource_write = client.put(
             f"{base}/{name}/file",
+            headers=_revision_headers(client, base, name),
             json={"path": long_resource, "content": "LONG-RESOURCE-KITE-3018"},
         )
         assert long_resource_write.status_code == 200, long_resource_write.text
@@ -259,6 +297,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
 
         enabled = client.patch(
             f"{base}/{name}/state",
+            headers=_revision_headers(client, base, name),
             json={"enabled": True, "priority": 7},
         )
         assert enabled.status_code == 200, enabled.text
@@ -271,6 +310,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
 
         hostile_disabled = client.patch(
             f"{base}/{name}/state",
+            headers=_revision_headers(client, base, name),
             json={"enabled": False, "priority": 7},
         )
         assert hostile_disabled.status_code == 200, hostile_disabled.text
@@ -396,7 +436,15 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert hosted_read_body in hosted_read_command.json()["response"]
         hosted_read_deleted = client.delete(
             f"{base}/{hosted_read_name}",
-            headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
+            headers={
+                **_revision_headers(
+                    client,
+                    base,
+                    hosted_read_name,
+                    deletion=True,
+                ),
+                "X-Kestrel-Allow-Destructive": "kite-test-cleanup",
+            },
         )
         assert hosted_read_deleted.status_code == 200, hosted_read_deleted.text
 
@@ -558,6 +606,22 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             '---\nname: "kite-container-link"\n'
             'description: "Container reference attempt"\n---\n\n'
             "> [bad]: javascript:alert(1)\n>\n> [click][bad]\n",
+            encoding="utf-8",
+        )
+        list_quote_folder = root / "kite-list-quote-reference"
+        list_quote_folder.mkdir()
+        (list_quote_folder / "SKILL.md").write_text(
+            '---\nname: "kite-list-quote-reference"\n'
+            'description: "Alternating container escape attempt"\n---\n\n'
+            "[open][bad]\n\n- > [bad]: ../kite-outside.md\n",
+            encoding="utf-8",
+        )
+        lazy_quote_folder = root / "kite-lazy-quote-link"
+        lazy_quote_folder.mkdir()
+        (lazy_quote_folder / "SKILL.md").write_text(
+            '---\nname: "kite-lazy-quote-link"\n'
+            'description: "Lazy blockquote escape attempt"\n---\n\n'
+            "> paragraph\n    [outside](../kite-outside.md)\n",
             encoding="utf-8",
         )
         literal_separator_folder = root / "kite-literal-separator"
@@ -781,6 +845,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             )
         bounded_edit = client.put(
             f"{base}/{bounded_edit_name}/file",
+            headers={"If-Match": bounded_create.json()["revision"]},
             json={"path": "notes.md", "content": "must not publish"},
         )
         assert bounded_edit.status_code == 422, bounded_edit.text
@@ -814,6 +879,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         overlong_path = "a" * 1025
         overlong_write = client.put(
             f"{base}/{name}/file",
+            headers=_revision_headers(client, base, name),
             json={"path": overlong_path, "content": "must not be written"},
         )
         overlong_read = client.get(
@@ -824,21 +890,25 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
 
         invalid_state = client.patch(
             f"{base}/INVALID!/state",
+            headers={"If-Match": "0" * 64},
             json={"enabled": True},
         )
         assert invalid_state.status_code == 422, invalid_state.text
 
         unknown_name = "kite-never-published-state"
-        unknown_claim = (
-            root / ".kestrel-internal" / f".{unknown_name}.publication-state.lock"
+        unknown_claims_before = set(
+            (root / ".kestrel-internal").glob(".publication-state-bucket-*.lock")
         )
-        unknown_claim.unlink(missing_ok=True)
         unknown_state = client.patch(
             f"{base}/{unknown_name}/state",
+            headers={"If-Match": "0" * 64},
             json={"enabled": True},
         )
         assert unknown_state.status_code == 404, unknown_state.text
-        assert not unknown_claim.exists()
+        assert (
+            set((root / ".kestrel-internal").glob(".publication-state-bucket-*.lock"))
+            == unknown_claims_before
+        )
 
         invalid_git_url = client.post(
             f"{base}/install",
@@ -879,6 +949,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
 
         disabled = client.patch(
             f"{base}/{name}/state",
+            headers=_revision_headers(client, base, name),
             json={"enabled": False, "priority": 7},
         )
         assert disabled.status_code == 200, disabled.text
@@ -914,17 +985,31 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
 
         deleted = client.delete(
             f"{base}/{name}",
-            headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
+            headers={
+                **_revision_headers(client, base, name, deletion=True),
+                "X-Kestrel-Allow-Destructive": "kite-test-cleanup",
+            },
         )
         assert deleted.status_code == 200, deleted.text
         hidden_cleanup = client.delete(
             f"{base}/{hidden_retry_name}",
-            headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
+            headers={
+                **_revision_headers(
+                    client,
+                    base,
+                    hidden_retry_name,
+                    deletion=True,
+                ),
+                "X-Kestrel-Allow-Destructive": "kite-test-cleanup",
+            },
         )
         assert hidden_cleanup.status_code == 200, hidden_cleanup.text
         bounded_cleanup = client.delete(
             f"{base}/{bounded_edit_name}",
-            headers={"X-Kestrel-Allow-Destructive": "kite-test-cleanup"},
+            headers={
+                "If-Match": "0" * 64,
+                "X-Kestrel-Allow-Destructive": "kite-test-cleanup",
+            },
         )
         assert bounded_cleanup.status_code == 404, bounded_cleanup.text
         shutil.rmtree(root / bounded_edit_name, ignore_errors=True)

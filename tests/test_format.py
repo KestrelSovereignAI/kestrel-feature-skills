@@ -401,6 +401,25 @@ def test_reference_definitions_inside_markdown_containers_are_validated(tmp_path
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "destination",
+    ("../outside.md", "javascript:alert(1)"),
+)
+def test_reference_definition_inside_alternating_list_quote_is_validated(
+    tmp_path,
+    destination,
+):
+    value = SkillDocument(
+        "alternating-container-link",
+        "Alternating list and quote",
+        f"[open][bad]\n\n- > [bad]: {destination}",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_reference_definitions_inside_container_fences_remain_literal(tmp_path):
     value = SkillDocument(
         "container-code",
@@ -1125,6 +1144,36 @@ def test_indented_live_autolink_is_not_mistaken_for_a_code_block(tmp_path):
 
     with pytest.raises(SkillPathError, match="unsupported link scheme"):
         validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "continuation",
+    ("[outside](../secret.md)", "<javascript:alert(1)>"),
+)
+def test_indented_lazy_blockquote_continuation_is_validated(
+    tmp_path,
+    continuation,
+):
+    value = SkillDocument(
+        "quote-lazy-link",
+        "Lazy blockquote continuation",
+        f"> paragraph\n    {continuation}",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_indented_link_after_blank_blockquote_paragraph_remains_literal_code(tmp_path):
+    value = SkillDocument(
+        "quote-code-control",
+        "Indented code control",
+        "> paragraph\n\n    [literal](../secret.md)",
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
 
 
 def test_escaped_backtick_does_not_hide_a_live_markdown_link(tmp_path):

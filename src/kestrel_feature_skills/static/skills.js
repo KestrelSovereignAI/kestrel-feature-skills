@@ -190,24 +190,44 @@ function buildDeleteDialog() {
   const cancel = button('Cancel', () => dialog.close('cancel'));
   const approve = button('Delete permanently', async () => {
     const name = dialog.dataset.skill;
-    if (!name) return;
+    const revision = dialog.dataset.revision;
+    if (!name || !revision) return;
     const agent = currentAgent();
     try {
       const result = await request(`/${encodeURIComponent(name)}`, {
         method: 'DELETE',
-        headers: { 'X-Kestrel-Allow-Destructive': 'operator-confirmed-ui' },
+        headers: {
+          'If-Match': revision,
+          'X-Kestrel-Allow-Destructive': 'operator-confirmed-ui',
+        },
       });
       if (currentAgent() !== agent) return;
       dialog.close('approved');
+      delete dialog.dataset.skill;
+      delete dialog.dataset.revision;
       clearSelection();
       await loadCatalog();
       if (currentAgent() === agent) {
-        setStatus(result.resolved_skill_retained
-          ? `Deleted the local installation for ${name}; ${result.remaining_source_kind} remains resolved.`
-          : `Deleted ${name}.`);
+        const cleanupErrors = Array.isArray(result.errors) ? result.errors : [];
+        if (cleanupErrors.length) {
+          setStatus(
+            `Deleted the authoritative folder for ${name}, but cleanup is incomplete: ${cleanupErrors.join('; ')}`,
+            true,
+          );
+        } else {
+          setStatus(result.resolved_skill_retained
+            ? `Deleted the local installation for ${name}; ${result.remaining_source_kind} remains resolved.`
+            : `Deleted ${name}.`);
+        }
       }
     } catch (error) {
-      if (currentAgent() === agent) setStatus(detail(error), true);
+      if (currentAgent() === agent) {
+        dialog.close('rejected');
+        delete dialog.dataset.skill;
+        delete dialog.dataset.revision;
+        await loadCatalog();
+        if (currentAgent() === agent) setStatus(detail(error), true);
+      }
     }
   }, 'skills-button skills-danger');
   approve.dataset.testid = 'skills-delete-confirm';
@@ -430,6 +450,7 @@ async function openFile(path) {
       || currentAgent() !== owner.agent
     ) return;
     state.path = path;
+    owner.revision = file.revision;
     state.editorOwner = owner;
     state.ui.editor.value = file.content;
     state.ui.editor.disabled = !file.editable;
@@ -460,9 +481,12 @@ async function saveFile() {
   const content = state.ui.editor.value;
   state.ui.save.disabled = true;
   try {
-    await request(`/${encodeURIComponent(owner.name)}/file`, {
+    const result = await request(`/${encodeURIComponent(owner.name)}/file`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'If-Match': owner.revision,
+      },
       body: JSON.stringify({ path: owner.path, content }),
     });
     if (
@@ -470,6 +494,7 @@ async function saveFile() {
       || state.selected !== owner.name
       || currentAgent() !== owner.agent
     ) return;
+    owner.revision = result.revision;
     await loadCatalog();
     if (state.editorOwner === owner && currentAgent() === owner.agent) {
       state.ui.save.disabled = false;
@@ -497,7 +522,10 @@ async function setEnabled(skill, enabled, priority = null) {
   try {
     await request(`/${encodeURIComponent(skill.name)}/state`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'If-Match': skill.revision,
+      },
       body: JSON.stringify({ enabled, priority }),
     });
     if (currentAgent() !== agent) return;
@@ -527,6 +555,7 @@ async function setEnabled(skill, enabled, priority = null) {
 function confirmDelete(skill) {
   if (!skill.deletable || !state.ui) return;
   state.ui.deleteDialog.dataset.skill = skill.name;
+  state.ui.deleteDialog.dataset.revision = skill.delete_revision;
   state.ui.deleteDialog.showModal();
 }
 
@@ -616,6 +645,7 @@ bus.on('agent:switch', (payload) => {
   if (state.ui?.createDialog.open) state.ui.createDialog.close('agent-switch');
   if (state.ui?.deleteDialog.open) state.ui.deleteDialog.close('agent-switch');
   if (state.ui?.deleteDialog) delete state.ui.deleteDialog.dataset.skill;
+  if (state.ui?.deleteDialog) delete state.ui.deleteDialog.dataset.revision;
   clearSelection();
   renderCatalog();
   syncNav();

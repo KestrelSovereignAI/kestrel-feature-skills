@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import fcntl
+import hashlib
 import os
 import shutil
 import stat
@@ -52,12 +53,11 @@ INTERNAL_DIRECTORY = ".kestrel-internal"
 GIT_CHECKOUT_PREFIX = ".kestrel-skill-git-"
 GIT_CHECKOUT_LOCK = ".checkout-owner.lock"
 MAX_EDITOR_FILE_BYTES = 262_144
-_MUTATION_LOCKS: dict[tuple[str, str], threading.RLock] = {}
-_MUTATION_LOCKS_GUARD = threading.Lock()
+NAME_LOCK_BUCKETS = 256
+_MUTATION_LOCKS = tuple(threading.RLock() for _ in range(NAME_LOCK_BUCKETS))
 _SOURCE_PUBLICATION_LOCKS: dict[str, threading.RLock] = {}
 _SOURCE_PUBLICATION_LOCKS_GUARD = threading.Lock()
-_PUBLICATION_STATE_LOCKS: dict[tuple[str, str], threading.Lock] = {}
-_PUBLICATION_STATE_LOCKS_GUARD = threading.Lock()
+_PUBLICATION_STATE_LOCKS = tuple(threading.Lock() for _ in range(NAME_LOCK_BUCKETS))
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_DIRECTORY", 0)
@@ -70,6 +70,23 @@ def has_python_execution_risk(relative_path: str) -> bool:
     """Return whether a resource suffix can conventionally denote Python code."""
 
     return Path(relative_path).suffix.casefold() == ".py"
+
+
+def _name_lock_bucket(root: Path, name: str, *, domain: str) -> int:
+    material = f"{domain}\0{root}\0{name}".encode()
+    return (
+        int.from_bytes(hashlib.sha256(material).digest()[:2], "big") % NAME_LOCK_BUCKETS
+    )
+
+
+def _mutation_lock_name(root: Path, name: str) -> str:
+    bucket = _name_lock_bucket(root, name, domain="mutation")
+    return f".mutation-bucket-{bucket:03d}.lock"
+
+
+def _publication_state_lock_name(root: Path, name: str) -> str:
+    bucket = _name_lock_bucket(root, name, domain="publication-state")
+    return f".publication-state-bucket-{bucket:03d}.lock"
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,9 +198,9 @@ def _serialized_skill_mutation(
 ):
     """Serialize validation and publication across threads and processes."""
 
-    key = (str(root), validate_skill_name(name))
-    with _MUTATION_LOCKS_GUARD:
-        thread_lock = _MUTATION_LOCKS.setdefault(key, threading.RLock())
+    name = validate_skill_name(name)
+    bucket = _name_lock_bucket(root, name, domain="mutation")
+    thread_lock = _MUTATION_LOCKS[bucket]
     with thread_lock:
         root_fd = _open_directory(root, expected=root_identity)
         try:
@@ -192,7 +209,7 @@ def _serialized_skill_mutation(
                 expected=internal_root_identity,
             )
             try:
-                lock_name = f".{name}.mutation.lock"
+                lock_name = _mutation_lock_name(root, name)
                 flags = (
                     os.O_RDWR
                     | os.O_CREAT
@@ -663,10 +680,29 @@ def _remove_quarantined_directory_at(
         descriptor = _open_directory_at(root_fd, quarantine, expected=expected)
         for entry in os.listdir(descriptor):
             value = os.stat(entry, dir_fd=descriptor, follow_symlinks=False)
+            entry_identity = (value.st_dev, value.st_ino)
+            # A valid resource component can already occupy NAME_MAX bytes.
+            # Keep recovery names independent of attacker-controlled length.
+            detached = f".kestrel-delete-{uuid.uuid4().hex}"
+            _rename_directory_no_replace_at(descriptor, entry, detached)
+            if _identity_at(descriptor, detached) != entry_identity:
+                raise SkillPathError(
+                    "nested skill entry changed during deletion; "
+                    f"its replacement was preserved as {detached}"
+                )
             if stat.S_ISDIR(value.st_mode):
-                shutil.rmtree(entry, dir_fd=descriptor)
+                _remove_quarantined_directory_at(
+                    descriptor,
+                    detached,
+                    expected=entry_identity,
+                )
             else:
-                os.unlink(entry, dir_fd=descriptor)
+                if _identity_at(descriptor, detached) != entry_identity:
+                    raise SkillPathError(
+                        "nested skill file changed during deletion; "
+                        f"its replacement was preserved as {detached}"
+                    )
+                os.unlink(detached, dir_fd=descriptor)
         if _identity_at(root_fd, quarantine) != expected:
             raise SkillPathError(
                 "quarantined skill folder changed during deletion; "
@@ -735,7 +771,9 @@ def _open_parent_at(
                     pass
                 else:
                     try:
-                        created = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+                        created = os.stat(
+                            part, dir_fd=descriptor, follow_symlinks=False
+                        )
                     except OSError as exc:
                         raise SkillPathError(
                             "new skill path parent could not be inspected"
@@ -761,10 +799,14 @@ def _open_parent_at(
             if not stat.S_ISDIR(value.st_mode):
                 os.close(child)
                 raise SkillPathError("skill path parent is not a directory")
-            if created_identity is not None and (
-                value.st_dev,
-                value.st_ino,
-            ) != created_identity:
+            if (
+                created_identity is not None
+                and (
+                    value.st_dev,
+                    value.st_ino,
+                )
+                != created_identity
+            ):
                 os.close(child)
                 raise SkillPathError("new skill path parent changed during creation")
             os.close(descriptor)
@@ -1239,9 +1281,12 @@ class SkillStore:
         """Try to claim one name across state guards and filesystem publication."""
 
         name = validate_skill_name(name)
-        key = (str(self.local_root), name)
-        with _PUBLICATION_STATE_LOCKS_GUARD:
-            thread_lock = _PUBLICATION_STATE_LOCKS.setdefault(key, threading.Lock())
+        bucket = _name_lock_bucket(
+            self.local_root,
+            name,
+            domain="publication-state",
+        )
+        thread_lock = _PUBLICATION_STATE_LOCKS[bucket]
         if not thread_lock.acquire(blocking=False):
             return None
 
@@ -1259,7 +1304,7 @@ class SkillStore:
                 self._internal_root,
                 expected=self._internal_root_identity,
             )
-            lock_name = f".{name}.publication-state.lock"
+            lock_name = _publication_state_lock_name(self.local_root, name)
             flags = (
                 os.O_RDWR
                 | os.O_CREAT
@@ -2158,6 +2203,7 @@ __all__ = [
     "CLAIM_STALENESS_SECONDS",
     "INTERNAL_DIRECTORY",
     "MAX_EDITOR_FILE_BYTES",
+    "NAME_LOCK_BUCKETS",
     "SkillStore",
     "atomic_replace_file",
     "atomic_write_primary",

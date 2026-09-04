@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from pathlib import Path
 
 import httpx
@@ -13,7 +14,16 @@ from kestrel_feature_skills.errors import (
     SkillConflictError,
     SkillPathError,
 )
-from kestrel_feature_skills.format import MAX_RESOURCE_PATH_BYTES
+from kestrel_feature_skills.format import (
+    MAX_RESOURCE_PATH_BYTES,
+    serialize_skill_markdown,
+)
+from kestrel_feature_skills.models import SkillDocument
+
+
+async def _record(client, name):
+    catalog = (await client.get("/api/procedural-skills")).json()
+    return next(item for item in catalog["skills"] if item["name"] == name)
 
 
 @pytest.fixture
@@ -56,6 +66,7 @@ async def test_catalog_create_tree_open_edit_round_trip(client):
     content = opened.json()["content"].replace("Original.", "Edited.")
     saved = await client.put(
         "/api/procedural-skills/console/file",
+        headers={"If-Match": opened.json()["revision"]},
         json={"path": "SKILL.md", "content": content},
     )
     assert saved.status_code == 200, saved.text
@@ -74,6 +85,7 @@ async def test_invalid_frontmatter_rejected_at_save_with_visible_reason(client):
     )
     response = await client.put(
         "/api/procedural-skills/invalid-save/file",
+        headers={"If-Match": (await _record(client, "invalid-save"))["revision"]},
         json={"path": "SKILL.md", "content": "---\nname: invalid-save\n---\nbody"},
     )
     assert response.status_code == 422
@@ -91,6 +103,7 @@ async def test_edit_api_maps_concurrent_writer_conflict_to_409(
 
     response = await client.put(
         "/api/procedural-skills/conflicted/file",
+        headers={"If-Match": "0" * 64},
         json={"path": "SKILL.md", "content": "replacement"},
     )
 
@@ -183,6 +196,7 @@ async def test_api_read_and_write_share_the_validated_resource_path_cap(client):
 
     written = await client.put(
         "/api/procedural-skills/bounded-path/file",
+        headers={"If-Match": (await _record(client, "bounded-path"))["revision"]},
         json={"path": overlong, "content": "notes"},
     )
     opened = await client.get(
@@ -207,6 +221,7 @@ async def test_python_route_saves_text_and_reports_risk_without_execution(
     source = f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n"
     saved = await client.put(
         "/api/procedural-skills/python-risk/file",
+        headers={"If-Match": (await _record(client, "python-risk"))["revision"]},
         json={"path": "scripts/danger.py", "content": source},
     )
     assert saved.status_code == 200, saved.text
@@ -227,6 +242,7 @@ async def test_file_read_rejects_symlink_added_after_catalog_discovery(client, f
     )
     saved = await client.put(
         "/api/procedural-skills/late-link/file",
+        headers={"If-Match": (await _record(client, "late-link"))["revision"]},
         json={"path": "scripts/tool.py", "content": "SECRET = True\n"},
     )
     assert saved.status_code == 200, saved.text
@@ -351,6 +367,7 @@ async def test_state_endpoint_changes_context_breakdown(client):
     )
     enabled = await client.patch(
         "/api/procedural-skills/context/state",
+        headers={"If-Match": (await _record(client, "context"))["revision"]},
         json={"enabled": True, "priority": 3},
     )
     assert enabled.status_code == 200
@@ -360,6 +377,7 @@ async def test_state_endpoint_changes_context_breakdown(client):
     assert "secret body" not in catalog["context"]["text"]
     await client.patch(
         "/api/procedural-skills/context/state",
+        headers={"If-Match": (await _record(client, "context"))["revision"]},
         json={"enabled": False},
     )
     assert (await client.get("/api/procedural-skills")).json()["context"]["text"] == ""
@@ -369,6 +387,7 @@ async def test_state_endpoint_changes_context_breakdown(client):
 async def test_state_endpoint_maps_invalid_skill_name_to_422(client):
     response = await client.patch(
         "/api/procedural-skills/INVALID!/state",
+        headers={"If-Match": "0" * 64},
         json={"enabled": True},
     )
 
@@ -382,18 +401,28 @@ async def test_delete_api_removes_only_resolved_local_skill(client, feature):
         "/api/procedural-skills",
         json={"name": "delete-me", "description": "Delete", "body": "body"},
     )
-    refused = await client.delete("/api/procedural-skills/delete-me")
+    delete_revision = (await _record(client, "delete-me"))["delete_revision"]
+    refused = await client.delete(
+        "/api/procedural-skills/delete-me",
+        headers={"If-Match": delete_revision},
+    )
     assert refused.status_code == 403
     assert (feature.agent.procedural_skills_root / "delete-me").exists()
     response = await client.delete(
         "/api/procedural-skills/delete-me",
-        headers={"X-Kestrel-Allow-Destructive": "operator-confirmed-ui"},
+        headers={
+            "If-Match": delete_revision,
+            "X-Kestrel-Allow-Destructive": "operator-confirmed-ui",
+        },
     )
     assert response.status_code == 200
     assert not (feature.agent.procedural_skills_root / "delete-me").exists()
     second = await client.delete(
         "/api/procedural-skills/delete-me",
-        headers={"X-Kestrel-Allow-Destructive": "operator-confirmed-ui"},
+        headers={
+            "If-Match": "0" * 64,
+            "X-Kestrel-Allow-Destructive": "operator-confirmed-ui",
+        },
     )
     assert second.status_code == 404
 
@@ -402,11 +431,120 @@ async def test_delete_api_removes_only_resolved_local_skill(client, feature):
 async def test_delete_api_maps_invalid_skill_name_to_422(client):
     response = await client.delete(
         "/api/procedural-skills/INVALID!",
-        headers={"X-Kestrel-Allow-Destructive": "operator-confirmed-ui"},
+        headers={
+            "If-Match": "0" * 64,
+            "X-Kestrel-Allow-Destructive": "operator-confirmed-ui",
+        },
     )
 
     assert response.status_code == 422
     assert "skill name" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path", "kwargs"),
+    (
+        (
+            "put",
+            "/api/procedural-skills/revision-required/file",
+            {"json": {"path": "SKILL.md", "content": "x"}},
+        ),
+        (
+            "patch",
+            "/api/procedural-skills/revision-required/state",
+            {"json": {"enabled": True}},
+        ),
+        (
+            "delete",
+            "/api/procedural-skills/revision-required",
+            {"headers": {"X-Kestrel-Allow-Destructive": "operator-confirmed-ui"}},
+        ),
+    ),
+)
+async def test_mutation_routes_require_a_well_formed_revision(
+    client,
+    method,
+    path,
+    kwargs,
+):
+    await client.post(
+        "/api/procedural-skills",
+        json={"name": "revision-required", "description": "Revision", "body": "body"},
+    )
+
+    missing = await getattr(client, method)(path, **kwargs)
+    malformed_kwargs = dict(kwargs)
+    malformed_kwargs["headers"] = {
+        **kwargs.get("headers", {}),
+        "If-Match": "not-a-revision",
+    }
+    malformed = await getattr(client, method)(path, **malformed_kwargs)
+
+    assert missing.status_code == 422
+    assert malformed.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_stale_revision_cannot_edit_or_delete_a_recreated_skill(client, feature):
+    name = "stale-replacement"
+    await client.post(
+        "/api/procedural-skills",
+        json={"name": name, "description": "Original", "body": "original"},
+    )
+    stale = await _record(client, name)
+    folder = feature.agent.procedural_skills_root / name
+    shutil.rmtree(folder)
+    folder.mkdir()
+    replacement = SkillDocument(name, "Replacement", "must survive")
+    (folder / "SKILL.md").write_text(
+        serialize_skill_markdown(replacement),
+        encoding="utf-8",
+    )
+
+    edited = await client.put(
+        f"/api/procedural-skills/{name}/file",
+        headers={"If-Match": stale["revision"]},
+        json={"path": "SKILL.md", "content": "stale overwrite"},
+    )
+    deleted = await client.delete(
+        f"/api/procedural-skills/{name}",
+        headers={
+            "If-Match": stale["delete_revision"],
+            "X-Kestrel-Allow-Destructive": "operator-confirmed-ui",
+        },
+    )
+
+    assert edited.status_code == 409
+    assert deleted.status_code == 409
+    assert (folder / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == serialize_skill_markdown(replacement)
+
+
+@pytest.mark.asyncio
+async def test_stale_revision_cannot_overwrite_newer_state(client):
+    name = "stale-state"
+    await client.post(
+        "/api/procedural-skills",
+        json={"name": name, "description": "State", "body": "body"},
+    )
+    stale = (await _record(client, name))["revision"]
+    current = await client.patch(
+        f"/api/procedural-skills/{name}/state",
+        headers={"If-Match": stale},
+        json={"enabled": True, "priority": 7},
+    )
+    overwritten = await client.patch(
+        f"/api/procedural-skills/{name}/state",
+        headers={"If-Match": stale},
+        json={"enabled": False},
+    )
+
+    assert current.status_code == 200
+    assert current.json()["revision"] != stale
+    assert overwritten.status_code == 409
+    assert (await _record(client, name))["enabled"] is True
 
 
 def test_ui_bundle_contains_required_rails_and_no_run_control(feature):
@@ -420,6 +558,10 @@ def test_ui_bundle_contains_required_rails_and_no_run_control(feature):
     assert "name.pattern = '[a-z0-9](?:[a-z0-9_\\\\-]{0,62}[a-z0-9])?'" in source
     assert "skills-delete-approval" in source
     assert "X-Kestrel-Allow-Destructive" in source
+    assert "'If-Match': owner.revision" in source
+    assert "'If-Match': skill.revision" in source
+    assert "skill.delete_revision" in source
+    assert "cleanup is incomplete" in source
     assert "python-execution-risk" in source
     assert "Discover / reload" in source
     assert "Save rejected:" in source

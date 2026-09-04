@@ -55,6 +55,7 @@ class SkillRecord:
     precedence: int
     provenance: SkillProvenance
     folder_identity: tuple[int, int] | None = None
+    revision: str = ""
     state: SkillState = SkillState()
 
     @property
