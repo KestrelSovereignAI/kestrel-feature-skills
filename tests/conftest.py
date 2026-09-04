@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 from kestrel_sovereign.storage.async_database import AsyncDatabase
-from kestrel_sovereign.storage.async_graph_store import GraphNode, NodeSwapResult
+from kestrel_sovereign.storage.async_graph_store import (
+    GraphNode,
+    NodeDeleteResult,
+    NodeSwapResult,
+)
 
 from kestrel_feature_skills import ProceduralSkillsFeature
 
@@ -20,7 +24,14 @@ class GraphStorage:
         self.added.append(node)
 
     async def compare_and_swap_node(
-        self, node_id, expected, new_node, allowed_node_types=None
+        self,
+        node_id,
+        expected,
+        new_node,
+        allowed_node_types=None,
+        *,
+        expected_node_type=None,
+        expected_label=None,
     ):
         existing = self.nodes.get(node_id)
         if existing is None:
@@ -39,6 +50,11 @@ class GraphStorage:
             and existing.node_type not in allowed_node_types
         ):
             return NodeSwapResult.TYPE_NOT_ALLOWED
+        if (expected_node_type, expected_label) != (None, None) and (
+            existing.node_type,
+            existing.label,
+        ) != (expected_node_type, expected_label):
+            return NodeSwapResult.PREDICATE_FAILED
         if expected is None or existing.properties != expected:
             return NodeSwapResult.PREDICATE_FAILED
         persisted = GraphNode(
@@ -60,6 +76,25 @@ class GraphStorage:
     async def delete_node(self, node_id: str) -> None:
         self.nodes.pop(node_id, None)
         self.deleted.append(node_id)
+
+    async def compare_and_delete_node(
+        self,
+        node_id: str,
+        *,
+        expected_node_type: str,
+        expected_label: str,
+    ):
+        existing = self.nodes.get(node_id)
+        if existing is None:
+            return NodeDeleteResult.NOT_FOUND
+        if (existing.node_type, existing.label) != (
+            expected_node_type,
+            expected_label,
+        ):
+            return NodeDeleteResult.PREDICATE_FAILED
+        self.nodes.pop(node_id)
+        self.deleted.append(node_id)
+        return NodeDeleteResult.DELETED
 
 
 @pytest.fixture

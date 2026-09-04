@@ -73,6 +73,36 @@ def test_json_escaped_lone_surrogate_is_a_visible_format_error():
         parse_skill_markdown(content)
 
 
+@pytest.mark.parametrize(
+    "scalar",
+    (
+        "Use when: task arrives",
+        "hello # comment",
+        "'foo'bar'",
+        "TRUE",
+        "2026-09-04",
+        "42",
+        "1:20",
+        ",flow-indicator",
+    ),
+)
+def test_plain_or_single_quoted_scalars_cannot_change_yaml_meaning(scalar):
+    content = f"---\nname: safe-skill\ndescription: {scalar}\n---\n\nProcedure.\n"
+
+    with pytest.raises(SkillFormatError, match="quote|single-quoted"):
+        parse_skill_markdown(content)
+
+
+def test_single_quoted_scalar_accepts_only_yaml_doubled_quotes():
+    content = (
+        "---\nname: safe-skill\n"
+        "description: 'Don''t lose the apostrophe'\n"
+        "---\n\nProcedure.\n"
+    )
+
+    assert parse_skill_markdown(content).description == "Don't lose the apostrophe"
+
+
 @pytest.mark.parametrize("separator", ("\\u0085", "\\u2028", "\\u2029"))
 def test_json_escaped_unicode_line_separators_are_rejected(separator):
     content = (

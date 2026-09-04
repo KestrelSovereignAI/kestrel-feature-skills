@@ -5,6 +5,7 @@ import os
 import shutil
 import sqlite3
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -12,6 +13,7 @@ import pytest
 
 KITE_URL = os.environ.get("KESTREL_KITE_URL")
 KITE_KEY = os.environ.get("KESTREL_KITE_API_KEY")
+KITE_AGENT = os.environ.get("KESTREL_KITE_AGENT", "kite")
 KITE_ROOT = os.environ.get("KESTREL_KITE_SKILLS_ROOT")
 KITE_DB = os.environ.get("KESTREL_KITE_DB")
 KITE_HOSTED_PROVIDER = os.environ.get("KESTREL_KITE_HOSTED_PROVIDER")
@@ -41,13 +43,61 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _apply_privacy_mode(client: httpx.Client, mode: str) -> dict[str, object]:
+    endpoint = f"{KITE_URL}/api/agents/{KITE_AGENT}/api/agent/privacy-mode"
+    response = client.post(endpoint, json={"mode": mode}, timeout=180)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    if payload.get("requires_confirmation"):
+        response = client.post(f"{endpoint}/confirm", timeout=180)
+        assert response.status_code == 200, response.text
+        payload = response.json()
+    assert payload.get("success") is True, payload
+    assert str(payload.get("mode", "")).upper() == mode.upper(), payload
+    return payload
+
+
+def _usage_snapshot(
+    database: Path,
+    *,
+    provider: str,
+    model: str,
+) -> tuple[int, int, int, int, int]:
+    """Read the durable #3019 counters for one exact hosted route."""
+
+    usage_database = database.with_name("llm_usage.db")
+    with sqlite3.connect(usage_database) as connection:
+        table_exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'model_usage'"
+        ).fetchone()
+        if table_exists is None:
+            return (0, 0, 0, 0, 0)
+        row = connection.execute(
+            "SELECT use_count, cache_creation_input_tokens, "
+            "cache_read_input_tokens, "
+            "cache_creation_input_tokens_report_count, "
+            "cache_read_input_tokens_report_count "
+            "FROM model_usage WHERE model_id = ? AND provider = ?",
+            (model, provider),
+        ).fetchone()
+    if row is None:
+        return (0, 0, 0, 0, 0)
+    return (
+        int(row[0]),
+        int(row[1]),
+        int(row[2]),
+        int(row[3]),
+        int(row[4]),
+    )
+
+
 def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
     hosted_identity = (str(KITE_HOSTED_PROVIDER), str(KITE_HOSTED_MODEL))
     assert hosted_identity in _ALLOWED_HOSTED_MODELS, (
         "Kite live verification must use hosted GPT-5.6 Luna or Claude Haiku; "
         f"received {hosted_identity!r}"
     )
-    base = f"{KITE_URL}/api/agents/kite/api/procedural-skills"
+    base = f"{KITE_URL}/api/agents/{KITE_AGENT}/api/procedural-skills"
     headers = {
         "X-API-Key": str(KITE_KEY),
         "X-Kestrel-Allow-Destructive": "true",
@@ -120,7 +170,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
 
     with httpx.Client(timeout=30, headers=headers) as client:
         onboarding = client.post(
-            f"{KITE_URL}/api/agents/kite/api/agent/invoke",
+            f"{KITE_URL}/api/agents/{KITE_AGENT}/api/agent/invoke",
             json={"input": "!skip-discovery"},
             timeout=180,
         )
@@ -238,8 +288,36 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert hosted_context["included"] == [hosted_read_name]
         assert hosted_read_body not in hosted_context["text"]
 
+        # Exercise the real post-policy async preparation seam. Entering a
+        # volatile mode clears every persisted Skills cache; returning to
+        # NORMAL must rehydrate the enabled description before this request
+        # returns, without waiting for a later Skills operation. No inference
+        # occurs while the temporary host is in its local-only privacy mode.
+        _apply_privacy_mode(client, "EPHEMERAL")
+        assert client.get(base).json()["context"]["text"] == ""
+        _apply_privacy_mode(client, "NORMAL")
+        resumed_context = client.get(base).json()["context"]
+        assert resumed_context["included"] == [hosted_read_name]
+        assert hosted_read_body not in resumed_context["text"]
+        with sqlite3.connect(database) as connection:
+            timed_skill_nodes = connection.execute(
+                "SELECT label, json_extract(properties, '$.created_at') "
+                "FROM graph_nodes WHERE node_type = 'procedural_skill'"
+            ).fetchall()
+        assert timed_skill_nodes
+        assert all(
+            label and datetime.fromisoformat(created_at).tzinfo is not None
+            for label, created_at in timed_skill_nodes
+        ), timed_skill_nodes
+
+        hosted_session_id = f"kite-skills-hosted-3018-{uuid.uuid4().hex}"
+        usage_before = _usage_snapshot(
+            database,
+            provider=str(KITE_HOSTED_PROVIDER),
+            model=str(KITE_HOSTED_MODEL),
+        )
         hosted_invoke = client.post(
-            f"{KITE_URL}/api/agents/kite/api/agent/invoke",
+            f"{KITE_URL}/api/agents/{KITE_AGENT}/api/agent/invoke",
             json={
                 "input": (
                     "Please tell me the name of the enabled procedural skill "
@@ -248,7 +326,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
                 ),
                 "provider": KITE_HOSTED_PROVIDER,
                 "model": KITE_HOSTED_MODEL,
-                "session_id": f"kite-skills-hosted-3018-{uuid.uuid4().hex}",
+                "session_id": hosted_session_id,
             },
             timeout=180,
         )
@@ -258,8 +336,59 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert hosted_payload["model"] == KITE_HOSTED_MODEL, hosted_payload
         assert hosted_read_name in hosted_payload["response"], hosted_payload
         assert hosted_read_answer not in hosted_payload["response"], hosted_payload
+
+        # The agent intentionally emits a one-time session briefing on its
+        # first request, so that request proves progressive disclosure but is
+        # not byte-identical to later system prefixes. Start the measured cache
+        # sequence after that warm-up and keep all three measured turns in the
+        # same hosted session. Within this stable sequence T2 must read T1's
+        # prefix and Anthropic T3 must compound beyond T2.
+        usage_before_cache_sequence = _usage_snapshot(
+            database,
+            provider=str(KITE_HOSTED_PROVIDER),
+            model=str(KITE_HOSTED_MODEL),
+        )
+
+        cache_snapshots = []
+        for marker in ("TURN ONE", "TURN TWO", "TURN THREE"):
+            cache_turn = client.post(
+                f"{KITE_URL}/api/agents/{KITE_AGENT}/api/agent/invoke",
+                json={
+                    "input": f"Reply with exactly: {marker}",
+                    "provider": KITE_HOSTED_PROVIDER,
+                    "model": KITE_HOSTED_MODEL,
+                    "session_id": hosted_session_id,
+                },
+                timeout=180,
+            )
+            assert cache_turn.status_code == 200, cache_turn.text
+            cache_payload = cache_turn.json()
+            assert cache_payload["provider"] == KITE_HOSTED_PROVIDER, cache_payload
+            assert cache_payload["model"] == KITE_HOSTED_MODEL, cache_payload
+            cache_snapshots.append(
+                _usage_snapshot(
+                    database,
+                    provider=str(KITE_HOSTED_PROVIDER),
+                    model=str(KITE_HOSTED_MODEL),
+                )
+            )
+
+        assert usage_before_cache_sequence[0] > usage_before[0]
+        assert cache_snapshots[0][0] > usage_before_cache_sequence[0]
+        turn_2_read = cache_snapshots[1][2] - cache_snapshots[0][2]
+        turn_3_read = cache_snapshots[2][2] - cache_snapshots[1][2]
+        turn_2_reports = cache_snapshots[1][4] - cache_snapshots[0][4]
+        turn_3_reports = cache_snapshots[2][4] - cache_snapshots[1][4]
+        assert turn_2_reports > 0, cache_snapshots
+        assert turn_3_reports > 0, cache_snapshots
+        assert turn_2_read > 0, cache_snapshots
+        if str(KITE_HOSTED_PROVIDER).startswith("anthropic:"):
+            assert turn_3_read > turn_2_read, cache_snapshots
+        else:
+            assert turn_3_read > 0, cache_snapshots
+
         hosted_read_command = client.post(
-            f"{KITE_URL}/api/agents/kite/api/agent/invoke",
+            f"{KITE_URL}/api/agents/{KITE_AGENT}/api/agent/invoke",
             json={"input": f"!skill read {hosted_read_name}"},
             timeout=180,
         )
@@ -275,14 +404,14 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert read.status_code == 200
         assert secret_body in read.json()["content"]
         invoked_read = client.post(
-            f"{KITE_URL}/api/agents/kite/api/agent/invoke",
+            f"{KITE_URL}/api/agents/{KITE_AGENT}/api/agent/invoke",
             json={"input": f"!skill read {name}"},
             timeout=180,
         )
         assert invoked_read.status_code == 200, invoked_read.text
         assert secret_body in invoked_read.json()["response"]
         invoked_resource = client.post(
-            f"{KITE_URL}/api/agents/kite/api/agent/invoke",
+            f"{KITE_URL}/api/agents/{KITE_AGENT}/api/agent/invoke",
             json={"input": f"!skill read {name} references.md"},
             timeout=180,
         )
@@ -672,7 +801,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             assert nested_read.status_code == 200, nested_read.text
             assert nested_read.json()["content"] == content
         nested_tool_read = client.post(
-            f"{KITE_URL}/api/agents/kite/api/agent/invoke",
+            f"{KITE_URL}/api/agents/{KITE_AGENT}/api/agent/invoke",
             json={"input": f"!skill read {name} docs/.kestrel-provenance.json"},
             timeout=180,
         )
@@ -756,7 +885,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert client.get(base).json()["context"]["text"] == ""
 
         invoke = client.post(
-            f"{KITE_URL}/api/agents/kite/api/agent/invoke",
+            f"{KITE_URL}/api/agents/{KITE_AGENT}/api/agent/invoke",
             json={"input": "!skill list"},
             timeout=180,
         )
@@ -764,7 +893,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert name in invoke.json()["response"]
 
         missing = client.post(
-            f"{KITE_URL}/api/agents/kite/api/agent/invoke",
+            f"{KITE_URL}/api/agents/{KITE_AGENT}/api/agent/invoke",
             json={"input": "!skill read definitely-not-a-skill"},
             timeout=180,
         )
@@ -772,7 +901,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         assert "was not found" in missing.json()["response"]
 
         install = client.post(
-            f"{KITE_URL}/api/agents/kite/api/agent/invoke",
+            f"{KITE_URL}/api/agents/{KITE_AGENT}/api/agent/invoke",
             json={
                 "input": "!skill install https://example.com/repo.git "
                 f"{unapproved_install} main"

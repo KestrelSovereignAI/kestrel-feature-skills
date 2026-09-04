@@ -4,6 +4,13 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact tag or commit to test before publishing
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -33,6 +40,8 @@ jobs:
         python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
@@ -40,6 +49,12 @@ jobs:
       - run: uv sync --extra test
       - run: uv run pytest -q
       - run: uv build
+      - name: Verify source distribution carries the browser harness
+        run: |
+          sdist=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
+          for file in package.json package-lock.json playwright.config.cjs; do
+            tar -tzf "$sdist" | rg -q "/$file$"
+          done
       - name: Verify installed entry point and package data
         run: |
           uv venv --python "${{ matrix.python }}" .wheel-venv
@@ -65,9 +80,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+      - run: uv sync --extra test
       - run: npm ci
-      - run: npx playwright test --list
+      - run: npx playwright install --with-deps chromium
+      - name: Exercise contributed console on an isolated live host
+        run: tests/e2e/run-live-suite.sh skills
+      - name: Exercise the core-only console on an isolated live host
+        run: tests/e2e/run-live-suite.sh core-only
+      - name: Upload browser and server diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-contract-diagnostics
+          path: |
+            .e2e-artifacts/
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore

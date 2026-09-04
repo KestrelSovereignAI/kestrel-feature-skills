@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -752,6 +753,36 @@ async def test_create_writes_procedural_skill_graph_node(feature):
     assert node.node_type == PROCEDURAL_SKILL_NODE_TYPE
     assert node.node_type != "skill"
     assert node.properties["name"] == "indexed"
+    assert datetime.fromisoformat(node.properties["created_at"]).tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_graph_index_preserves_created_at_and_repairs_legacy_untimed_node(
+    feature,
+):
+    name = "timed-index"
+    await feature.skill_create(name, "Timed graph index", "body")
+    node_id = feature._node_id(name)
+    created_at = feature.agent.storage.nodes[node_id].properties["created_at"]
+
+    await feature.skill_enable(name, priority=8)
+
+    assert feature.agent.storage.nodes[node_id].properties["created_at"] == created_at
+
+    feature.agent.storage.nodes[node_id].properties.pop("created_at")
+    feature.agent.storage.added.clear()
+    replacement = ProceduralSkillsFeature(feature.agent)
+    await replacement.initialize()
+    try:
+        repaired = feature.agent.storage.nodes[node_id]
+        assert len(feature.agent.storage.added) == 1
+        assert (
+            datetime.fromisoformat(repaired.properties["created_at"]).tzinfo is not None
+        )
+        assert repaired.properties["enabled"] is True
+        assert repaired.properties["priority"] == 8
+    finally:
+        await replacement.shutdown()
 
 
 @pytest.mark.asyncio
@@ -822,6 +853,45 @@ async def test_sqlite_graph_cas_preserves_non_skill_node_at_index_id(feature, tm
     finally:
         await indexed.shutdown()
         await graph.delete_node(node_id)
+
+
+@pytest.mark.asyncio
+async def test_graph_index_cas_does_not_overwrite_racing_identity_replacement(
+    feature, monkeypatch
+):
+    name = "racing-index-identity"
+    await feature.skill_create(name, "Original description", "body")
+    node_id = feature._node_id(name)
+    original_swap = feature.agent.storage.compare_and_swap_node
+    replacement = GraphNode(
+        node_id=node_id,
+        node_type="episode",
+        label="concurrent replacement",
+        properties=dict(feature.agent.storage.nodes[node_id].properties),
+    )
+
+    async def replace_identity_before_swap(*args, **kwargs):
+        feature.agent.storage.nodes[node_id] = replacement
+        return await original_swap(*args, **kwargs)
+
+    monkeypatch.setattr(
+        feature.agent.storage,
+        "compare_and_swap_node",
+        replace_identity_before_swap,
+    )
+    folder = feature.agent.procedural_skills_root / name
+    (folder / "SKILL.md").write_text(
+        serialize_skill_markdown(SkillDocument(name, "Updated description", "body")),
+        encoding="utf-8",
+    )
+
+    await feature.refresh()
+
+    assert feature.agent.storage.nodes[node_id] is replacement
+    assert replacement.node_type == "episode"
+    assert replacement.label == "concurrent replacement"
+    assert replacement.properties["description"] == "Original description"
+    assert name not in feature._indexed_names
 
 
 @pytest.mark.asyncio
@@ -1018,6 +1088,48 @@ async def test_refresh_preserves_different_label_at_stale_skill_index_id(feature
         "name": name,
         "sentinel": "must survive",
     }
+    assert node_id not in feature.agent.storage.deleted
+
+
+@pytest.mark.asyncio
+async def test_refresh_does_not_delete_racing_identity_replacement(
+    feature, monkeypatch
+):
+    name = "vanished-racing-replacement"
+    await feature.skill_create(name, "Vanishing graph index", "body")
+    node_id = feature._node_id(name)
+    replacement = GraphNode(
+        node_id=node_id,
+        node_type="episode",
+        label="concurrent refresh replacement",
+        properties={"sentinel": "must survive refresh cleanup"},
+    )
+    original_delete = feature.agent.storage.delete_node
+    original_compare_delete = feature.agent.storage.compare_and_delete_node
+
+    async def race_unconditional_delete(candidate):
+        feature.agent.storage.nodes[candidate] = replacement
+        await original_delete(candidate)
+
+    async def race_conditional_delete(*args, **kwargs):
+        feature.agent.storage.nodes[node_id] = replacement
+        return await original_compare_delete(*args, **kwargs)
+
+    monkeypatch.setattr(feature.agent.storage, "delete_node", race_unconditional_delete)
+    monkeypatch.setattr(
+        feature.agent.storage,
+        "compare_and_delete_node",
+        race_conditional_delete,
+    )
+    folder = feature.agent.procedural_skills_root / name
+    for path in folder.iterdir():
+        path.unlink()
+    folder.rmdir()
+
+    await feature.refresh()
+
+    assert feature.agent.storage.nodes[node_id] is replacement
+    assert replacement.properties == {"sentinel": "must survive refresh cleanup"}
     assert node_id not in feature.agent.storage.deleted
 
 
@@ -1596,10 +1708,10 @@ async def test_delete_reports_partial_after_authoritative_folder_removal(
     await feature.skill_create("partial-delete", "Partial delete", "body")
     folder = feature.agent.procedural_skills_root / "partial-delete"
 
-    async def fail(_node_id):
+    async def fail(_node_id, **_kwargs):
         raise UnexpectedGraphError("graph unavailable")
 
-    monkeypatch.setattr(feature.agent.storage, "delete_node", fail)
+    monkeypatch.setattr(feature.agent.storage, "compare_and_delete_node", fail)
     result = await feature.skill_delete("partial-delete")
 
     assert result.status is ToolResultStatus.PARTIAL
@@ -1631,6 +1743,44 @@ async def test_delete_preserves_different_label_at_skill_index_id(feature):
         "name": name,
         "sentinel": "must survive",
     }
+    assert node_id not in feature.agent.storage.deleted
+
+
+@pytest.mark.asyncio
+async def test_delete_does_not_remove_racing_identity_replacement(feature, monkeypatch):
+    name = "delete-racing-replacement"
+    await feature.skill_create(name, "Delete graph race", "body")
+    node_id = feature._node_id(name)
+    replacement = GraphNode(
+        node_id=node_id,
+        node_type="episode",
+        label="concurrent delete replacement",
+        properties={"sentinel": "must survive delete"},
+    )
+    original_delete = feature.agent.storage.delete_node
+    original_compare_delete = feature.agent.storage.compare_and_delete_node
+
+    async def race_unconditional_delete(candidate):
+        feature.agent.storage.nodes[candidate] = replacement
+        await original_delete(candidate)
+
+    async def race_conditional_delete(*args, **kwargs):
+        feature.agent.storage.nodes[node_id] = replacement
+        return await original_compare_delete(*args, **kwargs)
+
+    monkeypatch.setattr(feature.agent.storage, "delete_node", race_unconditional_delete)
+    monkeypatch.setattr(
+        feature.agent.storage,
+        "compare_and_delete_node",
+        race_conditional_delete,
+    )
+
+    result = await feature.skill_delete(name)
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["graph_deleted"] is True
+    assert feature.agent.storage.nodes[node_id] is replacement
+    assert replacement.properties == {"sentinel": "must survive delete"}
     assert node_id not in feature.agent.storage.deleted
 
 

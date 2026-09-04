@@ -207,6 +207,43 @@ def test_priority_change_is_the_only_order_change():
 
 
 @pytest.mark.asyncio
+async def test_context_prepare_rehydrates_without_self_publishing(feature):
+    created = await feature.skill_create(
+        "prepare-only",
+        "Rehydrated before Core renders",
+        "PRIVATE BODY",
+    )
+    enabled = await feature.skill_enable("prepare-only")
+    assert created.status is ToolResultStatus.OK
+    assert enabled.status is ToolResultStatus.OK
+
+    feature.agent.feature_contribution_runtime = type(
+        "ActiveRuntime",
+        (),
+        {"is_active": staticmethod(lambda _feature: True)},
+    )()
+
+    def unexpected_publication(_feature):
+        raise AssertionError("prepare hook must leave batch publication to Core")
+
+    feature.agent.refresh_feature_context_clauses = unexpected_publication
+    feature.agent.privacy_config = PrivacyConfig(storage="none")
+    await feature.prepare_context_clause_refresh()
+    assert feature._store is None
+    assert feature.context_clause_text == ""
+
+    feature.agent.privacy_config = PrivacyConfig(storage="full")
+    await feature.prepare_context_clause_refresh()
+    assert "Rehydrated before Core renders" in feature.context_clause_text
+    assert "PRIVATE BODY" not in feature.context_clause_text
+
+    published = []
+    feature.agent.refresh_feature_context_clauses = published.append
+    await feature.refresh()
+    assert published == [feature]
+
+
+@pytest.mark.asyncio
 async def test_real_core_context_seam_tracks_enablement_without_disclosing_body(
     feature, tmp_path
 ):
@@ -271,13 +308,18 @@ async def test_real_core_context_seam_tracks_enablement_without_disclosing_body(
     assert "procedural-skills" in squeezed.dropped_clauses
 
     feature.agent.privacy_config = PrivacyConfig(storage="none")
-    runtime.refresh_all_context_clauses()
+    await runtime.prepare_and_refresh_all_context_clauses()
     assert (
         builder.build_system_prompt("GOVERNANCE", include_briefing=False).encode()
         == baseline
     )
+    # A feature read while persistence is hidden clears every cached persistent
+    # service and prompt snapshot. Core must still be able to republish the
+    # enabled description as part of the later host-owned privacy transition.
+    await feature.refresh()
+    assert feature._store is None
     feature.agent.privacy_config = PrivacyConfig(storage="full")
-    runtime.refresh_all_context_clauses()
+    await runtime.prepare_and_refresh_all_context_clauses()
     assert "Description reaches the next prompt" in builder.build_system_prompt(
         "GOVERNANCE", include_briefing=False
     )

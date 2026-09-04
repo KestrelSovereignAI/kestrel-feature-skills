@@ -106,7 +106,15 @@ dogfooded alongside a core release that still contains the obsolete bundled
 ```bash
 uv run --extra test pytest -q
 uv build
+npm ci
+npx playwright install chromium
+tests/e2e/run-live-suite.sh skills
+tests/e2e/run-live-suite.sh core-only
 ```
+
+The browser runner incepts a temporary test-only Kite home, starts Core on the
+configured E2E port, executes Chromium against the live host, and removes the
+temporary agent afterward. The browser contract does not invoke an LLM.
 
 Live-path verification follows Kestrel's Kite runbook and drives the feature
 through `/api/agents/kite/api/agent/invoke`, in addition to its scoped HTTP and
@@ -114,3 +122,7 @@ Console surfaces. The live test requires `KESTREL_KITE_HOSTED_PROVIDER` and
 `KESTREL_KITE_HOSTED_MODEL`; it accepts only hosted Claude Haiku or GPT-5.6
 Luna routes and asserts that the invoke response reports the exact pinned
 provider and model. It never accepts a local-model fallback as release evidence.
+
+Version tags matching `vX.Y.Z` run the complete reusable CI workflow against
+the exact tag SHA before building and uploading through PyPI trusted publishing.
+The publish workflow rejects a tag whose version differs from `pyproject.toml`.

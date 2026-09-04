@@ -18,8 +18,8 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.115,<1",
-    "kestrel-sovereign>=0.53.10,<0.54",
-    "kestrel-sovereign-sdk>=0.37.1,<0.38",
+    "kestrel-sovereign>=0.53.11,<0.54",
+    "kestrel-sovereign-sdk>=0.38.1,<0.39",
 ]
 
 [project.optional-dependencies]
@@ -61,6 +61,9 @@ include = [
     "/.github/workflows/*.yml",
     "/AGENTS.md",
     "/LICENSE",
+    "/package-lock.json",
+    "/package.json",
+    "/playwright.config.cjs",
     "/README.md",
     "/SKILL.md",
     "/pyproject.toml",

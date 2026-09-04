@@ -10,6 +10,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,11 @@ from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
     resolve_feature_database,
 )
-from kestrel_sovereign.storage.async_graph_store import GraphNode, NodeSwapResult
+from kestrel_sovereign.storage.async_graph_store import (
+    GraphNode,
+    NodeDeleteResult,
+    NodeSwapResult,
+)
 from kestrel_sovereign.storage.privacy_wrapper import optional_transition_lock
 
 from .context import (
@@ -150,6 +155,7 @@ class ProceduralSkillsFeature(Feature):
         self._catalog: SkillCatalog | None = None
         self._snapshot = CatalogSnapshot()
         self._context_render = render_context_clause(self._snapshot)
+        self._context_publication_uncertain = False
         self._context_clause_registration = ContextClauseRegistration(
             owner=self.contribution_owner,
             name="procedural-skills",
@@ -238,7 +244,7 @@ class ProceduralSkillsFeature(Feature):
             return
         refresh = getattr(self.agent, "refresh_feature_context_clauses", None)
         if not callable(refresh):
-            raise RuntimeError(
+            raise RuntimeError(  # noqa: TRY004 - missing host capability, not bad input
                 "active procedural skills require core context-clause refresh support"
             )
         refresh(self)
@@ -248,9 +254,16 @@ class ProceduralSkillsFeature(Feature):
 
         previous = self._context_render
         self._context_render = replacement
-        if replacement.text == previous.text:
+        if (
+            replacement.text == previous.text
+            and not self._context_publication_uncertain
+        ):
             return
         try:
+            # A prior host-owned batch may have prepared these exact local
+            # bytes and then aborted because another feature failed. Publish
+            # even when the local render is unchanged so the next deliberate
+            # Skills refresh repairs that possible registry divergence.
             self._publish_context_transition()
         except BaseException:
             # The core registry still owns ``previous``. Retain that exact
@@ -258,6 +271,7 @@ class ProceduralSkillsFeature(Feature):
             # publication instead of treating the failed update as committed.
             self._context_render = previous
             raise
+        self._context_publication_uncertain = False
 
     @property
     def snapshot(self) -> CatalogSnapshot:
@@ -281,6 +295,21 @@ class ProceduralSkillsFeature(Feature):
         async with self.persistent_read(refresh=True):
             return self._snapshot
 
+    async def prepare_context_clause_refresh(self) -> None:
+        """Rehydrate policy-dependent state before Core renders a new batch.
+
+        Core owns publication of the complete context-clause batch.  This hook
+        therefore refreshes the local immutable render without calling the
+        synchronous per-feature publication seam.
+        """
+
+        async with optional_transition_lock(_privacy_transition_lock(self.agent)):
+            if self._privacy_hidden():
+                self._hide_persistent_state(publish_context=False)
+                return
+            self._ensure_persistent_services()
+            await self._refresh_locked(publish_context=False)
+
     @asynccontextmanager
     async def persistent_read(self, *, refresh: bool = False):
         """Hold the privacy-transition lock through one persisted read scope."""
@@ -299,7 +328,7 @@ class ProceduralSkillsFeature(Feature):
                 await self._refresh_locked()
             yield True
 
-    async def _refresh_locked(self) -> CatalogSnapshot:
+    async def _refresh_locked(self, *, publish_context: bool = True) -> CatalogSnapshot:
         if self._catalog is None or self._enablement is None:
             raise RuntimeError("ProceduralSkillsFeature is not initialized")
         try:
@@ -314,7 +343,10 @@ class ProceduralSkillsFeature(Feature):
         else:
             self._states = dict(states)
             self._enablement_error = None
-        return await self._rebuild_snapshot_locked(states)
+        return await self._rebuild_snapshot_locked(
+            states,
+            publish_context=publish_context,
+        )
 
     @staticmethod
     async def _scan_catalog_until_stopped(
@@ -339,7 +371,10 @@ class ProceduralSkillsFeature(Feature):
             raise
 
     async def _rebuild_snapshot_locked(
-        self, states: dict[str, SkillState]
+        self,
+        states: dict[str, SkillState],
+        *,
+        publish_context: bool = True,
     ) -> CatalogSnapshot:
         """Rebuild catalog, prompt clause, and graph index from observed state."""
 
@@ -349,12 +384,15 @@ class ProceduralSkillsFeature(Feature):
             self._catalog,
             states,
         )
-        self._replace_context_render(
-            render_context_clause(
-                self._snapshot,
-                max_bytes=DEFAULT_CONTEXT_BUDGET_BYTES,
-            )
+        replacement = render_context_clause(
+            self._snapshot,
+            max_bytes=DEFAULT_CONTEXT_BUDGET_BYTES,
         )
+        if publish_context:
+            self._replace_context_render(replacement)
+        else:
+            self._context_render = replacement
+            self._context_publication_uncertain = True
         records_by_name = {record.name: record for record in self._snapshot.records}
         desired_payloads = {
             name: self._index_payload(self._index_node(record))
@@ -429,13 +467,18 @@ class ProceduralSkillsFeature(Feature):
                 "persistent procedural skills are unavailable in the current privacy mode"
             )
 
-    def _hide_persistent_state(self) -> None:
+    def _hide_persistent_state(self, *, publish_context: bool = True) -> None:
         self._db = None
         self._enablement = None
         self._store = None
         self._catalog = None
         self._snapshot = CatalogSnapshot()
-        self._replace_context_render(render_context_clause(self._snapshot))
+        replacement = render_context_clause(self._snapshot)
+        if publish_context:
+            self._replace_context_render(replacement)
+        else:
+            self._context_render = replacement
+            self._context_publication_uncertain = True
         self._states = {}
         self._enablement_error = (
             "persistent procedural skills are unavailable in the current privacy mode"
@@ -1006,7 +1049,6 @@ class ProceduralSkillsFeature(Feature):
             if local_candidates:
                 record = local_candidates[0]
                 deleting_shadowed_local = True
-        node_id = self._node_id(name)
         store.require_local_record(record)
         if deleting_shadowed_local:
             store.delete(record)
@@ -1071,23 +1113,10 @@ class ProceduralSkillsFeature(Feature):
                     else:
                         enablement_cleanup_observed_absent = True
                         self._enablement_error = None
-        storage = getattr(self.agent, "storage", None)
-        if (
-            storage is not None
-            and hasattr(storage, "get_node")
-            and hasattr(storage, "delete_node")
-        ):
-            try:
-                node = await storage.get_node(node_id)
-                if (
-                    node is not None
-                    and getattr(node, "node_type", None) == PROCEDURAL_SKILL_NODE_TYPE
-                    and getattr(node, "label", None) == name
-                ):
-                    await storage.delete_node(node_id)
-            except Exception as exc:  # noqa: BLE001 - graph is a recoverable index
-                graph_deleted = False
-                errors.append(f"graph index cleanup failed: {exc}")
+        if getattr(self.agent, "storage", None) is not None:
+            graph_deleted = await self._delete_index_node(name)
+            if not graph_deleted:
+                errors.append("graph index cleanup failed")
         await self._refresh_locked()
         if enablement_cleanup_error is not None:
             final_refresh_observed_absent = bool(
@@ -1396,6 +1425,13 @@ class ProceduralSkillsFeature(Feature):
                     node.node_id,
                 )
                 return False
+            if existing is not None and self._valid_index_created_at(
+                existing.properties
+            ):
+                node = self._index_node(
+                    record,
+                    created_at=existing.properties["created_at"],
+                )
             expected = (
                 dict(existing.properties)
                 if existing is not None and isinstance(existing.properties, dict)
@@ -1405,6 +1441,8 @@ class ProceduralSkillsFeature(Feature):
                 node.node_id,
                 expected,
                 node,
+                expected_node_type=PROCEDURAL_SKILL_NODE_TYPE,
+                expected_label=record.name,
             )
             if outcome != NodeSwapResult.SWAPPED:
                 logger.warning(
@@ -1429,7 +1467,12 @@ class ProceduralSkillsFeature(Feature):
             return False
         return True
 
-    def _index_node(self, record: SkillRecord) -> GraphNode:
+    def _index_node(
+        self,
+        record: SkillRecord,
+        *,
+        created_at: str | None = None,
+    ) -> GraphNode:
         return GraphNode(
             node_id=self._node_id(record.name),
             node_type=PROCEDURAL_SKILL_NODE_TYPE,
@@ -1441,19 +1484,45 @@ class ProceduralSkillsFeature(Feature):
                 "source_id": record.source_id,
                 "enabled": record.state.enabled,
                 "priority": record.state.priority,
+                # Core's scoped EPHEMERAL leak purge requires every owned graph
+                # node to carry a timezone-qualified creation time. Preserve
+                # this value on later index refreshes so ordinary catalog/state
+                # changes cannot make a pre-stint node look newly created.
+                "created_at": created_at or datetime.now(UTC).isoformat(),
             },
         )
 
     @staticmethod
+    def _valid_index_created_at(properties: object) -> bool:
+        if not isinstance(properties, dict):
+            return False
+        value = properties.get("created_at")
+        if not isinstance(value, str) or len(value) > 64:
+            return False
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return False
+        return parsed.tzinfo is not None
+
+    @staticmethod
     def _index_payload(node: GraphNode) -> str:
         """Return a type-preserving canonical payload for graph change detection."""
+
+        properties = dict(node.properties)
+        # Creation provenance is deliberately stable metadata rather than
+        # catalog content. Ignoring its exact value here lets desired payloads
+        # be computed without inventing a new timestamp on every refresh; the
+        # persisted-node scan separately rejects missing/invalid timestamps so
+        # legacy untimed rows are still repaired.
+        properties.pop("created_at", None)
 
         return json.dumps(
             {
                 "node_id": node.node_id,
                 "node_type": node.node_type,
                 "label": node.label,
-                "properties": node.properties,
+                "properties": properties,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -1467,7 +1536,7 @@ class ProceduralSkillsFeature(Feature):
         if (
             storage is None
             or not hasattr(storage, "get_node")
-            or not hasattr(storage, "delete_node")
+            or not hasattr(storage, "compare_and_delete_node")
         ):
             return False
         node_id = self._node_id(name)
@@ -1484,7 +1553,28 @@ class ProceduralSkillsFeature(Feature):
                     node_id,
                 )
                 return True
-            await storage.delete_node(node_id)
+            outcome = await storage.compare_and_delete_node(
+                node_id,
+                expected_node_type=PROCEDURAL_SKILL_NODE_TYPE,
+                expected_label=name,
+            )
+            if outcome == NodeDeleteResult.PREDICATE_FAILED:
+                logger.warning(
+                    "Refusing to delete graph node whose identity changed at "
+                    "expected skill index id %s",
+                    node_id,
+                )
+                return True
+            if outcome not in {
+                NodeDeleteResult.DELETED,
+                NodeDeleteResult.NOT_FOUND,
+            }:
+                logger.warning(
+                    "Could not conditionally remove procedural_skill index for %s: %s",
+                    name,
+                    outcome,
+                )
+                return False
         except Exception as exc:  # noqa: BLE001 - graph is a recoverable index
             logger.warning(
                 "Could not remove stale procedural_skill index for %s: %s", name, exc
@@ -1506,6 +1596,10 @@ class ProceduralSkillsFeature(Feature):
         payloads: dict[str, str] = {}
         for node in nodes:
             properties = getattr(node, "properties", None)
+            if not self._valid_index_created_at(properties):
+                # Force one CAS repair for legacy nodes written before the
+                # scoped privacy purge's timestamp contract was enforced.
+                continue
             name = properties.get("name") if isinstance(properties, dict) else None
             try:
                 name = validate_skill_name(name)

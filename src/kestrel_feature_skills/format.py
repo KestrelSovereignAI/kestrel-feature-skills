@@ -30,6 +30,13 @@ SKILL_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
 _FRONTMATTER_KEYS = frozenset({"name", "description"})
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _UNICODE_LINE_SEPARATOR = re.compile(r"[\x85\u2028\u2029]")
+_YAML_PLAIN_SYNTAX = re.compile(r"(?:^[-?:](?:[ \t]|$)|:[ \t]|:$|[ \t]#)")
+_YAML_IMPLICIT_WORD = re.compile(
+    r"(?:null|true|false|yes|no|on|off|~|\.inf|[-+]?\.inf|\.nan)",
+    re.IGNORECASE,
+)
+_YAML_TIMESTAMP = re.compile(r"\d{4}-\d{1,2}-\d{1,2}(?:[Tt]|[ \t]+|$)")
+_YAML_SEXAGESIMAL = re.compile(r"[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+(?:\.[0-9_]*)?")
 _MARKDOWN_REFERENCE_DEFINITION = re.compile(
     r"(?m)^[ \t]{0,3}\[(?:\\[^\r\n]|[^\]\\\r\n])+\]:[ \t]*"
     r"(?:\r?\n[ \t]{0,3})?"
@@ -150,8 +157,39 @@ def _parse_scalar(raw: str, *, key: str) -> str:
     if value.startswith("'"):
         if len(value) < 2 or not value.endswith("'"):
             raise SkillFormatError(f"unterminated single-quoted scalar for {key!r}")
-        return value[1:-1].replace("''", "'")
-    if value[0] in "!&*[{>|%@`" or value in {"null", "true", "false", "~"}:
+        inner = value[1:-1]
+        offset = 0
+        while offset < len(inner):
+            if inner[offset] != "'":
+                offset += 1
+                continue
+            if offset + 1 >= len(inner) or inner[offset + 1] != "'":
+                raise SkillFormatError(
+                    f"invalid single-quoted scalar for {key!r}; quote apostrophes twice"
+                )
+            offset += 2
+        return inner.replace("''", "'")
+    normalized_number = value.replace("_", "")
+    is_implicit_number = False
+    try:
+        float(normalized_number)
+    except ValueError:
+        try:
+            int(normalized_number, 0)
+        except ValueError:
+            pass
+        else:
+            is_implicit_number = True
+    else:
+        is_implicit_number = True
+    if (
+        value[0] in "!,&*#[{]}>|%@`"
+        or _YAML_PLAIN_SYNTAX.search(value)
+        or _YAML_IMPLICIT_WORD.fullmatch(value)
+        or _YAML_TIMESTAMP.match(value)
+        or _YAML_SEXAGESIMAL.fullmatch(value)
+        or is_implicit_number
+    ):
         raise SkillFormatError(
             f"frontmatter field {key!r} uses unsupported YAML syntax; quote it"
         )

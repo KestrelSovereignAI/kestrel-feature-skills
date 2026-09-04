@@ -1,0 +1,71 @@
+name: Publish to PyPI
+
+# The trusted-publisher binding is scoped to this repository, workflow, and
+# ``pypi`` environment. Every artifact is built only after the reusable CI
+# workflow passes against the exact tag SHA; no API token is used.
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag or commit to publish (for example v0.1.0)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: CI gate
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ inputs.ref || github.ref }}
+    secrets: inherit
+
+  build:
+    name: Build sdist + wheel
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - name: Verify tag and package versions match
+        if: startsWith(inputs.ref, 'v') || startsWith(github.ref, 'refs/tags/v')
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$INPUT_REF" ]; then
+            tag_name="$INPUT_REF"
+          else
+            tag_name="$GITHUB_REF_NAME"
+          fi
+          tag_version="${tag_name#v}"
+          package_version=$(uv run --no-project python -c "import tomllib; print(tomllib.loads(open('pyproject.toml').read())['project']['version'])")
+          if [ "$tag_version" != "$package_version" ]; then
+            echo "::error::tag $tag_name does not match pyproject.toml version $package_version"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Upload to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
