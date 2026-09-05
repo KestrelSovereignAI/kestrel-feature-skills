@@ -72,9 +72,11 @@ from .sources import (
 CLAIM_STALENESS_SECONDS = 60
 GIT_CHECKOUT_PREFIX = ".kestrel-skill-git-"
 GIT_CHECKOUT_LOCK = ".checkout-owner.lock"
+GIT_CHECKOUT_RECOVERY_MARKER = ".preserve-failed-edit"
 SKILL_TRASH_PREFIX = ".kestrel-skill-trash-"
 SKILL_TRASH_LOCK = ".skill-trash.lock"
 SKILL_PUBLICATION_STAGING_PREFIX = ".kestrel-skill-publication-"
+SKILL_RECOVERY_PREFIX = ".kestrel-skill-recovery-"
 FAIL_CLOSED_STATE_PREFIX = ".fail-closed-state-"
 FAIL_CLOSED_STATE_SUFFIX = ".json"
 FAIL_CLOSED_STATE_VERSION = 1
@@ -891,6 +893,42 @@ def _remove_expected_directory_at(
     )
 
 
+def _preserve_recovery_directory_at(
+    source_fd: int,
+    name: str,
+    *,
+    expected: tuple[int, int],
+    internal_fd: int,
+    clear_workspace_marker: bool = False,
+) -> str:
+    """Move one recovery generation into the private durable domain."""
+
+    if _identity_at(source_fd, name) != expected:
+        raise SkillPathError(
+            "skill recovery generation changed before private preservation"
+        )
+    recovery = f"{SKILL_RECOVERY_PREFIX}{uuid.uuid4().hex}"
+    _rename_directory_no_replace_at(
+        source_fd,
+        name,
+        recovery,
+        destination_directory_fd=internal_fd,
+    )
+    if _identity_at(internal_fd, recovery) != expected:
+        _fsync_directory_pair(source_fd, internal_fd)
+        raise SkillPathError(
+            "skill recovery generation changed during private preservation"
+        )
+    _fsync_directory_pair(source_fd, internal_fd)
+    if (
+        clear_workspace_marker
+        and _identity_at(source_fd, GIT_CHECKOUT_RECOVERY_MARKER) is not None
+    ):
+        _unlink_at(source_fd, GIT_CHECKOUT_RECOVERY_MARKER)
+        os.fsync(source_fd)
+    return recovery
+
+
 def _remove_quarantined_directory_at(
     root_fd: int,
     quarantine: str,
@@ -1628,17 +1666,34 @@ class SkillStore:
                         expected=identity,
                     )
                     try:
+                        recovery_marked = (
+                            _identity_at(workspace_fd, GIT_CHECKOUT_RECOVERY_MARKER)
+                            is not None
+                        )
                         owner_lock = self._lock_git_checkout_workspace(workspace_fd)
                     finally:
                         os.close(workspace_fd)
                     if owner_lock is None:
                         continue
                     try:
-                        _purge_internal_directory_at(
-                            internal_fd,
-                            name,
-                            expected=identity,
-                        )
+                        if recovery_marked:
+                            try:
+                                _preserve_recovery_directory_at(
+                                    internal_fd,
+                                    name,
+                                    expected=identity,
+                                    internal_fd=internal_fd,
+                                )
+                            except (OSError, SkillPathError):
+                                # A failed edit owns recoverable user data. Never
+                                # convert a transient retirement error into purge.
+                                continue
+                        else:
+                            _purge_internal_directory_at(
+                                internal_fd,
+                                name,
+                                expected=identity,
+                            )
                     finally:
                         fcntl.flock(owner_lock, fcntl.LOCK_UN)
                         os.close(owner_lock)
@@ -1711,6 +1766,23 @@ class SkillStore:
                     try:
                         owner_lock_attempted = True
                         owner_lock = self._lock_git_checkout_workspace(workspace_fd)
+                        if owner_lock is not None and not cleanup_errors_fatal:
+                            marker_fd = os.open(
+                                GIT_CHECKOUT_RECOVERY_MARKER,
+                                os.O_WRONLY
+                                | os.O_CREAT
+                                | os.O_EXCL
+                                | getattr(os, "O_NOFOLLOW", 0)
+                                | getattr(os, "O_CLOEXEC", 0),
+                                0o600,
+                                dir_fd=workspace_fd,
+                            )
+                            try:
+                                os.write(marker_fd, b"kestrel-edit-recovery-v1\n")
+                                os.fsync(marker_fd)
+                            finally:
+                                os.close(marker_fd)
+                            os.fsync(workspace_fd)
                     finally:
                         os.close(workspace_fd)
                     if owner_lock is None:
@@ -1732,22 +1804,72 @@ class SkillStore:
             raise
 
         workspace = self._internal_root / name
+        body_failed = True
         try:
             yield workspace
+            body_failed = False
         finally:
             try:
                 assert identity is not None
-                try:
-                    self._remove_git_checkout_workspace(name, expected=identity)
-                except Exception as cleanup_error:
-                    if cleanup_errors_fatal:
-                        raise
-                    logger.warning(
-                        "Could not clean committed skill edit workspace %s; "
-                        "startup recovery will retry: %s",
-                        name,
-                        cleanup_error,
-                    )
+                retain_failed_workspace = body_failed and not cleanup_errors_fatal
+                if retain_failed_workspace:
+                    internal_fd = None
+                    try:
+                        internal_fd = _open_directory(
+                            self._internal_root,
+                            expected=self._internal_root_identity,
+                        )
+                        workspace_fd = _open_directory_at(
+                            internal_fd,
+                            name,
+                            expected=identity,
+                        )
+                        try:
+                            retain_failed_workspace = (
+                                _identity_at(
+                                    workspace_fd,
+                                    GIT_CHECKOUT_RECOVERY_MARKER,
+                                )
+                                is not None
+                            )
+                        finally:
+                            os.close(workspace_fd)
+                        if retain_failed_workspace:
+                            recovery = _preserve_recovery_directory_at(
+                                internal_fd,
+                                name,
+                                expected=identity,
+                                internal_fd=internal_fd,
+                            )
+                            logger.error(
+                                "Retained failed skill edit workspace as %s",
+                                recovery,
+                            )
+                    except Exception as recovery_error:  # noqa: BLE001
+                        # The marker makes startup recovery preserve this old
+                        # checkout name too. Never purge after uncertain rescue.
+                        retain_failed_workspace = True
+                        logger.error(
+                            "Could not retire failed skill edit workspace %s; "
+                            "it remains marked for recovery: %s",
+                            name,
+                            recovery_error,
+                        )
+                    finally:
+                        if internal_fd is not None:
+                            os.close(internal_fd)
+                if not retain_failed_workspace:
+                    try:
+                        self._remove_git_checkout_workspace(name, expected=identity)
+                    except Exception as cleanup_error:
+                        if cleanup_errors_fatal:
+                            raise
+                        logger.warning(
+                            "Could not clean committed skill edit workspace %s; "
+                            "startup recovery will retry: %s",
+                            name,
+                            cleanup_error,
+                        )
             finally:
                 if owner_lock is not None:
                     fcntl.flock(owner_lock, fcntl.LOCK_UN)
@@ -2014,6 +2136,7 @@ class SkillStore:
                 f"{SKILL_PUBLICATION_STAGING_PREFIX}create-{uuid.uuid4().hex}"
             )
             created_identity: tuple[int, int] | None = None
+            published: CreatedSkillPublication | None = None
             published_to_root = False
             publication_collision = False
             try:
@@ -2116,9 +2239,35 @@ class SkillStore:
                 ):
                     try:
                         if published_to_root:
-                            _remove_expected_directory_at(
+                            quarantine = _quarantine_directory_at(
                                 root_fd,
                                 cleanup_name,
+                                expected=created_identity,
+                            )
+                            try:
+                                if published is None:
+                                    raise SkillPathError(
+                                        "created publication evidence is unavailable"
+                                    )
+                                self._assert_created_publication_at(
+                                    root_fd,
+                                    quarantine,
+                                    published,
+                                )
+                            except BaseException as inspection_error:  # noqa: BLE001
+                                self._raise_modified_publication_preserved(
+                                    root_fd=root_fd,
+                                    internal_fd=internal_fd,
+                                    quarantine=quarantine,
+                                    public_name=cleanup_name,
+                                    expected=created_identity,
+                                    operation="creation",
+                                    publication_error=publication_error,
+                                    inspection_error=inspection_error,
+                                )
+                            _remove_quarantined_directory_at(
+                                root_fd,
+                                quarantine,
                                 expected=created_identity,
                             )
                         else:
@@ -2127,6 +2276,8 @@ class SkillStore:
                                 cleanup_name,
                                 expected=created_identity,
                             )
+                    except SkillPublicationCleanupError:
+                        raise
                     except BaseException as cleanup_error:
                         cleanup_error.add_note(
                             f"skill creation originally failed: {publication_error}"
@@ -2145,6 +2296,10 @@ class SkillStore:
                         "appeared; its removal was not attempted"
                     ) from publication_error
                 raise
+        if published is None:
+            raise SkillPublicationCleanupError(
+                "skill creation completed without rollback evidence"
+            )
         return folder, published
 
     @staticmethod
@@ -2155,6 +2310,164 @@ class SkillStore:
         return left.document == right.document and tuple(
             sorted(left.entries, key=lambda item: item.path)
         ) == tuple(sorted(right.entries, key=lambda item: item.path))
+
+    @staticmethod
+    def _assert_created_publication_at(
+        parent_fd: int,
+        name: str,
+        publication: CreatedSkillPublication,
+    ) -> None:
+        """Require a newly-created folder to match its pre-publication evidence."""
+
+        descriptor = _open_directory_at(
+            parent_fd,
+            name,
+            expected=publication.folder_identity,
+        )
+        try:
+            if set(os.listdir(descriptor)) != {
+                SKILL_FILENAME,
+                GENERATION_FILENAME,
+            }:
+                raise SkillPathError("created skill contents changed")
+            primary = os.stat(
+                SKILL_FILENAME,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            generation = os.stat(
+                GENERATION_FILENAME,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            observed_primary = (
+                primary.st_dev,
+                primary.st_ino,
+                primary.st_size,
+                primary.st_mtime_ns,
+                primary.st_ctime_ns,
+            )
+            expected_primary = (
+                *publication.primary_identity,
+                publication.primary_size,
+                publication.primary_mtime_ns,
+                publication.primary_ctime_ns,
+            )
+            observed_generation = (
+                generation.st_dev,
+                generation.st_ino,
+                generation.st_size,
+                generation.st_mtime_ns,
+                generation.st_ctime_ns,
+            )
+            expected_generation = (
+                *publication.generation_identity,
+                publication.generation_size,
+                publication.generation_mtime_ns,
+                publication.generation_ctime_ns,
+            )
+            if (
+                observed_primary != expected_primary
+                or observed_generation != expected_generation
+            ):
+                raise SkillPathError("created skill contents changed")
+        finally:
+            os.close(descriptor)
+
+    def _assert_installed_publication_at(
+        self,
+        parent_fd: int,
+        name: str,
+        publication: InstalledSkillPublication,
+    ) -> None:
+        """Require a newly-installed folder to match its captured snapshot."""
+
+        current = _inspect_child_at(
+            parent_fd,
+            name,
+            expected=publication.folder_identity,
+            folder_name=publication.snapshot.document.name,
+        )
+        if not self._same_snapshot(current, publication.snapshot):
+            raise SkillPathError("installed skill contents changed")
+
+    @staticmethod
+    def _raise_modified_publication_preserved(
+        *,
+        root_fd: int,
+        internal_fd: int,
+        quarantine: str,
+        public_name: str,
+        expected: tuple[int, int],
+        operation: str,
+        publication_error: BaseException,
+        inspection_error: BaseException,
+    ) -> None:
+        """Restore or privately retain a modified publication, then fail safely."""
+
+        publication_error.add_note(
+            f"published {operation} content check reported: {inspection_error}"
+        )
+        location = public_name
+        restored_publicly = False
+        try:
+            _restore_quarantined_directory_at(
+                root_fd,
+                quarantine,
+                public_name,
+                expected=expected,
+            )
+            restored_publicly = True
+            os.fsync(root_fd)
+        except BaseException as restoration_error:  # noqa: BLE001
+            publication_error.add_note(
+                f"modified {operation} folder public restoration was incomplete: "
+                f"{restoration_error}"
+            )
+            if not restored_publicly:
+                location = quarantine
+                try:
+                    recovery = _preserve_recovery_directory_at(
+                        root_fd,
+                        quarantine,
+                        expected=expected,
+                        internal_fd=internal_fd,
+                    )
+                except BaseException as recovery_error:  # noqa: BLE001
+                    publication_error.add_note(
+                        f"modified {operation} folder remains as {quarantine}; "
+                        f"private retirement also reported: {recovery_error}"
+                    )
+                else:
+                    location = f"{INTERNAL_DIRECTORY}/{recovery}"
+        raise SkillPublicationCleanupError(
+            f"skill {operation} publication failed after its contents changed; "
+            f"the modified folder was preserved as {location}"
+        ) from publication_error
+
+    def _preserve_edit_recovery(
+        self,
+        staged_fd: int,
+        name: str,
+        *,
+        expected: tuple[int, int],
+    ) -> str:
+        """Retire an edit-conflict generation outside the public source root."""
+
+        internal_fd = _open_directory(
+            self._internal_root,
+            expected=self._internal_root_identity,
+        )
+        try:
+            return _preserve_recovery_directory_at(
+                staged_fd,
+                name,
+                expected=expected,
+                internal_fd=internal_fd,
+                clear_workspace_marker=True,
+            )
+        finally:
+            os.close(internal_fd)
 
     def _publish_replacement_folder(
         self,
@@ -2257,21 +2570,18 @@ class SkillStore:
                             root_fd,
                             record.name,
                         )
-                        preserved = f".kestrel-edit-conflict-{uuid.uuid4().hex}"
-                        _rename_directory_no_replace_at(
+                        preserved = self._preserve_edit_recovery(
                             staged_fd,
                             record.name,
-                            preserved,
-                            destination_directory_fd=root_fd,
+                            expected=candidate_identity,
                         )
-                        _fsync_directory_pair(staged_fd, root_fd)
                         if _identity_at(root_fd, record.name) != expected_identity:
                             raise SkillPathError(
                                 "prior skill generation was not restored after edit conflict"
                             )
                         publication_error.add_note(
                             "the displaced candidate generation was preserved for "
-                            f"recovery as {preserved}"
+                            f"recovery as {INTERNAL_DIRECTORY}/{preserved}"
                         )
                     except BaseException as rollback_error:
                         rollback_error.add_note(
@@ -2282,16 +2592,14 @@ class SkillStore:
                             f"{rollback_error}"
                         ) from rollback_error
                 else:
-                    preserved = f".kestrel-edit-conflict-{uuid.uuid4().hex}"
+                    preserved: str | None = None
                     try:
                         if _identity_at(staged_fd, record.name) is not None:
-                            _rename_directory_no_replace_at(
+                            preserved = self._preserve_edit_recovery(
                                 staged_fd,
                                 record.name,
-                                preserved,
-                                destination_directory_fd=root_fd,
+                                expected=expected_identity,
                             )
-                            _fsync_directory_pair(staged_fd, root_fd)
                     except BaseException as preservation_error:
                         preservation_error.add_note(
                             f"skill edit originally failed: {publication_error}"
@@ -2300,10 +2608,14 @@ class SkillStore:
                             "skill edit conflict generations could not both be preserved: "
                             f"{preservation_error}"
                         ) from preservation_error
+                    if preserved is None:
+                        raise SkillPublicationCleanupError(
+                            "skill edit conflict lost its detached prior generation"
+                        ) from publication_error
                     publication_error.add_note(
                         "the prior generation was preserved for recovery as "
-                        f"{preserved}; the concurrently changed public generation was "
-                        "left untouched"
+                        f"{INTERNAL_DIRECTORY}/{preserved}; the concurrently changed "
+                        "public generation was left untouched"
                     )
                     raise SkillPublicationCleanupError(
                         "skill edit detected a concurrent change after atomic publication; "
@@ -2932,9 +3244,35 @@ class SkillStore:
                     ):
                         try:
                             if published_to_root:
-                                _remove_expected_directory_at(
+                                quarantine = _quarantine_directory_at(
                                     root_fd,
                                     cleanup_name,
+                                    expected=created_identity,
+                                )
+                                try:
+                                    if publication is None:
+                                        raise SkillPathError(
+                                            "installed publication evidence is unavailable"
+                                        )
+                                    self._assert_installed_publication_at(
+                                        root_fd,
+                                        quarantine,
+                                        publication,
+                                    )
+                                except BaseException as inspection_error:  # noqa: BLE001
+                                    self._raise_modified_publication_preserved(
+                                        root_fd=root_fd,
+                                        internal_fd=internal_fd,
+                                        quarantine=quarantine,
+                                        public_name=cleanup_name,
+                                        expected=created_identity,
+                                        operation="installation",
+                                        publication_error=publication_error,
+                                        inspection_error=inspection_error,
+                                    )
+                                _remove_quarantined_directory_at(
+                                    root_fd,
+                                    quarantine,
                                     expected=created_identity,
                                 )
                             else:
@@ -2943,6 +3281,8 @@ class SkillStore:
                                     cleanup_name,
                                     expected=created_identity,
                                 )
+                        except SkillPublicationCleanupError:
+                            raise
                         except BaseException as cleanup_error:
                             cleanup_error.add_note(
                                 "skill installation originally failed: "

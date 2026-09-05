@@ -193,6 +193,40 @@ def test_create_rejects_publication_directory_fsync_failure(tmp_path, monkeypatc
     assert not (store.local_root / "fsync-publication-failure").exists()
 
 
+def test_create_publication_failure_preserves_directly_modified_folder(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    name = "create-publication-direct-edit"
+    folder = store.local_root / name
+    note = folder / "operator-note.md"
+    real_fsync_pair = store_module._fsync_directory_pair
+    failed = False
+
+    def edit_after_publication_then_fail(first_fd, second_fd):
+        nonlocal failed
+        if not failed and folder.is_dir():
+            note.write_text("must survive publication rollback", encoding="utf-8")
+            failed = True
+            raise OSError(errno.EIO, "publication sync failed after direct edit")
+        return real_fsync_pair(first_fd, second_fd)
+
+    monkeypatch.setattr(
+        store_module,
+        "_fsync_directory_pair",
+        edit_after_publication_then_fail,
+    )
+
+    with pytest.raises(
+        SkillPublicationCleanupError,
+        match="modified folder was preserved",
+    ):
+        store.create(SkillDocument(name, "Direct edit", "Procedure."))
+
+    assert failed
+    assert note.read_text(encoding="utf-8") == "must survive publication rollback"
+
+
 def test_publication_state_claim_is_exclusive_across_processes(tmp_path):
     root = tmp_path / "skills"
     store = SkillStore(root)
@@ -1122,7 +1156,9 @@ def test_second_exchange_preserves_late_public_change(tmp_path, monkeypatch):
 
     assert exchange_count == 2
     assert (folder / "SKILL.md").read_text(encoding="utf-8") == old_external
-    preserved = list(store.local_root.glob(".kestrel-edit-conflict-*"))
+    preserved = list(
+        (store.local_root / INTERNAL_DIRECTORY).glob(".kestrel-skill-recovery-*")
+    )
     assert len(preserved) == 1
     assert (preserved[0] / "SKILL.md").read_text(encoding="utf-8") == late_public
 
@@ -2137,6 +2173,47 @@ def test_install_rejects_publication_directory_fsync_failure(tmp_path, monkeypat
 
     assert failed
     assert not (store.local_root / "remote-fsync-failure").exists()
+
+
+def test_install_publication_failure_preserves_directly_modified_folder(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source" / "install-publication-direct-edit"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(source.name, "Direct edit", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+    store = SkillStore(tmp_path / "local")
+    folder = store.local_root / source.name
+    note = folder / "operator-note.md"
+    real_fsync_pair = store_module._fsync_directory_pair
+    failed = False
+
+    def edit_after_publication_then_fail(first_fd, second_fd):
+        nonlocal failed
+        if not failed and folder.is_dir():
+            note.write_text("must survive publication rollback", encoding="utf-8")
+            failed = True
+            raise OSError(errno.EIO, "publication sync failed after direct edit")
+        return real_fsync_pair(first_fd, second_fd)
+
+    monkeypatch.setattr(
+        store_module,
+        "_fsync_directory_pair",
+        edit_after_publication_then_fail,
+    )
+
+    with pytest.raises(
+        SkillPublicationCleanupError,
+        match="modified folder was preserved",
+    ):
+        store.install_folder(source, provenance=git_provenance(source.name))
+
+    assert failed
+    assert note.read_text(encoding="utf-8") == "must survive publication rollback"
 
 
 def test_install_rollback_preserves_a_changed_publication(tmp_path):
@@ -3364,6 +3441,65 @@ def test_store_reaps_git_checkout_after_owner_process_is_killed(tmp_path):
     assert not workspace.exists()
 
 
+def test_failed_edit_workspace_survives_cleanup_and_startup_reaper(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    real_preserve = store_module._preserve_recovery_directory_at
+    refused_retirement = False
+
+    def fail_first_retirement(*args, **kwargs):
+        nonlocal refused_retirement
+        if not refused_retirement:
+            refused_retirement = True
+            raise OSError(errno.EIO, "failed workspace retirement")
+        return real_preserve(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store_module,
+        "_preserve_recovery_directory_at",
+        fail_first_retirement,
+    )
+
+    with (
+        pytest.raises(RuntimeError, match="simulated failed edit"),
+        store.git_checkout_workspace(cleanup_errors_fatal=False) as workspace,
+    ):
+        preserved = workspace / "failed-edit" / "SKILL.md"
+        preserved.parent.mkdir()
+        preserved.write_text("recover me", encoding="utf-8")
+        raise RuntimeError("simulated failed edit")
+
+    assert refused_retirement
+    stranded = tuple(
+        (root / INTERNAL_DIRECTORY).glob(f"{store_module.GIT_CHECKOUT_PREFIX}*")
+    )
+    assert len(stranded) == 1
+    assert (stranded[0] / store_module.GIT_CHECKOUT_RECOVERY_MARKER).is_file()
+    assert (stranded[0] / "failed-edit" / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == "recover me"
+
+    monkeypatch.setattr(
+        store_module,
+        "_preserve_recovery_directory_at",
+        real_preserve,
+    )
+    SkillStore(root)
+
+    assert not tuple(
+        (root / INTERNAL_DIRECTORY).glob(f"{store_module.GIT_CHECKOUT_PREFIX}*")
+    )
+    recovery = tuple(
+        (root / INTERNAL_DIRECTORY).glob(f"{store_module.SKILL_RECOVERY_PREFIX}*")
+    )
+    assert len(recovery) == 1
+    assert (recovery[0] / "failed-edit" / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == "recover me"
+
+
 def test_recursive_cleanup_handles_more_than_python_recursion_limit(tmp_path):
     store = SkillStore(tmp_path / "skills")
     folder = store.create(SkillDocument("deep-cleanup", "Deep cleanup", "Procedure."))
@@ -3440,7 +3576,9 @@ def test_primary_edit_rechecks_original_bytes_at_atomic_exchange(tmp_path, monke
 
     assert injected
     assert (folder / "SKILL.md").read_text(encoding="utf-8") == external
-    preserved = list(store.local_root.glob(".kestrel-edit-conflict-*"))
+    preserved = list(
+        (store.local_root / INTERNAL_DIRECTORY).glob(".kestrel-skill-recovery-*")
+    )
     assert len(preserved) == 1
     assert (preserved[0] / "SKILL.md").read_text(encoding="utf-8") == desired
 
@@ -3493,11 +3631,215 @@ def test_edit_preserves_public_change_detected_after_exchange(tmp_path, monkeypa
 
     assert injected
     assert (folder / "SKILL.md").read_text(encoding="utf-8") == external
-    preserved = list(store.local_root.glob(".kestrel-edit-conflict-*"))
+    preserved = list(
+        (store.local_root / INTERNAL_DIRECTORY).glob(".kestrel-skill-recovery-*")
+    )
     assert len(preserved) == 1
     assert "Original procedure." in (preserved[0] / "SKILL.md").read_text(
         encoding="utf-8"
     )
+
+
+def test_edit_preserves_prior_generation_when_public_recovery_move_fails(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    name = "failed-public-recovery-move"
+    folder = store.create(SkillDocument(name, "Original", "Original procedure."))
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    desired = serialize_skill_markdown(
+        SkillDocument(name, "Desired", "Desired procedure.")
+    )
+    external = serialize_skill_markdown(
+        SkillDocument(name, "External", "EXTERNAL procedure.")
+    )
+    root_identity = (store.local_root.stat().st_dev, store.local_root.stat().st_ino)
+    real_inspect = store_module._inspect_child_at
+    real_rename = store_module._rename_directory_no_replace_at
+    injected = False
+    refused_public_recovery = False
+
+    def mutate_public_candidate(parent_fd, child_name, *, expected, folder_name=None):
+        nonlocal injected
+        parent = os.fstat(parent_fd)
+        if (
+            not injected
+            and child_name == name
+            and (parent.st_dev, parent.st_ino) == root_identity
+            and expected != record.folder_identity
+        ):
+            injected = True
+            (folder / "SKILL.md").write_text(external, encoding="utf-8")
+        return real_inspect(
+            parent_fd,
+            child_name,
+            expected=expected,
+            folder_name=folder_name,
+        )
+
+    def fail_public_recovery_move(
+        source_fd,
+        source_name,
+        destination_name,
+        *,
+        destination_directory_fd=None,
+    ):
+        nonlocal refused_public_recovery
+        if destination_name.startswith(".kestrel-edit-conflict-"):
+            refused_public_recovery = True
+            raise OSError(errno.ENOSPC, "public recovery move refused")
+        return real_rename(
+            source_fd,
+            source_name,
+            destination_name,
+            destination_directory_fd=destination_directory_fd,
+        )
+
+    monkeypatch.setattr(store_module, "_inspect_child_at", mutate_public_candidate)
+    monkeypatch.setattr(
+        store_module,
+        "_rename_directory_no_replace_at",
+        fail_public_recovery_move,
+    )
+
+    with pytest.raises(SkillPublicationCleanupError):
+        store.edit_primary(record, desired)
+
+    assert injected
+    assert not refused_public_recovery
+    assert (folder / "SKILL.md").read_text(encoding="utf-8") == external
+    recovery = tuple(
+        (store.local_root / INTERNAL_DIRECTORY).glob(".kestrel-skill-recovery-*")
+    )
+    assert len(recovery) == 1
+    assert "Original procedure." in (recovery[0] / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_edit_retires_marked_workspace_when_private_recovery_move_fails(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    name = "failed-private-recovery-move"
+    folder = store.create(SkillDocument(name, "Original", "Original procedure."))
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    desired = serialize_skill_markdown(
+        SkillDocument(name, "Desired", "Desired procedure.")
+    )
+    external = serialize_skill_markdown(
+        SkillDocument(name, "External", "EXTERNAL procedure.")
+    )
+    root_identity = (store.local_root.stat().st_dev, store.local_root.stat().st_ino)
+    real_inspect = store_module._inspect_child_at
+    injected = False
+
+    def mutate_public_candidate(parent_fd, child_name, *, expected, folder_name=None):
+        nonlocal injected
+        parent = os.fstat(parent_fd)
+        if (
+            not injected
+            and child_name == name
+            and (parent.st_dev, parent.st_ino) == root_identity
+            and expected != record.folder_identity
+        ):
+            injected = True
+            (folder / "SKILL.md").write_text(external, encoding="utf-8")
+        return real_inspect(
+            parent_fd,
+            child_name,
+            expected=expected,
+            folder_name=folder_name,
+        )
+
+    def fail_private_recovery(*_args, **_kwargs):
+        raise OSError(errno.EIO, "private recovery move failed")
+
+    monkeypatch.setattr(store_module, "_inspect_child_at", mutate_public_candidate)
+    monkeypatch.setattr(store, "_preserve_edit_recovery", fail_private_recovery)
+
+    with pytest.raises(SkillPublicationCleanupError):
+        store.edit_primary(record, desired)
+
+    assert injected
+    assert (folder / "SKILL.md").read_text(encoding="utf-8") == external
+    recovery = tuple(
+        (store.local_root / INTERNAL_DIRECTORY).glob(".kestrel-skill-recovery-*")
+    )
+    assert len(recovery) == 1
+    preserved_primaries = tuple(recovery[0].rglob("SKILL.md"))
+    assert len(preserved_primaries) == 1
+    assert "Original procedure." in preserved_primaries[0].read_text(encoding="utf-8")
+
+
+def test_edit_conflict_recovery_does_not_exceed_source_entry_limit(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    monkeypatch.setattr(sources_module, "MAX_SOURCE_ENTRIES", 3)
+    name = "bounded-edit-recovery"
+    folder = store.create(SkillDocument(name, "Original", "Original procedure."))
+    (store.local_root / "ordinary.txt").write_text("ordinary", encoding="utf-8")
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    desired = serialize_skill_markdown(
+        SkillDocument(name, "Desired", "Desired procedure.")
+    )
+    external = serialize_skill_markdown(
+        SkillDocument(name, "External", "EXTERNAL procedure.")
+    )
+    root_identity = (store.local_root.stat().st_dev, store.local_root.stat().st_ino)
+    real_inspect = store_module._inspect_child_at
+    injected = False
+
+    def mutate_public_candidate(parent_fd, child_name, *, expected, folder_name=None):
+        nonlocal injected
+        parent = os.fstat(parent_fd)
+        if (
+            not injected
+            and child_name == name
+            and (parent.st_dev, parent.st_ino) == root_identity
+            and expected != record.folder_identity
+        ):
+            injected = True
+            (folder / "SKILL.md").write_text(external, encoding="utf-8")
+        return real_inspect(
+            parent_fd,
+            child_name,
+            expected=expected,
+            folder_name=folder_name,
+        )
+
+    monkeypatch.setattr(store_module, "_inspect_child_at", mutate_public_candidate)
+
+    with pytest.raises(SkillPublicationCleanupError):
+        store.edit_primary(record, desired)
+
+    records, errors = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()
+
+    assert injected
+    assert errors == ()
+    assert [item.name for item in records] == [name]
+    assert len(tuple(store.local_root.iterdir())) == 3
 
 
 def test_delete_restores_same_inode_change_made_at_quarantine(tmp_path, monkeypatch):
