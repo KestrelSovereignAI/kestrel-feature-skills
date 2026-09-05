@@ -424,6 +424,33 @@ test.describe.serial('procedural skills contributed console', () => {
     }
   });
 
+  test('state changes preserve an open editor revision for a later save', async ({ page, request }) => {
+    await patchState(request, SKILL_NAME, { enabled: false, priority: 100 });
+    await openPanel(page);
+    await page.getByRole('button', { name: SKILL_NAME }).click();
+    await page.getByRole('button', { name: 'SKILL.md' }).click();
+    const editor = page.getByLabel('Skill file editor');
+    await expect(page.locator('[role="status"]')).toContainText(`Opened ${SKILL_NAME}/SKILL.md`);
+    await expect(editor).toHaveValue(new RegExp(DESCRIPTION));
+    const edited = `${await editor.inputValue()}\nSTATE-THEN-SAVE-SENTINEL\n`;
+    await editor.fill(edited);
+    try {
+      await page.getByRole('button', { name: 'Enable', exact: true }).click();
+      await expect(page.locator('[role="status"]')).toContainText(`Enabled ${SKILL_NAME}`);
+      await expect(editor).toHaveValue(edited);
+      await page.getByTestId('skills-save').click();
+      await expect(page.locator('[role="status"]')).toContainText(`Saved ${SKILL_NAME}/SKILL.md`);
+      const reopened = await request.get(`${API_ROOT}/${SKILL_NAME}/file`, {
+        headers: headers(),
+        params: { path: 'SKILL.md' },
+      });
+      expect(reopened.ok(), await reopened.text()).toBeTruthy();
+      expect((await reopened.json()).content).toContain('STATE-THEN-SAVE-SENTINEL');
+    } finally {
+      await resetFixture(request);
+    }
+  });
+
   test('state completion preserves a newer skill selection and unsaved edit', async ({ page, request }) => {
     const newer = 'e2e-state-race-newer';
     await deleteFixture(request, newer);

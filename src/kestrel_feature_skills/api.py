@@ -19,6 +19,7 @@ from .errors import (
     SkillNotFoundError,
     SkillPathError,
     SkillPrivacyError,
+    SkillPublicationCleanupError,
     SkillReadOnlyError,
 )
 from .format import MAX_RESOURCE_PATH_BYTES
@@ -60,6 +61,11 @@ class InstallSkillRequest(_StrictRequest):
 def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, SkillNotFoundError):
         return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, SkillPublicationCleanupError):
+        return HTTPException(
+            status_code=500,
+            detail=f"skill publication cleanup could not be confirmed: {exc}",
+        )
     if isinstance(exc, SkillConflictError):
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, (SkillReadOnlyError, SkillPrivacyError)):

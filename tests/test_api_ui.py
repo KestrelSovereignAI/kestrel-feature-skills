@@ -13,6 +13,7 @@ from kestrel_feature_skills.errors import (
     GitSourceError,
     SkillConflictError,
     SkillPathError,
+    SkillPublicationCleanupError,
 )
 from kestrel_feature_skills.format import (
     MAX_RESOURCE_PATH_BYTES,
@@ -109,6 +110,27 @@ async def test_edit_api_maps_concurrent_writer_conflict_to_409(
 
     assert response.status_code == 409
     assert "concurrent skill write" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_api_maps_publication_cleanup_uncertainty_to_server_error(
+    client, feature, monkeypatch
+):
+    async def cleanup_failed(**_kwargs):
+        raise SkillPublicationCleanupError(
+            "skill edit conflict generations could not both be preserved"
+        )
+
+    monkeypatch.setattr(feature, "edit_skill", cleanup_failed)
+
+    response = await client.put(
+        "/api/procedural-skills/uncertain/file",
+        headers={"If-Match": "0" * 64},
+        json={"path": "SKILL.md", "content": "replacement"},
+    )
+
+    assert response.status_code == 500
+    assert "cleanup" in response.json()["detail"]
 
 
 @pytest.mark.asyncio

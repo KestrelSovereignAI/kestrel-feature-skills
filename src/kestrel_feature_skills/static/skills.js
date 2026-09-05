@@ -538,8 +538,10 @@ async function setEnabled(skill, enabled, priority = null) {
   };
   state.stateUpdateOwner = owner;
   setStateControlsDisabled(true);
+  const editorOwner = state.editorOwner;
+  const editorRevision = editorOwner?.revision;
   try {
-    await request(`/${encodeURIComponent(skill.name)}/state`, {
+    const result = await request(`/${encodeURIComponent(skill.name)}/state`, {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -548,6 +550,13 @@ async function setEnabled(skill, enabled, priority = null) {
       body: JSON.stringify({ enabled, priority }),
     });
     if (currentAgent() !== agent) return;
+    if (
+      state.editorOwner === editorOwner
+      && editorOwner?.agent === agent
+      && editorOwner.name === skill.name
+      && editorOwner.revision === editorRevision
+      && typeof result.revision === 'string'
+    ) editorOwner.revision = result.revision;
     await loadCatalog();
     if (currentAgent() !== agent) return;
     if (
