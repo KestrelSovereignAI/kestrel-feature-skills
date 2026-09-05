@@ -299,7 +299,20 @@ def parse_skill_markdown(
         raise SkillFormatError(
             f"description exceeds {MAX_DESCRIPTION_BYTES} UTF-8 bytes"
         )
-    body = "\n".join(lines[closing + 1 :]).strip()
+    body_lines = lines[closing + 1 :]
+    first_content = next(
+        (index for index, line in enumerate(body_lines) if line.strip()),
+        len(body_lines),
+    )
+    last_content = next(
+        (
+            index
+            for index in range(len(body_lines) - 1, first_content - 1, -1)
+            if body_lines[index].strip()
+        ),
+        first_content - 1,
+    )
+    body = "\n".join(body_lines[first_content : last_content + 1])
     if not body:
         raise SkillFormatError("SKILL.md procedure body must not be empty")
     if _CONTROL.search(body):
@@ -316,7 +329,7 @@ def serialize_skill_markdown(document: SkillDocument) -> str:
         f"name: {json.dumps(name, ensure_ascii=False)}\n"
         f"description: {json.dumps(document.description, ensure_ascii=False)}\n"
         "---\n\n"
-        f"{document.body.strip()}\n"
+        f"{document.body}\n"
     )
     return (
         "---\n"

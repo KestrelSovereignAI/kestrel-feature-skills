@@ -752,6 +752,29 @@ def test_git_source_compares_annotated_tag_peeled_commit(monkeypatch):
     )
 
 
+def test_git_source_treats_full_object_ref_as_immutable(monkeypatch):
+    revision = "a" * 40
+
+    def unexpected_git(*_args, **_kwargs):
+        raise AssertionError(
+            "an immutable object ID must not be resolved as a ref name"
+        )
+
+    monkeypatch.setattr(git_source_module, "_run_git", unexpected_git)
+
+    source = GitSkillSource()
+    assert not source.has_changed(
+        url="https://example.com/skills.git",
+        ref=revision,
+        installed_revision=revision,
+    )
+    assert source.has_changed(
+        url="https://example.com/skills.git",
+        ref=revision,
+        installed_revision="b" * 40,
+    )
+
+
 def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch):
     commands = []
     target = tmp_path / "checkout"
@@ -827,6 +850,59 @@ def test_git_checkout_uses_remote_default_branch_for_head(tmp_path, monkeypatch)
         max_entries,
     )
     assert checkout.ref == "HEAD"
+
+
+@pytest.mark.parametrize("object_id_length", (40, 64))
+def test_git_checkout_fetches_full_object_id_before_materializing(
+    tmp_path, monkeypatch, object_id_length
+):
+    target = tmp_path / "checkout"
+    revision = "a" * object_id_length
+    commands = []
+
+    def fake_git(argv, **_kwargs):
+        commands.append(argv)
+        if argv[0] == "clone":
+            make_skill(target / "skills", "remote", "Pinned commit")
+            return ""
+        if "ls-tree" in argv:
+            return (
+                f"100644 blob {'b' * object_id_length} 128\tskills/remote/SKILL.md\x00"
+            )
+        if "rev-parse" in argv:
+            return revision
+        return ""
+
+    monkeypatch.setattr(git_source_module, "_run_git", fake_git)
+
+    checkout = GitSkillSource().checkout(
+        url="https://example.com/skills.git",
+        ref=revision,
+        skill_name="remote",
+        target=target,
+    )
+
+    assert "--branch" not in commands[0]
+    assert commands[1] == [
+        "-C",
+        str(target),
+        "fetch",
+        "--depth",
+        "1",
+        "--no-tags",
+        "--",
+        "origin",
+        revision,
+    ]
+    assert commands[2][commands[2].index("-z") + 1] == "FETCH_HEAD"
+    assert commands[4] == [
+        "-C",
+        str(target),
+        "checkout",
+        "--detach",
+        "FETCH_HEAD",
+    ]
+    assert checkout.revision == revision
 
 
 def test_git_checkout_accepts_sha256_object_ids(tmp_path, monkeypatch):
@@ -1183,3 +1259,97 @@ def test_git_checkout_materializes_only_the_requested_folder(
     assert len(checkout.revision) == (40 if object_format == "sha1" else 64)
     assert (checkout.skill_folder / "SKILL.md").is_file()
     assert not (target / "unrelated").exists()
+
+
+@pytest.mark.parametrize("object_format", ("sha1", "sha256"))
+def test_git_checkout_materializes_the_requested_full_commit(
+    tmp_path, monkeypatch, object_format
+):
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git_source_module._run_git(
+        [
+            "init",
+            "--initial-branch=main",
+            f"--object-format={object_format}",
+            str(origin),
+        ]
+    )
+    git_source_module._run_git(
+        ["-C", str(origin), "config", "uploadpack.allowFilter", "true"]
+    )
+    git_source_module._run_git(
+        [
+            "-C",
+            str(origin),
+            "config",
+            "uploadpack.allowReachableSHA1InWant",
+            "true",
+        ]
+    )
+    folder = make_skill(origin / "skills", "remote", "Pinned description")
+    git_source_module._run_git(["-C", str(origin), "add", "."])
+    git_source_module._run_git(
+        [
+            "-C",
+            str(origin),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "pinned",
+        ]
+    )
+    pinned_revision = git_source_module._run_git(
+        ["-C", str(origin), "rev-parse", "HEAD"]
+    )
+    (folder / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("remote", "New default branch tip", "Changed procedure.")
+        ),
+        encoding="utf-8",
+    )
+    git_source_module._run_git(["-C", str(origin), "add", "."])
+    git_source_module._run_git(
+        [
+            "-C",
+            str(origin),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "new tip",
+        ]
+    )
+    source_url = origin.as_uri()
+    monkeypatch.setattr(
+        git_source_module, "validate_remote_url", lambda _url: source_url
+    )
+    monkeypatch.setattr(
+        git_source_module,
+        "_GIT_CONFIG_PREFIX",
+        (
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.https.allow=never",
+            "-c",
+            "protocol.file.allow=always",
+        ),
+    )
+
+    checkout = GitSkillSource().checkout(
+        url=source_url,
+        ref=pinned_revision,
+        skill_name="remote",
+        target=tmp_path / "checkout",
+    )
+
+    installed = (checkout.skill_folder / "SKILL.md").read_text(encoding="utf-8")
+    assert checkout.revision == pinned_revision
+    assert "Pinned description" in installed
+    assert "New default branch tip" not in installed

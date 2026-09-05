@@ -48,6 +48,20 @@ def test_round_trip_quotes_unicode_and_colons():
     assert 'description: "' in encoded
 
 
+@pytest.mark.parametrize("indentation", ("    ", "\t"))
+def test_first_procedure_line_preserves_indented_code_semantics(tmp_path, indentation):
+    body = f"{indentation}[literal](../secret.md)\n\n{indentation}print('safe')"
+    encoded = serialize_skill_markdown(
+        SkillDocument("indented-first-line", "Indented code first", body)
+    )
+
+    assert parse_skill_markdown(encoded).body == body
+    folder = tmp_path / "indented-first-line"
+    folder.mkdir()
+    (folder / "SKILL.md").write_text(encoded, encoding="utf-8")
+    assert validate_skill_folder(folder, source_root=tmp_path).body == body
+
+
 @pytest.mark.parametrize(
     "content, needle",
     [

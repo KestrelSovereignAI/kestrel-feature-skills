@@ -370,6 +370,7 @@ class GitSkillSource:
         skill_name = validate_skill_name(skill_name)
         if target.exists():
             raise GitSourceError("git checkout target already exists")
+        object_id_ref = is_full_object_id(ref)
         clone = [
             "clone",
             "--depth",
@@ -378,7 +379,7 @@ class GitSkillSource:
             "--sparse",
             "--no-checkout",
         ]
-        if ref != "HEAD":
+        if ref != "HEAD" and not object_id_ref:
             clone.extend(["--branch", ref, "--single-branch"])
         clone.extend(["--", url, str(target)])
         _run_git(
@@ -388,6 +389,26 @@ class GitSkillSource:
             max_entries=MAX_GIT_TRANSFER_ENTRIES,
             cancel_event=cancel_event,
         )
+        checkout_revision = "HEAD"
+        if object_id_ref:
+            _run_git(
+                [
+                    "-C",
+                    str(target),
+                    "fetch",
+                    "--depth",
+                    "1",
+                    "--no-tags",
+                    "--",
+                    "origin",
+                    ref,
+                ],
+                size_limit_root=target,
+                max_bytes=MAX_GIT_TRANSFER_BYTES,
+                max_entries=MAX_GIT_TRANSFER_ENTRIES,
+                cancel_event=cancel_event,
+            )
+            checkout_revision = "FETCH_HEAD"
         sparse_listing = _run_git(
             [
                 "-C",
@@ -397,7 +418,7 @@ class GitSkillSource:
                 "-t",
                 "-l",
                 "-z",
-                "HEAD",
+                checkout_revision,
                 "--",
                 skill_name,
                 f"skills/{skill_name}",
@@ -425,7 +446,7 @@ class GitSkillSource:
             cancel_event=cancel_event,
         )
         _run_git(
-            ["-C", str(target), "checkout", "--detach", "HEAD"],
+            ["-C", str(target), "checkout", "--detach", checkout_revision],
             size_limit_root=target,
             max_bytes=MAX_GIT_TRANSFER_BYTES,
             max_entries=MAX_GIT_TRANSFER_ENTRIES,
@@ -440,6 +461,8 @@ class GitSkillSource:
             and len(revision) != listing_object_id_length
         ):
             raise GitSourceError("git checkout returned an invalid commit identity")
+        if object_id_ref and revision != ref:
+            raise GitSourceError("git checkout did not resolve the requested commit")
         candidates = (target / "skills" / skill_name, target / skill_name)
         folder = next(
             (candidate for candidate in candidates if candidate.is_dir()), None
@@ -460,6 +483,8 @@ class GitSkillSource:
     def remote_revision(self, *, url: str, ref: str) -> str:
         url = validate_remote_url(url)
         ref = validate_ref(ref)
+        if is_full_object_id(ref):
+            return ref
         output = _run_git(
             ["ls-remote", "--exit-code", "--", url, ref, f"{ref}^{{}}"],
             timeout=60,
