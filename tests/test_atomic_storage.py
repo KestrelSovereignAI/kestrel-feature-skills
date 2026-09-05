@@ -5,6 +5,7 @@ import fcntl
 import multiprocessing
 import os
 import shutil
+import stat
 import threading
 import time
 from pathlib import Path
@@ -146,6 +147,50 @@ def test_atomic_create_leaves_no_temporary_or_claim_files(tmp_path):
     assert (folder / "SKILL.md").is_file()
     assert not list(folder.glob(".SKILL.md.tmp.*"))
     assert not (folder / ".SKILL.md.claim").exists()
+
+
+def test_create_rejects_staging_directory_fsync_failure(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    real_fsync = os.fsync
+    failed = False
+
+    def fail_first_directory_fsync(descriptor):
+        nonlocal failed
+        if not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            failed = True
+            raise OSError(errno.EIO, "staging directory fsync failed")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(store_module.os, "fsync", fail_first_directory_fsync)
+
+    with pytest.raises(OSError, match="staging directory fsync failed"):
+        store.create(SkillDocument("fsync-stage-failure", "Durability", "Procedure."))
+
+    assert failed
+    assert not (store.local_root / "fsync-stage-failure").exists()
+
+
+def test_create_rejects_publication_directory_fsync_failure(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    real_fsync_pair = store_module._fsync_directory_pair
+    failed = False
+
+    def fail_first_pair(first_fd, second_fd):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError(errno.ENOSPC, "publication directory fsync failed")
+        return real_fsync_pair(first_fd, second_fd)
+
+    monkeypatch.setattr(store_module, "_fsync_directory_pair", fail_first_pair)
+
+    with pytest.raises(OSError, match="publication directory fsync failed"):
+        store.create(
+            SkillDocument("fsync-publication-failure", "Durability", "Procedure.")
+        )
+
+    assert failed
+    assert not (store.local_root / "fsync-publication-failure").exists()
 
 
 def test_publication_state_claim_is_exclusive_across_processes(tmp_path):
@@ -1214,20 +1259,49 @@ def test_edit_workspace_cleanup_preserves_raced_path_replacement(tmp_path, monke
         replace_workspace_after_publication,
     )
     try:
-        with pytest.raises(SkillPathError, match="changed after validation"):
-            store.edit_primary(
-                record,
-                serialize_skill_markdown(
-                    SkillDocument(name, "Edited", "Edited procedure.")
-                ),
-            )
+        edited = store.edit_primary(
+            record,
+            serialize_skill_markdown(
+                SkillDocument(name, "Edited", "Edited procedure.")
+            ),
+        )
 
+        assert edited.description == "Edited"
+        assert "Edited procedure." in (store.local_root / name / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
         assert replacement_path is not None
         assert (replacement_path / marker.name).read_text(encoding="utf-8") == "survive"
     finally:
         shutil.rmtree(displaced_workspace, ignore_errors=True)
         if replacement_path is not None:
             shutil.rmtree(replacement_path, ignore_errors=True)
+
+
+def test_resource_edit_does_not_report_failure_after_cleanup_refusal(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    name = "resource-cleanup-failure"
+    store.create(SkillDocument(name, "Original", "Original procedure."))
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+
+    def refuse_cleanup(_name, *, expected):
+        del expected
+        raise SkillPathError("workspace changed after validation")
+
+    monkeypatch.setattr(store, "_remove_git_checkout_workspace", refuse_cleanup)
+
+    store.write_file(record, "notes.md", "committed notes")
+
+    assert (store.local_root / name / "notes.md").read_text(encoding="utf-8") == (
+        "committed notes"
+    )
 
 
 def test_normal_lock_accumulation_does_not_consume_source_entry_budget(tmp_path):
@@ -1913,6 +1987,39 @@ def test_install_copies_resources_then_fsyncs_tree_and_publishes_primary(
     )
     assert calls == [{"scripts", "scripts/nested"}]
     assert validate_skill_folder(folder, source_root=store.local_root) == document
+
+
+def test_install_rejects_publication_directory_fsync_failure(tmp_path, monkeypatch):
+    source_root = tmp_path / "source"
+    source = source_root / "remote-fsync-failure"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("remote-fsync-failure", "Remote", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+    store = SkillStore(tmp_path / "local")
+    real_fsync_pair = store_module._fsync_directory_pair
+    failed = False
+
+    def fail_first_pair(first_fd, second_fd):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError(errno.EIO, "install publication fsync failed")
+        return real_fsync_pair(first_fd, second_fd)
+
+    monkeypatch.setattr(store_module, "_fsync_directory_pair", fail_first_pair)
+
+    with pytest.raises(OSError, match="install publication fsync failed"):
+        store.install_folder(
+            source,
+            provenance=git_provenance("remote-fsync-failure"),
+        )
+
+    assert failed
+    assert not (store.local_root / "remote-fsync-failure").exists()
 
 
 def test_install_rollback_preserves_a_changed_publication(tmp_path):

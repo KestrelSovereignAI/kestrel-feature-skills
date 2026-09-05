@@ -7,6 +7,7 @@ import errno
 import fcntl
 import hashlib
 import hmac
+import logging
 import os
 import shutil
 import stat
@@ -74,6 +75,7 @@ _DIRECTORY_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_CLOEXEC", 0)
 )
+logger = logging.getLogger(__name__)
 
 
 def has_python_execution_risk(relative_path: str) -> bool:
@@ -1561,8 +1563,13 @@ class SkillStore:
             os.close(internal_fd)
 
     @contextmanager
-    def git_checkout_workspace(self):
-        """Yield a crash-recoverable, exclusively owned Git staging folder."""
+    def git_checkout_workspace(self, *, cleanup_errors_fatal: bool = True):
+        """Yield a crash-recoverable, exclusively owned Git staging folder.
+
+        Callers that atomically commit their result before leaving the workspace
+        can make cleanup best-effort. Any retained private workspace is then
+        eligible for the existing startup reaper.
+        """
 
         name = f"{GIT_CHECKOUT_PREFIX}{uuid.uuid4().hex}"
         identity: tuple[int, int] | None = None
@@ -1617,7 +1624,17 @@ class SkillStore:
         finally:
             try:
                 assert identity is not None
-                self._remove_git_checkout_workspace(name, expected=identity)
+                try:
+                    self._remove_git_checkout_workspace(name, expected=identity)
+                except Exception as cleanup_error:
+                    if cleanup_errors_fatal:
+                        raise
+                    logger.warning(
+                        "Could not clean committed skill edit workspace %s; "
+                        "startup recovery will retry: %s",
+                        name,
+                        cleanup_error,
+                    )
             finally:
                 if owner_lock is not None:
                     fcntl.flock(owner_lock, fcntl.LOCK_UN)
@@ -1796,10 +1813,7 @@ class SkillStore:
                         primary_mtime_ns=primary.st_mtime_ns,
                         primary_ctime_ns=primary.st_ctime_ns,
                     )
-                    try:
-                        os.fsync(folder_fd)
-                    except OSError:
-                        pass
+                    os.fsync(folder_fd)
                 finally:
                     os.close(folder_fd)
                 if _identity_at(internal_fd, staging_name) != created_identity:
@@ -1828,10 +1842,7 @@ class SkillStore:
                     raise SkillPathError(
                         "created skill folder changed during publication"
                     )
-                try:
-                    _fsync_directory_pair(internal_fd, root_fd)
-                except OSError:
-                    pass
+                _fsync_directory_pair(internal_fd, root_fd)
             except BaseException as publication_error:
                 cleanup_fd = root_fd if published_to_root else internal_fd
                 cleanup_name = name if published_to_root else staging_name
@@ -2062,7 +2073,7 @@ class SkillStore:
                 expected=record.folder_identity,
             )
             _require_record_snapshot(record, snapshot)
-            with self.git_checkout_workspace() as workspace:
+            with self.git_checkout_workspace(cleanup_errors_fatal=False) as workspace:
                 staged_root = workspace.resolve(strict=True)
                 staged_folder = staged_root / record.name
                 _materialize_validated_folder(snapshot, staged_folder)
@@ -2292,7 +2303,7 @@ class SkillStore:
                 expected=record.folder_identity,
             )
             _require_record_snapshot(record, snapshot)
-            with self.git_checkout_workspace() as workspace:
+            with self.git_checkout_workspace(cleanup_errors_fatal=False) as workspace:
                 staged_root = workspace.resolve(strict=True)
                 staged_folder = staged_root / record.name
                 _materialize_validated_folder(snapshot, staged_folder)
@@ -2531,10 +2542,7 @@ class SkillStore:
                         raise SkillPathError(
                             "installed skill folder changed during publication"
                         )
-                    try:
-                        _fsync_directory_pair(internal_fd, root_fd)
-                    except OSError:
-                        pass
+                    _fsync_directory_pair(internal_fd, root_fd)
                 except BaseException as publication_error:
                     cleanup_fd = root_fd if published_to_root else internal_fd
                     cleanup_name = document.name if published_to_root else staging_name

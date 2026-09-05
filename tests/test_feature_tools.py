@@ -1814,6 +1814,67 @@ async def test_delete_reconciles_graph_cleanup_completed_by_final_refresh(
 
 
 @pytest.mark.asyncio
+async def test_delete_preserves_fallback_graph_index_repaired_by_final_refresh(
+    feature, tmp_path, monkeypatch
+):
+    name = "refresh-repaired-fallback"
+    await feature.skill_create(name, "Local skill", "Local procedure.")
+    shared_root = tmp_path / "shared"
+    shared_folder = shared_root / name
+    shared_folder.mkdir(parents=True)
+    (shared_folder / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Shared fallback", "Shared procedure.")
+        ),
+        encoding="utf-8",
+    )
+    feature._catalog = SkillCatalog(
+        (
+            DirectorySkillSource(
+                root=feature.agent.procedural_skills_root,
+                source_id="agent-local",
+                kind="agent-local",
+                precedence=AGENT_LOCAL_PRECEDENCE,
+            ),
+            DirectorySkillSource(
+                root=shared_root,
+                source_id="host-shared",
+                kind="host-shared",
+                precedence=HOST_SHARED_PRECEDENCE,
+            ),
+        )
+    )
+    await feature.refresh()
+    original_delete = feature.agent.storage.compare_and_delete_node
+    attempts = 0
+
+    async def fail_once_then_delete(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise UnexpectedGraphError("graph unavailable once")
+        return await original_delete(*args, **kwargs)
+
+    monkeypatch.setattr(
+        feature.agent.storage,
+        "compare_and_delete_node",
+        fail_once_then_delete,
+    )
+
+    result = await feature.skill_delete(name)
+
+    fallback = feature.snapshot.by_name()[name]
+    node = feature.agent.storage.nodes[feature._node_id(name)]
+    assert fallback.source_kind == "host-shared"
+    assert node.properties["source_id"] == "host-shared"
+    assert name in feature._indexed_names
+    assert result.status is ToolResultStatus.OK
+    assert result.data["graph_deleted"] is False
+    assert result.data["graph_retained"] is True
+    assert result.data["errors"] == []
+
+
+@pytest.mark.asyncio
 async def test_delete_preserves_different_label_at_skill_index_id(feature):
     name = "delete-label-collision"
     await feature.skill_create(name, "Delete graph collision", "body")

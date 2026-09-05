@@ -1226,12 +1226,18 @@ class ProceduralSkillsFeature(Feature):
         if getattr(self.agent, "storage", None) is not None:
             graph_deleted = await self._delete_index_node(name)
         await self._refresh_locked()
-        if not graph_deleted and getattr(self.agent, "storage", None) is not None:
+        remaining = self._snapshot.by_name().get(name)
+        graph_retained = remaining is not None and name in self._indexed_names
+        if (
+            not graph_deleted
+            and remaining is None
+            and getattr(self.agent, "storage", None) is not None
+        ):
             # The refresh performs the same idempotent stale-index cleanup. Ask
             # once more after it completes so a transient first failure cannot
             # leave the result claiming cleanup is incomplete after it succeeded.
             graph_deleted = await self._delete_index_node(name)
-        if not graph_deleted:
+        if not graph_deleted and not graph_retained:
             errors.append("graph index cleanup failed")
         if enablement_cleanup_error is not None:
             final_refresh_observed_absent = bool(
@@ -1242,12 +1248,12 @@ class ProceduralSkillsFeature(Feature):
             ):
                 config_deleted = False
                 errors.insert(0, enablement_cleanup_error)
-        remaining = self._snapshot.by_name().get(name)
         return {
             "name": name,
             "removed_file": True,
             "config_deleted": config_deleted,
             "graph_deleted": graph_deleted,
+            "graph_retained": graph_retained,
             "errors": errors,
             "deleted_source_kind": record.source_kind,
             "resolved_skill_retained": remaining is not None,
