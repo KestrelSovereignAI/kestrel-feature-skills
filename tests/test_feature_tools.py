@@ -681,6 +681,23 @@ async def test_enable_disable_updates_bootstrap_and_cached_context(feature):
     assert feature.context_clause_text == ""
 
 
+@pytest.mark.parametrize("operation", ("skill_enable", "skill_disable"))
+@pytest.mark.asyncio
+async def test_state_tools_map_filesystem_failures(feature, monkeypatch, operation):
+    name = f"{operation.replace('_', '-')}-oserror"
+    await feature.skill_create(name, "State tool error", "body")
+
+    async def fail_state(**_kwargs):
+        raise OSError("simulated state marker filesystem failure")
+
+    monkeypatch.setattr(feature, "set_skill_state", fail_state)
+
+    result = await getattr(feature, operation)(name)
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "state marker filesystem failure" in result.error
+
+
 @pytest.mark.asyncio
 async def test_unknown_state_update_does_not_create_publication_claim(
     feature, monkeypatch

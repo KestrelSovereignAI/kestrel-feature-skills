@@ -191,6 +191,38 @@ test.describe.serial('procedural skills contributed console', () => {
     await expect(page.getByLabel('Skill file editor')).toHaveValue(/Round trip changed and persisted\./);
   });
 
+  test('committed save reports a context publication failure', async ({ page }) => {
+    await openPanel(page);
+    await page.getByRole('button', { name: SKILL_NAME }).click();
+    await page.getByRole('button', { name: 'SKILL.md' }).click();
+    const editor = page.getByLabel('Skill file editor');
+    await expect(editor).toHaveValue(/^---/);
+    await editor.fill(`${await editor.inputValue()}\nPARTIAL-SAVE-SENTINEL\n`);
+    await page.route(new RegExp(`${API_ROOT}/${SKILL_NAME}/file$`), async (route) => {
+      if (route.request().method() !== 'PUT') return route.continue();
+      const response = await route.fetch();
+      const payload = await response.json();
+      await route.fulfill({
+        response,
+        json: {
+          ...payload,
+          refresh_error: 'simulated context publication failure',
+        },
+      });
+    });
+    try {
+      await page.getByTestId('skills-save').click();
+      await expect(page.locator('[role="status"]')).toContainText(
+        'simulated context publication failure',
+      );
+      await expect(page.locator('[role="status"]')).toContainText(
+        'follow-up synchronization failed',
+      );
+    } finally {
+      await page.unrouteAll({ behavior: 'ignoreErrors' });
+    }
+  });
+
   test('stale file reads cannot overwrite the newly selected skill', async ({ page, request }) => {
     const first = 'e2e-race-first';
     const second = 'e2e-race-second';

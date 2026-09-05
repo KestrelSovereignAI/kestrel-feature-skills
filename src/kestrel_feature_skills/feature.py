@@ -2363,7 +2363,7 @@ class ProceduralSkillsFeature(Feature):
             payload = await self.set_skill_state(
                 name=name, enabled=True, priority=priority
             )
-        except (SkillError, DatabaseError, RuntimeError, ValueError) as exc:
+        except (SkillError, OSError, DatabaseError, RuntimeError, ValueError) as exc:
             return ToolResult.failed(str(exc))
         return ToolResult.ok(f"Enabled procedural skill {name}.", data=payload)
 
@@ -2376,7 +2376,7 @@ class ProceduralSkillsFeature(Feature):
     async def skill_disable(self, name: str) -> ToolResult:
         try:
             payload = await self.set_skill_state(name=name, enabled=False)
-        except (SkillError, DatabaseError, RuntimeError, ValueError) as exc:
+        except (SkillError, OSError, DatabaseError, RuntimeError, ValueError) as exc:
             return ToolResult.failed(str(exc))
         return ToolResult.ok(f"Disabled procedural skill {name}.", data=payload)
 

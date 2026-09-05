@@ -436,6 +436,30 @@ async def test_state_endpoint_changes_context_breakdown(client):
 
 
 @pytest.mark.asyncio
+async def test_state_endpoint_maps_fail_closed_marker_oserror(
+    client, feature, monkeypatch
+):
+    await client.post(
+        "/api/procedural-skills",
+        json={"name": "state-oserror", "description": "State error", "body": "body"},
+    )
+
+    def fail_clear(_name):
+        raise OSError("simulated fail-closed marker fsync failure")
+
+    monkeypatch.setattr(feature, "_clear_fail_closed_state", fail_clear)
+
+    response = await client.patch(
+        "/api/procedural-skills/state-oserror/state",
+        headers={"If-Match": (await _record(client, "state-oserror"))["revision"]},
+        json={"enabled": True},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "skill filesystem operation failed"
+
+
+@pytest.mark.asyncio
 async def test_state_endpoint_maps_invalid_skill_name_to_422(client):
     response = await client.patch(
         "/api/procedural-skills/INVALID!/state",

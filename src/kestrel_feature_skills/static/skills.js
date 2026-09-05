@@ -517,7 +517,14 @@ async function saveFile() {
     await loadCatalog();
     if (state.editorOwner === owner && currentAgent() === owner.agent) {
       state.ui.save.disabled = false;
-      setStatus(`Saved ${owner.name}/${owner.path}. No code was executed.`);
+      if (result.refresh_error) {
+        setStatus(
+          `Saved ${owner.name}/${owner.path} on disk, but follow-up synchronization failed: ${result.refresh_error}`,
+          true,
+        );
+      } else {
+        setStatus(`Saved ${owner.name}/${owner.path}. No code was executed.`);
+      }
     }
   } catch (error) {
     if (state.editorOwner === owner && currentAgent() === owner.agent) {

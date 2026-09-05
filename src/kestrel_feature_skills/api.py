@@ -253,6 +253,7 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
             EnablementUnavailableError,
             SkillPrivacyError,
             DatabaseError,
+            OSError,
             RuntimeError,
             ValueError,
         ) as exc:
