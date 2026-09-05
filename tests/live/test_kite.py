@@ -156,6 +156,12 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-container-link",
         "kite-list-quote-reference",
         "kite-lazy-quote-link",
+        "kite-raw-html-link",
+        "kite-max-reference-label",
+        "kite-partial-lazy-quote",
+        "kite-lazy-reference-destination",
+        "kite-lazy-list-state",
+        "kite-indented-pseudo-block",
         "kite-literal-separator",
         "kite-fence-exit",
         "kite-list-reference",
@@ -206,6 +212,38 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         )
         assert onboarding.status_code == 200, onboarding.text
         assert "GENESIS AUDIT PENDING" not in onboarding.json()["response"]
+
+        # Follow the live-agent runbook's post-genesis readiness probe before
+        # making a feature assertion. A freshly inceptioned agent may consume
+        # the first ordinary invoke with its one-time introduction and report
+        # no provider/model because no inference occurred. Retry that single
+        # documented transition once, then require the exact hosted route; a
+        # local or silently substituted model can never satisfy this gate.
+        readiness_session = f"kite-skills-ready-3018-{uuid.uuid4().hex}"
+        readiness_payload: dict[str, object] | None = None
+        for _readiness_attempt in range(2):
+            readiness = client.post(
+                f"{KITE_URL}/api/agents/{KITE_AGENT}/api/agent/invoke",
+                json={
+                    "input": "Reply with exactly: READY",
+                    "provider": KITE_HOSTED_PROVIDER,
+                    "model": KITE_HOSTED_MODEL,
+                    "session_id": readiness_session,
+                },
+                timeout=180,
+            )
+            assert readiness.status_code == 200, readiness.text
+            readiness_payload = readiness.json()
+            if readiness_payload.get("provider") is not None:
+                break
+            assert readiness_payload.get("model") is None, readiness_payload
+        assert readiness_payload is not None
+        assert readiness_payload.get("provider") == KITE_HOSTED_PROVIDER, (
+            readiness_payload
+        )
+        assert readiness_payload.get("model") == KITE_HOSTED_MODEL, readiness_payload
+        assert "READY" in str(readiness_payload.get("response")), readiness_payload
+
         existing = _skill_record(client, base, name)
         client.delete(
             f"{base}/{name}",
@@ -622,6 +660,62 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             '---\nname: "kite-lazy-quote-link"\n'
             'description: "Lazy blockquote escape attempt"\n---\n\n'
             "> paragraph\n    [outside](../kite-outside.md)\n",
+            encoding="utf-8",
+        )
+        raw_html_folder = root / "kite-raw-html-link"
+        raw_html_folder.mkdir()
+        (raw_html_folder / "SKILL.md").write_text(
+            '---\nname: "kite-raw-html-link"\n'
+            'description: "Raw HTML containment attempt"\n---\n\n'
+            '<a href="../kite-outside.md" href="https://safe.example">outside</a>\n',
+            encoding="utf-8",
+        )
+        max_reference_folder = root / "kite-max-reference-label"
+        max_reference_folder.mkdir()
+        first_label_line = "a" * 500
+        second_label_line = "a" * 498
+        max_reference_destination = "../" + "/".join(["x" * 200] * 5 + ["y" * 16])
+        assert len(f"{first_label_line}\n{second_label_line}") == 999
+        assert len(max_reference_destination.encode("utf-8")) == 1024
+        (max_reference_folder / "SKILL.md").write_text(
+            '---\nname: "kite-max-reference-label"\n'
+            'description: "Maximum reference label attempt"\n---\n\n'
+            f"[{first_label_line}\n{second_label_line}]: "
+            f"{max_reference_destination}\n",
+            encoding="utf-8",
+        )
+        partial_lazy_folder = root / "kite-partial-lazy-quote"
+        partial_lazy_folder.mkdir()
+        (partial_lazy_folder / "SKILL.md").write_text(
+            '---\nname: "kite-partial-lazy-quote"\n'
+            'description: "Partial lazy quote attempt"\n---\n\n'
+            "> > [outside\n> link](../kite-outside.md)\n",
+            encoding="utf-8",
+        )
+        lazy_reference_folder = root / "kite-lazy-reference-destination"
+        lazy_reference_folder.mkdir()
+        (lazy_reference_folder / "SKILL.md").write_text(
+            '---\nname: "kite-lazy-reference-destination"\n'
+            'description: "Lazy reference destination attempt"\n---\n\n'
+            "[click][outside]\n\n> > [outside]:\n>     ../kite-outside.md\n",
+            encoding="utf-8",
+        )
+        lazy_list_state_folder = root / "kite-lazy-list-state"
+        lazy_list_state_folder.mkdir()
+        (lazy_list_state_folder / "SKILL.md").write_text(
+            '---\nname: "kite-lazy-list-state"\n'
+            'description: "Lazy list state attempt"\n---\n\n'
+            "- paragraph\n[click][outside]\n\n"
+            "    [outside]: ../kite-outside.md\n",
+            encoding="utf-8",
+        )
+        indented_pseudo_block_folder = root / "kite-indented-pseudo-block"
+        indented_pseudo_block_folder.mkdir()
+        (indented_pseudo_block_folder / "SKILL.md").write_text(
+            '---\nname: "kite-indented-pseudo-block"\n'
+            'description: "Indented pseudo block attempt"\n---\n\n'
+            "paragraph\n    <!-- comment -->\n"
+            "    [outside](../kite-outside.md)\n",
             encoding="utf-8",
         )
         literal_separator_folder = root / "kite-literal-separator"

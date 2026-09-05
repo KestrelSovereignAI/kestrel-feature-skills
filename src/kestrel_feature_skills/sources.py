@@ -102,12 +102,6 @@ _DIRECTORY_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_CLOEXEC", 0)
 )
-_READ_FLAGS = (
-    os.O_RDONLY
-    | getattr(os, "O_NONBLOCK", 0)
-    | getattr(os, "O_NOFOLLOW", 0)
-    | getattr(os, "O_CLOEXEC", 0)
-)
 
 
 def _bounded_source_names(root_fd: int) -> list[str]:
@@ -202,54 +196,19 @@ def _validated_provenance(provenance: SkillProvenance) -> SkillProvenance:
     return validated
 
 
-def _load_provenance_at(
+def _parse_provenance_payload(
     source: DirectorySkillSource,
-    folder_fd: int,
     folder_name: str,
+    payload_bytes: bytes,
 ) -> SkillProvenance:
-    try:
-        before = os.stat(
-            PROVENANCE_FILENAME,
-            dir_fd=folder_fd,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        return _default_provenance(source, folder_name)
-    except OSError as exc:
-        raise SkillFormatError(f"could not inspect {PROVENANCE_FILENAME}") from exc
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise SkillFormatError(f"{PROVENANCE_FILENAME} must be a regular file")
-    if before.st_size > 16_384:
+    """Parse provenance from the same captured bytes used by record revision."""
+
+    if len(payload_bytes) > 16_384:
         raise SkillFormatError(f"{PROVENANCE_FILENAME} exceeds 16384 bytes")
     try:
-        descriptor = os.open(PROVENANCE_FILENAME, _READ_FLAGS, dir_fd=folder_fd)
-    except OSError as exc:
-        raise SkillFormatError(f"could not read {PROVENANCE_FILENAME}") from exc
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
-            before.st_dev,
-            before.st_ino,
-        ):
-            raise SkillFormatError(f"{PROVENANCE_FILENAME} changed during discovery")
-        if opened.st_size > 16_384:
-            raise SkillFormatError(f"{PROVENANCE_FILENAME} exceeds 16384 bytes")
-        payload_bytes = bytearray()
-        while len(payload_bytes) <= 16_384:
-            chunk = os.read(descriptor, min(16_385 - len(payload_bytes), 16_384))
-            if not chunk:
-                break
-            payload_bytes.extend(chunk)
-        if len(payload_bytes) > 16_384:
-            raise SkillFormatError(f"{PROVENANCE_FILENAME} exceeds 16384 bytes")
-        after = os.fstat(descriptor)
-        if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
-            raise SkillFormatError(f"{PROVENANCE_FILENAME} changed during discovery")
-        payload = json.loads(bytes(payload_bytes).decode("utf-8"))
+        payload = json.loads(payload_bytes.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise SkillFormatError(f"invalid {PROVENANCE_FILENAME}: {exc}") from exc
-    finally:
-        os.close(descriptor)
     if not isinstance(payload, dict) or payload.get("version") != PROVENANCE_VERSION:
         raise SkillFormatError(f"{PROVENANCE_FILENAME} has an unsupported version")
     allowed = {"version", "kind", "source_id", "locator", "revision", "remote_url"}
@@ -400,11 +359,26 @@ class DirectorySkillSource(SkillSource):
                         folder_name=folder_name,
                     )
                     document = snapshot.document
-                    provenance = _load_provenance_at(
-                        self,
-                        folder_fd,
-                        folder_name,
+                    provenance_entry = next(
+                        (
+                            entry
+                            for entry in snapshot.entries
+                            if entry.path == PROVENANCE_FILENAME
+                        ),
+                        None,
                     )
+                    if provenance_entry is None:
+                        provenance = _default_provenance(self, folder_name)
+                    elif provenance_entry.payload is None:
+                        raise SkillFormatError(
+                            f"{PROVENANCE_FILENAME} must be a regular file"
+                        )
+                    else:
+                        provenance = _parse_provenance_payload(
+                            self,
+                            folder_name,
+                            provenance_entry.payload,
+                        )
                     lexical_after = os.stat(
                         folder_name,
                         dir_fd=root_fd,
@@ -434,6 +408,7 @@ class DirectorySkillSource(SkillSource):
                 finally:
                     if folder_fd is not None:
                         os.close(folder_fd)
+                content_revision = _folder_revision(snapshot, folder_identity)
                 records.append(
                     SkillRecord(
                         document=document,
@@ -451,7 +426,8 @@ class DirectorySkillSource(SkillSource):
                         ),
                         provenance=provenance,
                         folder_identity=folder_identity,
-                        revision=_folder_revision(snapshot, folder_identity),
+                        content_revision=content_revision,
+                        revision=content_revision,
                     )
                 )
         finally:
@@ -488,10 +464,12 @@ class SkillCatalog:
             key=lambda item: (item.precedence, item.name, item.source_id),
         ):
             state = states.get(record.name, SkillState())
+            content_revision = record.content_revision or record.revision
             configured = replace(
                 record,
                 state=state,
-                revision=_configured_revision(record.revision, state),
+                content_revision=content_revision,
+                revision=_configured_revision(content_revision, state),
             )
             if record.name not in resolved:
                 resolved[record.name] = configured

@@ -6,6 +6,7 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+import hmac
 import os
 import shutil
 import stat
@@ -13,9 +14,10 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from .errors import (
     SkillConflictError,
@@ -46,18 +48,25 @@ from .paths import (
     lexical_contained_path,
     reject_symlink_chain,
 )
-from .sources import MAX_SOURCE_ENTRIES, PROVENANCE_FILENAME, serialize_provenance
+from .sources import (
+    MAX_SOURCE_ENTRIES,
+    PROVENANCE_FILENAME,
+    _folder_revision,
+    serialize_provenance,
+)
 
 CLAIM_STALENESS_SECONDS = 60
 INTERNAL_DIRECTORY = ".kestrel-internal"
 GIT_CHECKOUT_PREFIX = ".kestrel-skill-git-"
 GIT_CHECKOUT_LOCK = ".checkout-owner.lock"
+SKILL_TRASH_PREFIX = ".kestrel-skill-trash-"
+SKILL_TRASH_LOCK = ".skill-trash.lock"
 MAX_EDITOR_FILE_BYTES = 262_144
 NAME_LOCK_BUCKETS = 256
 _MUTATION_LOCKS = tuple(threading.RLock() for _ in range(NAME_LOCK_BUCKETS))
-_SOURCE_PUBLICATION_LOCKS: dict[str, threading.RLock] = {}
-_SOURCE_PUBLICATION_LOCKS_GUARD = threading.Lock()
+_SOURCE_PUBLICATION_LOCKS = tuple(threading.RLock() for _ in range(NAME_LOCK_BUCKETS))
 _PUBLICATION_STATE_LOCKS = tuple(threading.Lock() for _ in range(NAME_LOCK_BUCKETS))
+_TRASH_THREAD_LOCK = threading.RLock()
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_DIRECTORY", 0)
@@ -118,6 +127,17 @@ class CreatedParentDirectory:
 
 
 @dataclass(slots=True)
+class _RemovalFrame:
+    """One directory in the implementation-owned trash deletion walk."""
+
+    parent_fd: int
+    name: str
+    identity: tuple[int, int]
+    descriptor: int
+    entries: Iterator[str]
+
+
+@dataclass(slots=True)
 class PublicationStateClaim:
     """An exclusive same-name claim spanning database guard and publication."""
 
@@ -150,9 +170,8 @@ def _serialized_source_publication(
     if not enabled:
         yield
         return
-    key = str(root)
-    with _SOURCE_PUBLICATION_LOCKS_GUARD:
-        thread_lock = _SOURCE_PUBLICATION_LOCKS.setdefault(key, threading.RLock())
+    bucket = _name_lock_bucket(root, "", domain="source-publication")
+    thread_lock = _SOURCE_PUBLICATION_LOCKS[bucket]
     with thread_lock:
         lock_name = ".source-publication.lock"
         flags = (
@@ -177,6 +196,45 @@ def _serialized_source_publication(
                 raise SkillPathError(
                     "source publication lock changed while acquiring it"
                 )
+            yield
+        finally:
+            try:
+                if locked:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+@contextmanager
+def _serialized_skill_trash(internal_fd: int):
+    """Serialize durable retirement and private-trash reaping across processes."""
+
+    with _TRASH_THREAD_LOCK:
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            descriptor = os.open(
+                SKILL_TRASH_LOCK,
+                flags,
+                0o600,
+                dir_fd=internal_fd,
+            )
+        except OSError as exc:
+            raise SkillPathError("could not open the skill trash lock") from exc
+        locked = False
+        try:
+            value = os.fstat(descriptor)
+            if not stat.S_ISREG(value.st_mode):
+                raise SkillPathError("skill trash lock must be a regular file")
+            identity = (value.st_dev, value.st_ino)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            locked = True
+            if _identity_at(internal_fd, SKILL_TRASH_LOCK) != identity:
+                raise SkillPathError("skill trash lock changed while acquiring it")
             yield
         finally:
             try:
@@ -376,9 +434,14 @@ def _rename_directory_no_replace_at(
     directory_fd: int,
     source_name: str,
     destination_name: str,
+    *,
+    destination_directory_fd: int | None = None,
 ) -> None:
     """Atomically publish a directory only when its destination is absent."""
 
+    destination_fd = (
+        directory_fd if destination_directory_fd is None else destination_directory_fd
+    )
     source = os.fsencode(source_name)
     destination = os.fsencode(destination_name)
     libc = ctypes.CDLL(None, use_errno=True)
@@ -393,7 +456,7 @@ def _rename_directory_no_replace_at(
             ctypes.c_uint,
         )
         rename.restype = ctypes.c_int
-        arguments = (directory_fd, source, directory_fd, destination, 0x00000004)
+        arguments = (directory_fd, source, destination_fd, destination, 0x00000004)
     elif hasattr(libc, "renameat2"):
         rename = libc.renameat2
         rename.argtypes = (
@@ -404,7 +467,7 @@ def _rename_directory_no_replace_at(
             ctypes.c_uint,
         )
         rename.restype = ctypes.c_int
-        arguments = (directory_fd, source, directory_fd, destination, 0x00000001)
+        arguments = (directory_fd, source, destination_fd, destination, 0x00000001)
     else:
         raise SkillPathError(
             "atomic no-replace directory publication is unavailable on this platform"
@@ -421,6 +484,115 @@ def _rename_directory_no_replace_at(
             destination_name,
         )
     raise OSError(error_number, os.strerror(error_number), destination_name)
+
+
+def _exchange_directories_at(
+    source_directory_fd: int,
+    source_name: str,
+    destination_directory_fd: int,
+    destination_name: str,
+) -> None:
+    """Atomically exchange two directory entries without an absent-name window."""
+
+    source = os.fsencode(source_name)
+    destination = os.fsencode(destination_name)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if hasattr(libc, "renameatx_np"):
+        rename = libc.renameatx_np
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        arguments = (
+            source_directory_fd,
+            source,
+            destination_directory_fd,
+            destination,
+            0x00000002,
+        )
+    elif hasattr(libc, "renameat2"):
+        rename = libc.renameat2
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        arguments = (
+            source_directory_fd,
+            source,
+            destination_directory_fd,
+            destination,
+            0x00000002,
+        )
+    else:
+        raise SkillPathError(
+            "atomic directory exchange is unavailable on this platform"
+        )
+
+    ctypes.set_errno(0)
+    if rename(*arguments) == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {
+        errno.ENOSYS,
+        errno.EINVAL,
+        errno.ENOTSUP,
+        errno.EOPNOTSUPP,
+    }:
+        raise SkillPathError(
+            "atomic directory exchange is unavailable on this filesystem"
+        )
+    raise OSError(error_number, os.strerror(error_number), destination_name)
+
+
+def _fsync_directory_pair(first_fd: int, second_fd: int) -> None:
+    """Durably order a cross-directory exchange on both directory entries."""
+
+    os.fsync(first_fd)
+    if second_fd != first_fd:
+        os.fsync(second_fd)
+
+
+def _open_relative_directory_at(root_fd: int, parts: tuple[str, ...]) -> int:
+    """Open one already-validated relative directory without lexical traversal."""
+
+    descriptor = os.dup(root_fd)
+    try:
+        for part in parts:
+            child = _open_directory_at(descriptor, part)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _fsync_validated_directories_at(
+    folder_fd: int,
+    snapshot: ValidatedSkillFolder,
+) -> None:
+    """Persist every captured directory entry bottom-up before publication."""
+
+    directories: set[tuple[str, ...]] = {()}
+    for entry in snapshot.entries:
+        parts = Path(entry.path).parts
+        parent_depth = len(parts) if entry.is_directory else len(parts) - 1
+        for depth in range(1, parent_depth + 1):
+            directories.add(parts[:depth])
+    for parts in sorted(directories, key=lambda value: (-len(value), value)):
+        descriptor = _open_relative_directory_at(folder_fd, parts)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _unlink_at(directory_fd: int, name: str) -> None:
@@ -615,7 +787,7 @@ def _quarantine_directory_at(
     *,
     expected: tuple[int, int],
 ) -> str:
-    """Atomically detach one expected directory before recursive deletion."""
+    """Atomically detach one expected directory before durable retirement."""
 
     try:
         before = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
@@ -670,54 +842,128 @@ def _remove_quarantined_directory_at(
     *,
     expected: tuple[int, int],
 ) -> None:
-    """Recursively remove one already-detached and inode-pinned directory."""
+    """Move an owned detached generation into durable implementation trash.
 
-    descriptor: int | None = None
+    Public and recovery-visible names are never recursively unlinked. Physical
+    cleanup happens only under ``.kestrel-internal``, whose contents are an
+    implementation-owned domain and are not a supported direct-edit surface.
+    """
+
+    internal_fd = _open_directory_at(root_fd, INTERNAL_DIRECTORY)
     try:
-        # Pin the quarantined inode before traversing it. Resolving the
-        # quarantine name again through ``shutil.rmtree`` would let a raced
-        # replacement become the recursive-deletion target.
-        descriptor = _open_directory_at(root_fd, quarantine, expected=expected)
-        for entry in os.listdir(descriptor):
-            value = os.stat(entry, dir_fd=descriptor, follow_symlinks=False)
+        with _serialized_skill_trash(internal_fd):
+            if _identity_at(root_fd, quarantine) != expected:
+                raise SkillPathError(
+                    "quarantined skill directory changed before retirement; "
+                    f"its replacement was preserved as {quarantine}"
+                )
+            retired = f"{SKILL_TRASH_PREFIX}{uuid.uuid4().hex}"
+            _rename_directory_no_replace_at(
+                root_fd,
+                quarantine,
+                retired,
+                destination_directory_fd=internal_fd,
+            )
+            if _identity_at(internal_fd, retired) != expected:
+                _fsync_directory_pair(root_fd, internal_fd)
+                raise SkillPathError(
+                    "quarantined skill directory changed during retirement; "
+                    f"the unexpected generation was preserved as {retired}"
+                )
+            _fsync_directory_pair(root_fd, internal_fd)
+            try:
+                _purge_internal_directory_at(
+                    internal_fd,
+                    retired,
+                    expected=expected,
+                )
+            except (OSError, SkillPathError):
+                # Retirement already made the user-visible delete durable.
+                # Preserve partial/private recovery state for startup retry.
+                pass
+    finally:
+        os.close(internal_fd)
+
+
+def _purge_internal_directory_at(
+    internal_fd: int,
+    name: str,
+    *,
+    expected: tuple[int, int],
+) -> None:
+    """Recursively purge one pinned implementation-owned private directory."""
+
+    frames: list[_RemovalFrame] = []
+    try:
+        descriptor = _open_directory_at(internal_fd, name, expected=expected)
+        frames.append(
+            _RemovalFrame(
+                parent_fd=internal_fd,
+                name=name,
+                identity=expected,
+                descriptor=descriptor,
+                entries=iter(os.listdir(descriptor)),
+            )
+        )
+        while frames:
+            frame = frames[-1]
+            try:
+                entry = next(frame.entries)
+            except StopIteration:
+                if _identity_at(frame.parent_fd, frame.name) != frame.identity:
+                    raise SkillPathError(
+                        "quarantined skill directory changed during deletion; "
+                        "its replacement was preserved"
+                    )
+                os.close(frame.descriptor)
+                frame.descriptor = -1
+                os.rmdir(frame.name, dir_fd=frame.parent_fd)
+                frames.pop()
+                continue
+
+            value = os.stat(entry, dir_fd=frame.descriptor, follow_symlinks=False)
             entry_identity = (value.st_dev, value.st_ino)
             # A valid resource component can already occupy NAME_MAX bytes.
             # Keep recovery names independent of attacker-controlled length.
             detached = f".kestrel-delete-{uuid.uuid4().hex}"
-            _rename_directory_no_replace_at(descriptor, entry, detached)
-            if _identity_at(descriptor, detached) != entry_identity:
+            _rename_directory_no_replace_at(frame.descriptor, entry, detached)
+            if _identity_at(frame.descriptor, detached) != entry_identity:
                 raise SkillPathError(
                     "nested skill entry changed during deletion; "
                     f"its replacement was preserved as {detached}"
                 )
             if stat.S_ISDIR(value.st_mode):
-                _remove_quarantined_directory_at(
-                    descriptor,
+                child_descriptor = _open_directory_at(
+                    frame.descriptor,
                     detached,
                     expected=entry_identity,
                 )
+                frames.append(
+                    _RemovalFrame(
+                        parent_fd=frame.descriptor,
+                        name=detached,
+                        identity=entry_identity,
+                        descriptor=child_descriptor,
+                        entries=iter(os.listdir(child_descriptor)),
+                    )
+                )
             else:
-                if _identity_at(descriptor, detached) != entry_identity:
+                if _identity_at(frame.descriptor, detached) != entry_identity:
                     raise SkillPathError(
                         "nested skill file changed during deletion; "
                         f"its replacement was preserved as {detached}"
                     )
-                os.unlink(detached, dir_fd=descriptor)
-        if _identity_at(root_fd, quarantine) != expected:
-            raise SkillPathError(
-                "quarantined skill folder changed during deletion; "
-                "its replacement was preserved"
-            )
-        os.rmdir(quarantine, dir_fd=root_fd)
+                os.unlink(detached, dir_fd=frame.descriptor)
     except BaseException as exc:
         exc.add_note(
-            "skill removal did not complete; remaining data, if any, "
-            f"is preserved as {quarantine}"
+            "private cleanup did not complete; remaining implementation-owned "
+            f"data, if any, is preserved as {name}"
         )
         raise
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
+        for frame in reversed(frames):
+            if frame.descriptor >= 0:
+                os.close(frame.descriptor)
 
 
 def _restore_quarantined_directory_at(
@@ -984,6 +1230,25 @@ def _inspect_child_at(
         os.close(descriptor)
 
 
+def _require_record_snapshot(
+    record: SkillRecord,
+    snapshot: ValidatedSkillFolder,
+) -> None:
+    """Require captured folder bytes to match the record being mutated/read."""
+
+    if not record.content_revision:
+        return
+    if record.folder_identity is None:
+        raise SkillConflictError(
+            f"skill {record.name!r} has no folder generation; reload and retry"
+        )
+    current = _folder_revision(snapshot, record.folder_identity)
+    if not hmac.compare_digest(current, record.content_revision):
+        raise SkillConflictError(
+            f"skill {record.name!r} changed after it was read; reload and retry"
+        )
+
+
 class SkillStore:
     """Mutate only the agent-local root; read from the resolved catalog."""
 
@@ -1065,6 +1330,7 @@ class SkillStore:
         self._local_root_identity = root_identity
         self._internal_root = internal_root
         self._internal_root_identity = internal_identity
+        self._reap_retired_skill_folders()
         self._reap_git_checkout_workspaces()
 
     @staticmethod
@@ -1125,6 +1391,38 @@ class SkillStore:
         finally:
             os.close(internal_fd)
 
+    def _reap_retired_skill_folders(self) -> None:
+        """Physically clean only generations already in the private trash domain."""
+
+        internal_fd = _open_directory(
+            self._internal_root,
+            expected=self._internal_root_identity,
+        )
+        try:
+            with _serialized_skill_trash(internal_fd):
+                with os.scandir(internal_fd) as entries:
+                    candidates = tuple(
+                        (entry.name, entry.stat(follow_symlinks=False))
+                        for entry in entries
+                        if entry.name.startswith(SKILL_TRASH_PREFIX)
+                    )
+                for name, value in candidates:
+                    if not stat.S_ISDIR(value.st_mode):
+                        continue
+                    identity = (value.st_dev, value.st_ino)
+                    try:
+                        _purge_internal_directory_at(
+                            internal_fd,
+                            name,
+                            expected=identity,
+                        )
+                    except (OSError, SkillPathError):
+                        # The private domain is best-effort retention cleanup.
+                        # Preserve anything that changed and retry next startup.
+                        continue
+        finally:
+            os.close(internal_fd)
+
     def _reap_git_checkout_workspaces(self) -> None:
         """Remove crash-orphaned checkouts while preserving live processes."""
 
@@ -1165,7 +1463,7 @@ class SkillStore:
                     if owner_lock is None:
                         continue
                     try:
-                        _remove_quarantined_directory_at(
+                        _purge_internal_directory_at(
                             internal_fd,
                             name,
                             expected=identity,
@@ -1198,7 +1496,7 @@ class SkillStore:
                     # The private workspace name is stable recovery state, not
                     # a public record. Remove it in place so a kill during
                     # cleanup leaves the same prefix for the next reaper pass.
-                    _remove_quarantined_directory_at(
+                    _purge_internal_directory_at(
                         internal_fd,
                         name,
                         expected=expected,
@@ -1502,6 +1800,172 @@ class SkillStore:
                 raise
         return folder, published
 
+    @staticmethod
+    def _same_snapshot(
+        left: ValidatedSkillFolder,
+        right: ValidatedSkillFolder,
+    ) -> bool:
+        return left.document == right.document and tuple(
+            sorted(left.entries, key=lambda item: item.path)
+        ) == tuple(sorted(right.entries, key=lambda item: item.path))
+
+    def _publish_replacement_folder(
+        self,
+        *,
+        root_fd: int,
+        staged_root: Path,
+        record: SkillRecord,
+        candidate: ValidatedSkillFolder,
+    ) -> None:
+        """Exchange a complete folder and atomically compensate stale writers."""
+
+        staged_fd = _open_directory(staged_root)
+        exchanged = False
+        expected_identity = record.folder_identity or _identity_at(root_fd, record.name)
+        try:
+            staged_value = os.stat(
+                record.name,
+                dir_fd=staged_fd,
+                follow_symlinks=False,
+            )
+            candidate_identity = (staged_value.st_dev, staged_value.st_ino)
+            if not stat.S_ISDIR(staged_value.st_mode):
+                raise SkillPathError("validated edit staging folder changed")
+            candidate_fd = _open_directory_at(
+                staged_fd,
+                record.name,
+                expected=candidate_identity,
+            )
+            try:
+                _fsync_validated_directories_at(candidate_fd, candidate)
+            finally:
+                os.close(candidate_fd)
+            if expected_identity is None:
+                raise SkillConflictError(
+                    f"skill {record.name!r} has no folder generation; reload and retry"
+                )
+
+            current = _inspect_child_at(
+                root_fd,
+                record.name,
+                expected=expected_identity,
+            )
+            _require_record_snapshot(record, current)
+            _exchange_directories_at(
+                staged_fd,
+                record.name,
+                root_fd,
+                record.name,
+            )
+            exchanged = True
+            _fsync_directory_pair(staged_fd, root_fd)
+            if (
+                _identity_at(root_fd, record.name) != candidate_identity
+                or _identity_at(staged_fd, record.name) != expected_identity
+            ):
+                raise SkillConflictError(
+                    f"skill {record.name!r} changed during publication; retry"
+                )
+
+            detached = _inspect_child_at(
+                staged_fd,
+                record.name,
+                expected=expected_identity,
+                folder_name=record.name,
+            )
+            _require_record_snapshot(record, detached)
+            published = _inspect_child_at(
+                root_fd,
+                record.name,
+                expected=candidate_identity,
+            )
+            if not self._same_snapshot(published, candidate):
+                raise SkillConflictError(
+                    f"edited skill {record.name!r} changed during publication; retry"
+                )
+        except BaseException as publication_error:
+            if exchanged:
+                rollback_safe = False
+                try:
+                    if (
+                        _identity_at(root_fd, record.name) == candidate_identity
+                        and _identity_at(staged_fd, record.name) == expected_identity
+                    ):
+                        current_candidate = _inspect_child_at(
+                            root_fd,
+                            record.name,
+                            expected=candidate_identity,
+                        )
+                        rollback_safe = self._same_snapshot(
+                            current_candidate,
+                            candidate,
+                        )
+                except (SkillPathError, SkillFormatError, OSError):
+                    rollback_safe = False
+                if rollback_safe:
+                    try:
+                        _exchange_directories_at(
+                            staged_fd,
+                            record.name,
+                            root_fd,
+                            record.name,
+                        )
+                        preserved = f".kestrel-edit-conflict-{uuid.uuid4().hex}"
+                        _rename_directory_no_replace_at(
+                            staged_fd,
+                            record.name,
+                            preserved,
+                            destination_directory_fd=root_fd,
+                        )
+                        _fsync_directory_pair(staged_fd, root_fd)
+                        if _identity_at(root_fd, record.name) != expected_identity:
+                            raise SkillPathError(
+                                "prior skill generation was not restored after edit conflict"
+                            )
+                        publication_error.add_note(
+                            "the displaced candidate generation was preserved for "
+                            f"recovery as {preserved}"
+                        )
+                    except BaseException as rollback_error:
+                        rollback_error.add_note(
+                            f"skill edit originally failed: {publication_error}"
+                        )
+                        raise SkillPublicationCleanupError(
+                            "skill edit rollback could not restore the prior generation: "
+                            f"{rollback_error}"
+                        ) from rollback_error
+                else:
+                    preserved = f".kestrel-edit-conflict-{uuid.uuid4().hex}"
+                    try:
+                        if _identity_at(staged_fd, record.name) is not None:
+                            _rename_directory_no_replace_at(
+                                staged_fd,
+                                record.name,
+                                preserved,
+                                destination_directory_fd=root_fd,
+                            )
+                            _fsync_directory_pair(staged_fd, root_fd)
+                    except BaseException as preservation_error:
+                        preservation_error.add_note(
+                            f"skill edit originally failed: {publication_error}"
+                        )
+                        raise SkillPublicationCleanupError(
+                            "skill edit conflict generations could not both be preserved: "
+                            f"{preservation_error}"
+                        ) from preservation_error
+                    publication_error.add_note(
+                        "the prior generation was preserved for recovery as "
+                        f"{preserved}; the concurrently changed public generation was "
+                        "left untouched"
+                    )
+                    raise SkillPublicationCleanupError(
+                        "skill edit detected a concurrent change after atomic publication; "
+                        "both generations were preserved"
+                    ) from publication_error
+            raise
+        finally:
+            os.close(staged_fd)
+
     def edit_primary(self, record: SkillRecord, content: str) -> SkillDocument:
         document = parse_skill_markdown(
             content, source=f"{record.name}/{SKILL_FILENAME}"
@@ -1518,43 +1982,28 @@ class SkillStore:
             record.name,
             root_identity=self._local_root_identity,
             internal_root_identity=self._internal_root_identity,
-        ) as (root_fd, artifact_fd):
+        ) as (root_fd, _artifact_fd):
             self._require_local(record)
             snapshot = _inspect_child_at(
                 root_fd,
                 record.name,
                 expected=record.folder_identity,
             )
-            with tempfile.TemporaryDirectory(
-                prefix=".kestrel-skill-edit-"
-            ) as temporary:
-                staged_root = Path(temporary).resolve(strict=True)
+            _require_record_snapshot(record, snapshot)
+            with self.git_checkout_workspace() as workspace:
+                staged_root = workspace.resolve(strict=True)
                 staged_folder = staged_root / record.name
                 _materialize_validated_folder(snapshot, staged_folder)
                 atomic_write_primary(staged_folder, payload, overwrite=True)
-                candidate = validate_skill_folder(
-                    staged_folder, source_root=staged_root
+                validate_skill_folder(staged_folder, source_root=staged_root)
+                candidate = inspect_skill_folder(staged_folder, source_root=staged_root)
+                self._publish_replacement_folder(
+                    root_fd=root_fd,
+                    staged_root=staged_root,
+                    record=record,
+                    candidate=candidate,
                 )
-
-            # Validation and publication share the per-skill lock, so every
-            # candidate includes the preceding resource/primary mutation.
-            self._require_local(record)
-            descriptor = _open_directory_at(
-                root_fd,
-                record.name,
-                expected=record.folder_identity,
-            )
-            try:
-                _atomic_write_primary_at(
-                    descriptor,
-                    record.name,
-                    payload,
-                    overwrite=True,
-                    artifact_directory_fd=artifact_fd,
-                )
-            finally:
-                os.close(descriptor)
-        return candidate
+        return candidate.document
 
     def rollback_created(
         self,
@@ -1710,45 +2159,24 @@ class SkillStore:
     def read_file(self, record: SkillRecord, relative_path: str) -> str:
         validate_resource_path(relative_path)
         folder = self._require_real_folder(record)
-        relative = Path(*PurePosixPath(relative_path).parts)
         folder_fd = _open_directory(folder, expected=record.folder_identity)
         try:
-            parent_fd, filename = _open_parent_at(folder_fd, relative)
-            try:
-                flags = (
-                    os.O_RDONLY
-                    | getattr(os, "O_NOFOLLOW", 0)
-                    | getattr(os, "O_CLOEXEC", 0)
-                    | getattr(os, "O_NONBLOCK", 0)
-                )
-                try:
-                    descriptor = os.open(filename, flags, dir_fd=parent_fd)
-                except OSError as exc:
-                    raise SkillPathError(
-                        "requested skill path must be a regular file without symlinks"
-                    ) from exc
-                try:
-                    value = os.fstat(descriptor)
-                    if not stat.S_ISREG(value.st_mode):
-                        raise SkillPathError(
-                            "requested skill path must be a regular file"
-                        )
-                    if value.st_size > MAX_EDITOR_FILE_BYTES:
-                        raise SkillFormatError(
-                            f"file exceeds {MAX_EDITOR_FILE_BYTES} bytes"
-                        )
-                    with os.fdopen(descriptor, "rb", closefd=False) as handle:
-                        payload = handle.read(MAX_EDITOR_FILE_BYTES + 1)
-                    if len(payload) > MAX_EDITOR_FILE_BYTES:
-                        raise SkillFormatError(
-                            f"file exceeds {MAX_EDITOR_FILE_BYTES} bytes"
-                        )
-                finally:
-                    os.close(descriptor)
-            finally:
-                os.close(parent_fd)
+            snapshot = inspect_skill_folder_descriptor(
+                folder_fd,
+                folder_name=record.name,
+            )
         finally:
             os.close(folder_fd)
+        _require_record_snapshot(record, snapshot)
+        entry = next(
+            (item for item in snapshot.entries if item.path == relative_path),
+            None,
+        )
+        if entry is None or entry.payload is None:
+            raise SkillPathError(
+                "requested skill path must be an inventoried regular file"
+            )
+        payload = entry.payload
         try:
             return payload.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -1782,7 +2210,7 @@ class SkillStore:
             record.name,
             root_identity=self._local_root_identity,
             internal_root_identity=self._internal_root_identity,
-        ) as (root_fd, artifact_fd):
+        ) as (root_fd, _artifact_fd):
             folder = self._require_local(record)
             path = lexical_contained_path(folder, relative.as_posix(), must_exist=False)
             reject_symlink_chain(folder, path)
@@ -1791,10 +2219,9 @@ class SkillStore:
                 record.name,
                 expected=record.folder_identity,
             )
-            with tempfile.TemporaryDirectory(
-                prefix=".kestrel-skill-edit-"
-            ) as temporary:
-                staged_root = Path(temporary).resolve(strict=True)
+            _require_record_snapshot(record, snapshot)
+            with self.git_checkout_workspace() as workspace:
+                staged_root = workspace.resolve(strict=True)
                 staged_folder = staged_root / record.name
                 _materialize_validated_folder(snapshot, staged_folder)
                 staged_path = lexical_contained_path(
@@ -1805,55 +2232,16 @@ class SkillStore:
                 reject_symlink_chain(staged_folder, staged_path)
                 atomic_replace_file(staged_path, payload)
                 validate_skill_folder(staged_folder, source_root=staged_root)
-
-            # The complete candidate was valid. The held lock makes publication
-            # part of the same serial transaction as complete-folder validation.
-            folder = self._require_local(record)
-            path = lexical_contained_path(folder, relative.as_posix(), must_exist=False)
-            reject_symlink_chain(folder, path)
-            folder_fd = _open_directory_at(
-                root_fd,
-                record.name,
-                expected=record.folder_identity,
-            )
-            created_parents: list[CreatedParentDirectory] = []
-            try:
-                try:
-                    parent_fd, filename = _open_parent_at(
-                        folder_fd,
-                        path.relative_to(folder),
-                        create=True,
-                        created_parents=created_parents,
-                    )
-                    try:
-                        _atomic_replace_file_at(
-                            parent_fd,
-                            filename,
-                            payload,
-                            artifact_directory_fd=artifact_fd,
-                            artifact_label=record.name,
-                        )
-                    finally:
-                        os.close(parent_fd)
-                except BaseException as exc:
-                    try:
-                        _release_created_parent_directories(
-                            created_parents,
-                            rollback=True,
-                        )
-                    except SkillPublicationCleanupError as cleanup_exc:
-                        cleanup_exc.add_note(
-                            f"original resource edit failure: {type(exc).__name__}: {exc}"
-                        )
-                        raise cleanup_exc from exc
-                    raise
-                else:
-                    _release_created_parent_directories(
-                        created_parents,
-                        rollback=False,
-                    )
-            finally:
-                os.close(folder_fd)
+                candidate = inspect_skill_folder(
+                    staged_folder,
+                    source_root=staged_root,
+                )
+                self._publish_replacement_folder(
+                    root_fd=root_fd,
+                    staged_root=staged_root,
+                    record=record,
+                    candidate=candidate,
+                )
 
     @staticmethod
     def file_is_editable(record: SkillRecord, relative_path: str) -> bool:
@@ -1883,6 +2271,7 @@ class SkillStore:
             )
         finally:
             os.close(folder_fd)
+        _require_record_snapshot(record, snapshot)
         entries: list[dict[str, object]] = []
         for entry in sorted(snapshot.entries, key=lambda item: item.path):
             path = Path(entry.path)
@@ -2032,10 +2421,10 @@ class SkillStore:
                             folder_identity=created_identity,
                             snapshot=published_snapshot,
                         )
-                        try:
-                            os.fsync(target_fd)
-                        except OSError:
-                            pass
+                        _fsync_validated_directories_at(
+                            target_fd,
+                            published_snapshot,
+                        )
                     finally:
                         os.close(target_fd)
                     if _identity_at(root_fd, staging_name) != created_identity:
@@ -2126,11 +2515,66 @@ class SkillStore:
                 current.st_dev,
                 current.st_ino,
             )
-            _remove_expected_directory_at(
+            quarantine = _quarantine_directory_at(
                 root_fd,
                 record.name,
                 expected=expected_identity,
             )
+            try:
+                snapshot = _inspect_child_at(
+                    root_fd,
+                    quarantine,
+                    expected=expected_identity,
+                    folder_name=record.name,
+                )
+                _require_record_snapshot(record, snapshot)
+            except BaseException as inspection_error:
+                try:
+                    _restore_quarantined_directory_at(
+                        root_fd,
+                        quarantine,
+                        record.name,
+                        expected=expected_identity,
+                    )
+                except Exception as restoration_error:  # noqa: BLE001
+                    inspection_error.add_note(str(restoration_error))
+                raise
+            _remove_quarantined_directory_at(
+                root_fd,
+                quarantine,
+                expected=expected_identity,
+            )
+
+    def assert_current(self, record: SkillRecord) -> None:
+        """Check one folder generation under the cooperative mutation lock."""
+
+        if record.folder != self.local_root / record.name:
+            folder = self._require_real_folder(record)
+            folder_fd = _open_directory(folder, expected=record.folder_identity)
+            try:
+                snapshot = inspect_skill_folder_descriptor(
+                    folder_fd,
+                    folder_name=record.name,
+                )
+            finally:
+                os.close(folder_fd)
+            _require_record_snapshot(record, snapshot)
+            return
+
+        with _serialized_skill_mutation(
+            self.local_root,
+            self._internal_root,
+            record.name,
+            root_identity=self._local_root_identity,
+            internal_root_identity=self._internal_root_identity,
+        ) as (root_fd, _artifact_fd):
+            self._require_local(record)
+            snapshot = _inspect_child_at(
+                root_fd,
+                record.name,
+                expected=record.folder_identity,
+            )
+            _require_record_snapshot(record, snapshot)
 
     def require_local_record(self, record: SkillRecord) -> None:
         """Fail before persistent side effects when a record is not mutable here."""

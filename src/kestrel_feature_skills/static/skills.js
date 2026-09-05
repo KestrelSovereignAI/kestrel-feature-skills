@@ -2,7 +2,7 @@ import API from '/js/api.js';
 import { registerPanel, syncNav } from '/js/ui-ext/panels.js';
 import bus from '/js/ui-ext/bus.js';
 
-const PANEL_ID = 'procedural-skills';
+const PANEL_ID = 'skills';
 const ROOT = '/api/procedural-skills';
 const state = {
   active: false,

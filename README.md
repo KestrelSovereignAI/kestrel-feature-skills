@@ -59,6 +59,13 @@ even when the directory contains non-skill or hidden files.
 Mutation locks and crash-safe edit temporaries live below the single hidden
 `<agent-data>/skills/.kestrel-internal/` directory. They are never placed in a
 published skill folder or charged individually against source discovery.
+Deletion atomically retires the complete skill generation into this private
+directory before returning; it never recursively unlinks a public or
+recovery-visible name. It then best-effort purges the retired generation only
+inside `.kestrel-internal`; a later store startup retries interrupted cleanup.
+That directory is implementation-owned recovery state, not a supported
+direct-edit surface; direct filesystem edits remain supported only in named
+skill folders.
 
 ## Permission rails
 
@@ -122,6 +129,8 @@ Console surfaces. The live test requires `KESTREL_KITE_HOSTED_PROVIDER` and
 `KESTREL_KITE_HOSTED_MODEL`; it accepts only hosted Claude Haiku or GPT-5.6
 Luna routes and asserts that the invoke response reports the exact pinned
 provider and model. It never accepts a local-model fallback as release evidence.
+The isolated Kite agent must enable both `BootstrapFeature` (so the test can
+complete onboarding through `!skip-discovery`) and `ProceduralSkillsFeature`.
 
 Version tags matching `vX.Y.Z` run the complete reusable CI workflow against
 the exact tag SHA before building and uploading through PyPI trusted publishing.

@@ -69,7 +69,7 @@ async function openPanel(page) {
   }, API_KEY);
   await page.goto('/');
   await page.waitForLoadState('networkidle');
-  const tab = page.locator('.nav-tab[data-panel="procedural-skills"]');
+  const tab = page.locator('.nav-tab[data-panel="skills"]');
   if (!(await tab.isVisible().catch(() => false))) {
     const kite = page.getByText(new RegExp(`^${AGENT}$`, 'i')).last();
     if (await kite.isVisible().catch(() => false)) await kite.click();
@@ -81,8 +81,8 @@ async function openPanel(page) {
   await expect(tab).toBeVisible({ timeout: 20_000 });
   await tab.click();
   await expect(tab).toHaveClass(/active/);
-  await expect(page.locator('#panel-procedural-skills')).toBeVisible();
-  await expect(page.locator('#panel-procedural-skills')).toContainText('Procedural skills');
+  await expect(page.locator('#panel-skills')).toBeVisible();
+  await expect(page.locator('#panel-skills')).toContainText('Procedural skills');
   await expect.poll(
     () => page.evaluate(async () => {
       const module = await import('/js/api.js');
@@ -105,6 +105,18 @@ test.describe.serial('procedural skills contributed console', () => {
     await deleteFixture(request, SKILL_NAME);
   });
 
+  test('capability opt-out suppresses the contributed panel', async ({ page }) => {
+    await page.addInitScript(({ key }) => {
+      globalThis.sessionStorage.setItem('kestrel_api_key', key);
+      globalThis.KESTREL_UI_CONFIG = {
+        capabilities: { 'procedural-skills': false },
+      };
+    }, { key: API_KEY });
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+    await expect(page.locator('.nav-tab[data-panel="skills"]')).toHaveCount(0);
+  });
+
   test('navigator renders the folder tree and opens SKILL.md', async ({ page }) => {
     await openPanel(page);
     await page.getByRole('button', { name: SKILL_NAME }).click();
@@ -116,7 +128,7 @@ test.describe.serial('procedural skills contributed console', () => {
     await expect(page.getByRole('button', { name: 'SKILL.md' })).toBeVisible();
     await page.getByRole('button', { name: 'SKILL.md' }).click();
     await expect(page.getByLabel('Skill file editor')).toHaveValue(new RegExp(DESCRIPTION));
-    await expect(page.locator('#panel-procedural-skills')).toContainText('est. tokens');
+    await expect(page.locator('#panel-skills')).toContainText('est. tokens');
   });
 
   test('admin add creates a disabled skill through the modal', async ({ page, request }) => {
@@ -243,14 +255,14 @@ test.describe.serial('procedural skills contributed console', () => {
       bus.emit('agent:switch', { prev: 'kite', next: 'other-agent' });
     });
 
-    await expect(page.locator('.nav-tab[data-panel="procedural-skills"]')).toHaveCount(0);
+    await expect(page.locator('.nav-tab[data-panel="skills"]')).toHaveCount(0);
     await expect(editor).toHaveCount(0);
     await expect(page.getByTestId('skills-save')).toHaveCount(0);
   });
 
   test('route disappearance removes the stale panel and recovery restores it', async ({ page }) => {
     await openPanel(page);
-    const tab = page.locator('.nav-tab[data-panel="procedural-skills"]');
+    const tab = page.locator('.nav-tab[data-panel="skills"]');
     await page.route(new RegExp(`${API_ROOT}$`), async (route) => {
       await route.fulfill({
         status: 404,
@@ -271,13 +283,13 @@ test.describe.serial('procedural skills contributed console', () => {
     await expect(tab).toBeVisible();
     await tab.click();
     await expect(tab).toHaveClass(/active/);
-    await expect(page.locator('#panel-procedural-skills')).toBeVisible();
+    await expect(page.locator('#panel-skills')).toBeVisible();
     await expect(page.getByRole('button', { name: SKILL_NAME })).toBeVisible();
   });
 
   test('superseding catalog failure still tears down unavailable feature UI', async ({ page }) => {
     await openPanel(page);
-    const tab = page.locator('.nav-tab[data-panel="procedural-skills"]');
+    const tab = page.locator('.nav-tab[data-panel="skills"]');
     let requestCount = 0;
     let releaseFirst;
     const firstReleased = new Promise((resolve) => { releaseFirst = resolve; });
@@ -304,7 +316,7 @@ test.describe.serial('procedural skills contributed console', () => {
       await expect.poll(() => requestCount).toBeGreaterThanOrEqual(2);
       releaseFirst();
       await expect(tab).toHaveCount(0);
-      await expect(page.locator('#panel-procedural-skills')).toHaveCount(0);
+      await expect(page.locator('#panel-skills')).toHaveCount(0);
     } finally {
       releaseFirst();
       await page.unrouteAll({ behavior: 'ignoreErrors' });
@@ -314,13 +326,13 @@ test.describe.serial('procedural skills contributed console', () => {
   test('recreated active panel container remounts its feature body', async ({ page }) => {
     await openPanel(page);
     await page.evaluate(async () => {
-      document.getElementById('panel-procedural-skills')?.remove();
+      document.getElementById('panel-skills')?.remove();
       const panels = await import('/js/ui-ext/panels.js');
       panels.syncNav();
-      document.querySelector('.nav-tab[data-panel="procedural-skills"]')?.click();
+      document.querySelector('.nav-tab[data-panel="skills"]')?.click();
     });
 
-    await expect(page.locator('#panel-procedural-skills')).toBeVisible();
+    await expect(page.locator('#panel-skills')).toBeVisible();
     await expect(page.getByRole('button', { name: SKILL_NAME })).toBeVisible();
   });
 
@@ -338,7 +350,7 @@ test.describe.serial('procedural skills contributed console', () => {
 
     await expect(editor).toBeVisible();
     await expect(editor).toHaveValue(unsaved);
-    await expect(page.locator('#panel-procedural-skills')).toBeVisible();
+    await expect(page.locator('#panel-skills')).toBeVisible();
   });
 
   test('catalog refresh updates selected state controls without losing the editor', async ({ page, request }) => {

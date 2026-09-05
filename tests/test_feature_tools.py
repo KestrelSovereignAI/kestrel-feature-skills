@@ -707,6 +707,44 @@ async def test_state_update_refreshes_external_publication_before_precheck(featu
 
 
 @pytest.mark.asyncio
+async def test_state_change_rolls_back_when_folder_changes_during_persistence(
+    feature, monkeypatch
+):
+    name = "state-content-race"
+    await feature.skill_create(name, "Original", "Original procedure.")
+    record = feature.snapshot.by_name()[name]
+    folder = feature.agent.procedural_skills_root / name
+    external = serialize_skill_markdown(
+        SkillDocument(name, "External", "EXTERNAL procedure.")
+    )
+    real_set = feature._enablement.set
+    injected = False
+
+    async def persist_then_mutate(*args, **kwargs):
+        nonlocal injected
+        state = await real_set(*args, **kwargs)
+        if not injected:
+            injected = True
+            (folder / "SKILL.md").write_text(external, encoding="utf-8")
+        return state
+
+    monkeypatch.setattr(feature._enablement, "set", persist_then_mutate)
+
+    with pytest.raises(SkillConflictError, match="changed after it was read"):
+        await feature.set_skill_state(
+            name=name,
+            enabled=True,
+            priority=19,
+            expected_revision=record.revision,
+        )
+
+    assert injected
+    assert (await feature._enablement.load())[name] == SkillState(False, 100)
+    assert feature.snapshot.by_name()[name].state == SkillState(False, 100)
+    assert (folder / "SKILL.md").read_text(encoding="utf-8") == external
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "initial_enabled, requested_enabled",
     ((False, True), (True, False)),
@@ -2312,13 +2350,27 @@ async def test_git_install_records_revision_and_leaves_skill_disabled(
         "https://example.com/repo.git", "remote", "main"
     )
     assert result.status is ToolResultStatus.OK
-    assert result.data["revision"] == "b" * 40
+    assert result.data["source_revision"] == "b" * 40
+    assert len(result.data["revision"]) == 64
     assert result.data["enabled"] is False
     await feature.refresh()
     record = feature.snapshot.by_name()["remote"]
+    assert result.data["revision"] == record.revision
     assert record.provenance.revision == "b" * 40
     assert record.provenance.remote_url == "https://example.com/repo.git"
     assert record.state.enabled is False
+    edited = await feature.edit_skill(
+        name="remote",
+        relative_path="SKILL.md",
+        content=serialize_skill_markdown(
+            SkillDocument("remote", "Edited after install", "body")
+        ),
+        expected_revision=result.data["revision"],
+    )
+    assert edited["revision"] != result.data["revision"]
+    assert feature.snapshot.by_name()["remote"].document.description == (
+        "Edited after install"
+    )
 
 
 @pytest.mark.asyncio
@@ -2530,7 +2582,8 @@ async def test_git_install_refreshes_a_stale_conflict_before_checkout(
         ref="main",
     )
 
-    assert installed["revision"] == "a" * 40
+    assert installed["source_revision"] == "a" * 40
+    assert installed["revision"] == feature.snapshot.by_name()[name].revision
     assert installed["enabled"] is False
     assert feature.snapshot.by_name()[name].document.description == "Fresh remote skill"
 

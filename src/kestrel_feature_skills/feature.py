@@ -238,10 +238,7 @@ class ProceduralSkillsFeature(Feature):
             static_dir=str(_STATIC_DIR),
             modules=["skills.js"],
             css=["skills.css"],
-            # Core 0.53.x cannot derive a feature capability for an extracted
-            # class absent from its static registry. The module therefore
-            # probes its live, agent-scoped route and gates its own panel.
-            capability=None,
+            capability="procedural-skills",
         )
 
     def get_feature_permission_defaults(self) -> FeaturePermissionDefaults:
@@ -990,7 +987,7 @@ class ProceduralSkillsFeature(Feature):
                     f"skill {name!r} changed or became invalid after editing; "
                     "reload and repair its folder"
                 )
-            if not _same_resolved_folder(record, resolved):
+            if resolved.folder != record.folder or not resolved.editable:
                 raise SkillConflictError(
                     f"resolved source changed after editing {name}; reload before "
                     "making another change"
@@ -1039,6 +1036,7 @@ class ProceduralSkillsFeature(Feature):
             # against the catalog version protected by the same name claim.
             await self._refresh_locked()
             return await self._set_skill_state_with_publication_claim(
+                store=store,
                 enablement=enablement,
                 name=name,
                 enabled=enabled,
@@ -1049,6 +1047,7 @@ class ProceduralSkillsFeature(Feature):
     async def _set_skill_state_with_publication_claim(
         self,
         *,
+        store: SkillStore,
         enablement: SkillEnablementStore,
         name: str,
         enabled: bool,
@@ -1064,6 +1063,9 @@ class ProceduralSkillsFeature(Feature):
         resolved_priority = (
             record.state.priority if priority is None else validate_priority(priority)
         )
+        store.assert_current(record)
+        previous_state_present = name in self._states
+        previous_state = self._states.get(name, record.state)
         try:
             state = await enablement.set(
                 name, enabled=enabled, priority=resolved_priority
@@ -1073,6 +1075,28 @@ class ProceduralSkillsFeature(Feature):
             observed_states = await enablement.load()
             self._states = dict(observed_states)
             await self._rebuild_snapshot_locked(self._states)
+            raise
+        try:
+            store.assert_current(record)
+        except BaseException as consistency_error:
+            try:
+                if previous_state_present:
+                    await enablement.set(
+                        name,
+                        enabled=previous_state.enabled,
+                        priority=previous_state.priority,
+                    )
+                    self._states[name] = previous_state
+                else:
+                    await enablement.delete(name)
+                    self._states.pop(name, None)
+            except DatabaseError as rollback_error:
+                consistency_error.add_note(
+                    "state rollback after a concurrent skill-folder change failed: "
+                    f"{rollback_error}"
+                )
+                self._enablement_error = str(rollback_error)
+            await self._refresh_locked()
             raise
         self._states[name] = state
         await self._refresh_locked()
@@ -1317,7 +1341,8 @@ class ProceduralSkillsFeature(Feature):
         return {
             "name": skill_name,
             "folder": str(operation.folder),
-            "revision": checkout.revision,
+            "revision": record.revision,
+            "source_revision": checkout.revision,
             "remote_url": checkout.remote_url,
             "enabled": record.state.enabled,
             "indexed": skill_name in self._indexed_names,
@@ -1736,7 +1761,7 @@ class ProceduralSkillsFeature(Feature):
     )
     async def skill_read(self, name: str, path: str = SKILL_FILENAME) -> ToolResult:
         try:
-            async with self.persistent_read():
+            async with self.persistent_read(refresh=True):
                 inventory = self.read_skill(name=name)
                 if path == SKILL_FILENAME:
                     payload = inventory
@@ -1913,12 +1938,12 @@ class ProceduralSkillsFeature(Feature):
             return ToolResult.failed(str(exc))
         if payload["state_error"]:
             return ToolResult.partial(
-                f"Installed procedural skill {skill_name} at {payload['revision']} and left it disabled.",
+                f"Installed procedural skill {skill_name} at {payload['source_revision']} and left it disabled.",
                 str(payload["state_error"]),
                 data=payload,
             )
         return ToolResult.ok(
-            f"Installed procedural skill {skill_name} at {payload['revision']} and left it disabled.",
+            f"Installed procedural skill {skill_name} at {payload['source_revision']} and left it disabled.",
             data=payload,
         )
 

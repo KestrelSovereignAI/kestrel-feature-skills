@@ -254,8 +254,8 @@ async def test_file_read_rejects_symlink_added_after_catalog_discovery(client, f
         params={"path": "notes.md"},
     )
 
-    assert opened.status_code == 422
-    assert "symlink" in opened.json()["detail"]
+    assert opened.status_code == 404
+    assert "not found" in opened.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -547,13 +547,41 @@ async def test_stale_revision_cannot_overwrite_newer_state(client):
     assert (await _record(client, name))["enabled"] is True
 
 
+@pytest.mark.asyncio
+async def test_file_read_refreshes_content_and_revision_as_one_snapshot(
+    client, feature
+):
+    name = "coherent-read"
+    await client.post(
+        "/api/procedural-skills",
+        json={"name": name, "description": "Original", "body": "original body"},
+    )
+    before = await _record(client, name)
+    folder = feature.agent.procedural_skills_root / name
+    replacement = serialize_skill_markdown(
+        SkillDocument(name, "External", "EXTERNAL body")
+    )
+    (folder / "SKILL.md").write_text(replacement, encoding="utf-8")
+
+    opened = await client.get(
+        f"/api/procedural-skills/{name}/file",
+        params={"path": "SKILL.md"},
+    )
+    after = await _record(client, name)
+
+    assert opened.status_code == 200
+    assert opened.json()["content"] == replacement
+    assert opened.json()["revision"] == after["revision"]
+    assert after["revision"] != before["revision"]
+
+
 def test_ui_bundle_contains_required_rails_and_no_run_control(feature):
     ui = feature.get_ui_contributions()
     static = Path(ui.static_dir)
     source = (static / "skills.js").read_text(encoding="utf-8")
     assert ui.modules == ["skills.js"]
     assert ui.css == ["skills.css"]
-    assert ui.capability is None
+    assert ui.capability == "procedural-skills"
     assert "registerPanel" in source
     assert "name.pattern = '[a-z0-9](?:[a-z0-9_\\\\-]{0,62}[a-z0-9])?'" in source
     assert "skills-delete-approval" in source

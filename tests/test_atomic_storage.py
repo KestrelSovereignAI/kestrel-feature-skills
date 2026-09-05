@@ -17,12 +17,14 @@ from kestrel_feature_skills.errors import (
     SkillConflictError,
     SkillFormatError,
     SkillPathError,
+    SkillPublicationCleanupError,
 )
 from kestrel_feature_skills.format import (
     MAX_FOLDER_BYTES,
     MAX_FOLDER_FILES,
     MAX_RESOURCE_PATH_BYTES,
     MAX_SKILL_FILE_BYTES,
+    inspect_skill_folder,
     serialize_skill_markdown,
     validate_skill_folder,
 )
@@ -765,36 +767,17 @@ def test_primary_write_failure_does_not_leave_public_artifact_or_quarantine(
         precedence=0,
     ).discover()[0][0]
     original = (folder / "SKILL.md").read_bytes()
-    internal_identity = (
-        store._internal_root.stat().st_dev,
-        store._internal_root.stat().st_ino,
-    )
-    real_write = store_module._write_tmp_at
-    real_fsync = store_module.os.fsync
-    failing_internal_write = False
+    real_validate = store_module.validate_skill_folder
     injected = False
 
-    def track_internal_write(directory_fd, name, payload):
-        nonlocal failing_internal_write
-        directory = os.fstat(directory_fd)
-        failing_internal_write = bool(
-            (directory.st_dev, directory.st_ino) == internal_identity
-            and name.startswith(".primary-write-failure.primary.tmp.")
-        )
-        try:
-            return real_write(directory_fd, name, payload)
-        finally:
-            failing_internal_write = False
-
-    def fail_internal_fsync(descriptor):
+    def fail_staged_validation(candidate, *, source_root):
         nonlocal injected
-        if failing_internal_write:
+        if candidate != folder:
             injected = True
             raise OSError("simulated primary write failure")
-        return real_fsync(descriptor)
+        return real_validate(candidate, source_root=source_root)
 
-    monkeypatch.setattr(store_module, "_write_tmp_at", track_internal_write)
-    monkeypatch.setattr(store_module.os, "fsync", fail_internal_fsync)
+    monkeypatch.setattr(store_module, "validate_skill_folder", fail_staged_validation)
 
     with pytest.raises(OSError, match="primary write failure"):
         store.edit_primary(
@@ -807,7 +790,7 @@ def test_primary_write_failure_does_not_leave_public_artifact_or_quarantine(
     assert injected
     assert (folder / "SKILL.md").read_bytes() == original
     assert list(folder.glob(".SKILL.md.tmp.*")) == []
-    assert list(store._internal_root.glob(".primary-write-failure.primary.tmp.*")) == []
+    assert list(store._internal_root.glob(".kestrel-skill-git-*")) == []
     records, errors = DirectorySkillSource(
         root=store.local_root,
         source_id="agent-local",
@@ -920,36 +903,17 @@ def test_resource_write_failure_does_not_inventory_public_temporary(
         kind="agent-local",
         precedence=0,
     ).discover()[0][0]
-    internal_identity = (
-        store._internal_root.stat().st_dev,
-        store._internal_root.stat().st_ino,
-    )
-    real_write = store_module._write_tmp_at
-    real_fsync = store_module.os.fsync
-    failing_internal_write = False
+    real_validate = store_module.validate_skill_folder
     injected = False
 
-    def track_internal_write(directory_fd, name, payload):
-        nonlocal failing_internal_write
-        directory = os.fstat(directory_fd)
-        failing_internal_write = bool(
-            (directory.st_dev, directory.st_ino) == internal_identity
-            and name.startswith(".resource-write-failure.resource.tmp.")
-        )
-        try:
-            return real_write(directory_fd, name, payload)
-        finally:
-            failing_internal_write = False
-
-    def fail_internal_fsync(descriptor):
+    def fail_staged_validation(candidate, *, source_root):
         nonlocal injected
-        if failing_internal_write:
+        if candidate != folder:
             injected = True
             raise OSError("simulated resource write failure")
-        return real_fsync(descriptor)
+        return real_validate(candidate, source_root=source_root)
 
-    monkeypatch.setattr(store_module, "_write_tmp_at", track_internal_write)
-    monkeypatch.setattr(store_module.os, "fsync", fail_internal_fsync)
+    monkeypatch.setattr(store_module, "validate_skill_folder", fail_staged_validation)
 
     with pytest.raises(OSError, match="resource write failure"):
         store.write_file(record, "notes.md", "Replacement.")
@@ -957,9 +921,7 @@ def test_resource_write_failure_does_not_inventory_public_temporary(
     assert injected
     assert not (folder / "notes.md").exists()
     assert list(folder.glob(".tmp.*")) == []
-    assert (
-        list(store._internal_root.glob(".resource-write-failure.resource.tmp.*")) == []
-    )
+    assert list(store._internal_root.glob(".kestrel-skill-git-*")) == []
     records, errors = DirectorySkillSource(
         root=store.local_root,
         source_id="agent-local",
@@ -987,7 +949,7 @@ def test_nested_resource_write_failure_removes_new_empty_parent_directories(
     def fail_publication(*args, **kwargs):
         raise OSError("simulated nested resource publication failure")
 
-    monkeypatch.setattr(store_module, "_atomic_replace_file_at", fail_publication)
+    monkeypatch.setattr(store_module, "_exchange_directories_at", fail_publication)
 
     with pytest.raises(OSError, match="nested resource publication failure"):
         store.write_file(record, "docs/new/note.md", "replacement")
@@ -1022,7 +984,7 @@ def test_nested_resource_write_failure_preserves_preexisting_parent(
     def fail_publication(*args, **kwargs):
         raise OSError("simulated nested resource publication failure")
 
-    monkeypatch.setattr(store_module, "_atomic_replace_file_at", fail_publication)
+    monkeypatch.setattr(store_module, "_exchange_directories_at", fail_publication)
 
     with pytest.raises(OSError, match="nested resource publication failure"):
         store.write_file(record, "docs/new/note.md", "replacement")
@@ -1044,26 +1006,224 @@ def test_nested_resource_write_rollback_preserves_replaced_parent(
         kind="agent-local",
         precedence=0,
     ).discover()[0][0]
-    displaced = tmp_path / "displaced-created-parent"
     marker = folder / "docs" / "new" / "replacement-survived.md"
+    real_exchange = store_module._exchange_directories_at
+    injected = False
 
-    def replace_parent_then_fail(*args, **kwargs):
-        (folder / "docs" / "new").rename(displaced)
-        (folder / "docs" / "new").mkdir()
-        marker.write_text("replacement", encoding="utf-8")
-        raise OSError("simulated raced parent replacement")
+    def publish_after_external_parent_appears(*args, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            marker.parent.mkdir(parents=True)
+            marker.write_text("replacement", encoding="utf-8")
+        return real_exchange(*args, **kwargs)
 
     monkeypatch.setattr(
         store_module,
-        "_atomic_replace_file_at",
-        replace_parent_then_fail,
+        "_exchange_directories_at",
+        publish_after_external_parent_appears,
     )
 
-    with pytest.raises(OSError, match="raced parent replacement"):
+    with pytest.raises(SkillConflictError, match="changed after it was read"):
         store.write_file(record, "docs/new/note.md", "replacement")
 
+    assert injected
     assert marker.read_text(encoding="utf-8") == "replacement"
-    assert displaced.is_dir()
+
+
+def test_second_exchange_preserves_late_public_change(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    name = "second-exchange-race"
+    folder = store.create(SkillDocument(name, "Original", "Original procedure."))
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    old_external = serialize_skill_markdown(
+        SkillDocument(name, "Old external", "OLD-EXTERNAL procedure.")
+    )
+    late_public = serialize_skill_markdown(
+        SkillDocument(name, "Late public", "LATE-PUBLIC procedure.")
+    )
+    desired = serialize_skill_markdown(
+        SkillDocument(name, "Desired", "Desired procedure.")
+    )
+    real_exchange = store_module._exchange_directories_at
+    exchange_count = 0
+
+    def mutate_each_exchange(*args, **kwargs):
+        nonlocal exchange_count
+        exchange_count += 1
+        if exchange_count == 1:
+            (folder / "SKILL.md").write_text(old_external, encoding="utf-8")
+        elif exchange_count == 2:
+            (folder / "SKILL.md").write_text(late_public, encoding="utf-8")
+        return real_exchange(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store_module,
+        "_exchange_directories_at",
+        mutate_each_exchange,
+    )
+
+    with pytest.raises(SkillConflictError, match="changed after it was read"):
+        store.edit_primary(record, desired)
+
+    assert exchange_count == 2
+    assert (folder / "SKILL.md").read_text(encoding="utf-8") == old_external
+    preserved = list(store.local_root.glob(".kestrel-edit-conflict-*"))
+    assert len(preserved) == 1
+    assert (preserved[0] / "SKILL.md").read_text(encoding="utf-8") == late_public
+
+
+def test_atomic_exchange_fsyncs_both_directory_entries(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    name = "durable-exchange"
+    store.create(SkillDocument(name, "Original", "Original procedure."))
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    real_fsync_pair = store_module._fsync_directory_pair
+    synced_pairs = []
+
+    def record_fsync_pair(first_fd, second_fd):
+        synced_pairs.append((os.fstat(first_fd).st_ino, os.fstat(second_fd).st_ino))
+        return real_fsync_pair(first_fd, second_fd)
+
+    monkeypatch.setattr(store_module, "_fsync_directory_pair", record_fsync_pair)
+
+    store.edit_primary(
+        record,
+        serialize_skill_markdown(SkillDocument(name, "Edited", "Edited procedure.")),
+    )
+
+    assert len(synced_pairs) == 1
+    assert synced_pairs[0][0] != synced_pairs[0][1]
+
+
+def test_validated_tree_fsync_visits_nested_resource_directories(tmp_path, monkeypatch):
+    folder = tmp_path / "durable-tree"
+    nested = folder / "resources" / "nested"
+    nested.mkdir(parents=True)
+    (folder / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("durable-tree", "Durable tree", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+    (nested / "notes.md").write_text("notes", encoding="utf-8")
+    snapshot = inspect_skill_folder(folder, source_root=tmp_path)
+    expected = {
+        folder.stat().st_ino,
+        (folder / "resources").stat().st_ino,
+        nested.stat().st_ino,
+    }
+    synced = set()
+    real_fsync = os.fsync
+
+    def record_fsync(descriptor):
+        synced.add(os.fstat(descriptor).st_ino)
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(store_module.os, "fsync", record_fsync)
+    folder_fd = os.open(
+        folder,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        store_module._fsync_validated_directories_at(folder_fd, snapshot)
+    finally:
+        os.close(folder_fd)
+
+    assert expected <= synced
+
+
+def test_edit_wires_nested_tree_fsync_before_exchange(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    name = "durable-edit-tree"
+    folder = store.create(SkillDocument(name, "Original", "Original procedure."))
+    nested = folder / "resources" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "notes.md").write_text("notes", encoding="utf-8")
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    real_fsync_tree = store_module._fsync_validated_directories_at
+    calls = []
+
+    def record_fsync_tree(folder_fd, snapshot):
+        calls.append({entry.path for entry in snapshot.entries if entry.is_directory})
+        return real_fsync_tree(folder_fd, snapshot)
+
+    monkeypatch.setattr(
+        store_module,
+        "_fsync_validated_directories_at",
+        record_fsync_tree,
+    )
+
+    store.edit_primary(
+        record,
+        serialize_skill_markdown(SkillDocument(name, "Edited", "Edited procedure.")),
+    )
+
+    assert calls == [{"resources", "resources/nested"}]
+
+
+def test_edit_workspace_cleanup_preserves_raced_path_replacement(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    name = "workspace-cleanup-race"
+    store.create(SkillDocument(name, "Original", "Original procedure."))
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    marker = victim / "DO-NOT-DELETE"
+    marker.write_text("survive", encoding="utf-8")
+    displaced_workspace = tmp_path / "displaced-edit-workspace"
+    real_publish = store._publish_replacement_folder
+    replacement_path = None
+
+    def replace_workspace_after_publication(**kwargs):
+        nonlocal replacement_path
+        result = real_publish(**kwargs)
+        staged_root = kwargs["staged_root"]
+        staged_root.rename(displaced_workspace)
+        victim.rename(staged_root)
+        replacement_path = staged_root
+        return result
+
+    monkeypatch.setattr(
+        store,
+        "_publish_replacement_folder",
+        replace_workspace_after_publication,
+    )
+    try:
+        with pytest.raises(SkillPathError, match="changed after validation"):
+            store.edit_primary(
+                record,
+                serialize_skill_markdown(
+                    SkillDocument(name, "Edited", "Edited procedure.")
+                ),
+            )
+
+        assert replacement_path is not None
+        assert (replacement_path / marker.name).read_text(encoding="utf-8") == "survive"
+    finally:
+        shutil.rmtree(displaced_workspace, ignore_errors=True)
+        if replacement_path is not None:
+            shutil.rmtree(replacement_path, ignore_errors=True)
 
 
 def test_normal_lock_accumulation_does_not_consume_source_entry_budget(tmp_path):
@@ -1103,6 +1263,28 @@ def test_normal_lock_accumulation_does_not_consume_source_entry_budget(tmp_path)
     assert len(store_module._PUBLICATION_STATE_LOCKS) == 256
     assert [item.name for item in records] == ["lock-budget-survivor"]
     assert errors == ()
+
+
+def test_source_publication_locks_are_bounded_across_agent_roots(tmp_path):
+    internal = tmp_path / "internal"
+    internal.mkdir()
+    internal_fd = os.open(
+        internal,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        for index in range(1_000):
+            with store_module._serialized_source_publication(
+                tmp_path / f"agent-{index:04}" / "skills",
+                internal_fd,
+                enabled=True,
+            ):
+                pass
+    finally:
+        os.close(internal_fd)
+
+    assert isinstance(store_module._SOURCE_PUBLICATION_LOCKS, tuple)
+    assert len(store_module._SOURCE_PUBLICATION_LOCKS) == store_module.NAME_LOCK_BUCKETS
 
 
 def test_crash_orphaned_edit_artifacts_are_outside_skill_discovery(tmp_path):
@@ -1396,18 +1578,22 @@ def test_read_pins_intermediate_directories_against_symlink_swap(tmp_path, monke
     outside = tmp_path / "outside-read"
     outside.mkdir()
     (outside / "notes.md").write_text("OUTSIDE-SECRET", encoding="utf-8")
-    real_open_parent = store_module._open_parent_at
+    real_inspect = store_module.inspect_skill_folder_descriptor
     swapped = False
 
-    def swap_before_descriptor_walk(root_fd, relative, **kwargs):
+    def swap_before_snapshot(directory_fd, *, folder_name):
         nonlocal swapped
-        if relative.as_posix() == "references/notes.md" and not swapped:
+        if not swapped:
             shutil.rmtree(references)
             references.symlink_to(outside, target_is_directory=True)
             swapped = True
-        return real_open_parent(root_fd, relative, **kwargs)
+        return real_inspect(directory_fd, folder_name=folder_name)
 
-    monkeypatch.setattr(store_module, "_open_parent_at", swap_before_descriptor_walk)
+    monkeypatch.setattr(
+        store_module,
+        "inspect_skill_folder_descriptor",
+        swap_before_snapshot,
+    )
 
     with pytest.raises(SkillPathError, match="symlink|directory"):
         store.read_file(record, "references/notes.md")
@@ -1533,23 +1719,23 @@ def test_write_pins_intermediate_directories_against_symlink_swap(
     outside_notes = outside / "notes.md"
     outside_notes.write_text("OUTSIDE-ORIGINAL", encoding="utf-8")
     displaced = tmp_path / "displaced-references"
-    real_reject = store_module.reject_symlink_chain
-    checked = 0
+    real_exchange = store_module._exchange_directories_at
+    swapped = False
 
-    def swap_after_final_check(root, path):
-        nonlocal checked
-        real_reject(root, path)
-        if root == folder and path == references / "notes.md":
-            checked += 1
-            if checked == 3:
-                references.rename(displaced)
-                references.symlink_to(outside, target_is_directory=True)
+    def swap_at_exchange(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            references.rename(displaced)
+            references.symlink_to(outside, target_is_directory=True)
+        return real_exchange(*args, **kwargs)
 
-    monkeypatch.setattr(store_module, "reject_symlink_chain", swap_after_final_check)
+    monkeypatch.setattr(store_module, "_exchange_directories_at", swap_at_exchange)
 
     with pytest.raises(SkillPathError, match="symlink|directory"):
         store.write_file(record, "references/notes.md", "replacement")
 
+    assert swapped
     assert outside_notes.read_text(encoding="utf-8") == "OUTSIDE-ORIGINAL"
 
 
@@ -1674,20 +1860,39 @@ def test_resource_edit_supports_maximum_length_filename(tmp_path):
     assert not tuple(folder.glob(".*.tmp.*"))
 
 
-def test_install_copies_resources_then_publishes_primary(tmp_path):
+def test_install_copies_resources_then_fsyncs_tree_and_publishes_primary(
+    tmp_path,
+    monkeypatch,
+):
     source_root = tmp_path / "source"
     source_root.mkdir()
     source = source_root / "remote"
     source.mkdir()
-    (source / "scripts").mkdir()
-    (source / "scripts" / "helper.py").write_text(
+    (source / "scripts" / "nested").mkdir(parents=True)
+    (source / "scripts" / "nested" / "helper.py").write_text(
         "print('not executed')\n", encoding="utf-8"
     )
-    document = SkillDocument("remote", "Remote", "See [helper](scripts/helper.py).")
+    document = SkillDocument(
+        "remote",
+        "Remote",
+        "See [helper](scripts/nested/helper.py).",
+    )
     (source / "SKILL.md").write_text(
         serialize_skill_markdown(document), encoding="utf-8"
     )
     store = SkillStore(tmp_path / "local")
+    real_fsync_tree = store_module._fsync_validated_directories_at
+    calls = []
+
+    def record_fsync_tree(folder_fd, snapshot):
+        calls.append({entry.path for entry in snapshot.entries if entry.is_directory})
+        return real_fsync_tree(folder_fd, snapshot)
+
+    monkeypatch.setattr(
+        store_module,
+        "_fsync_validated_directories_at",
+        record_fsync_tree,
+    )
     folder = store.install_folder(
         source,
         provenance=SkillProvenance(
@@ -1698,7 +1903,10 @@ def test_install_copies_resources_then_publishes_primary(tmp_path):
             remote_url="https://example.com/repo.git",
         ),
     )
-    assert (folder / "scripts" / "helper.py").read_text() == "print('not executed')\n"
+    assert (folder / "scripts" / "nested" / "helper.py").read_text() == (
+        "print('not executed')\n"
+    )
+    assert calls == [{"scripts", "scripts/nested"}]
     assert validate_skill_folder(folder, source_root=store.local_root) == document
 
 
@@ -2316,7 +2524,7 @@ def test_delete_pins_quarantined_folder_during_recursive_removal(tmp_path, monke
             shutil.rmtree(quarantine, ignore_errors=True)
 
 
-def test_delete_preserves_nested_directory_swapped_after_identity_check(
+def test_delete_retires_whole_generation_without_unlinking_nested_entries(
     tmp_path,
     monkeypatch,
 ):
@@ -2325,10 +2533,47 @@ def test_delete_preserves_nested_directory_swapped_after_identity_check(
     resources = folder / "resources"
     resources.mkdir()
     (resources / "original.md").write_text("original", encoding="utf-8")
-    replacement = tmp_path / "outside-replacement"
-    replacement.mkdir()
-    (replacement / "replacement.md").write_text("replacement", encoding="utf-8")
-    displaced = tmp_path / "displaced-nested-original"
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    real_purge = store_module._purge_internal_directory_at
+    observed_before_purge = []
+
+    def observe_whole_retired_generation(internal_fd, retired_name, *, expected):
+        retired = store.local_root / INTERNAL_DIRECTORY / retired_name
+        observed_before_purge.append(
+            (retired / "resources" / "original.md").read_text(encoding="utf-8")
+        )
+        return real_purge(internal_fd, retired_name, expected=expected)
+
+    monkeypatch.setattr(
+        store_module,
+        "_purge_internal_directory_at",
+        observe_whole_retired_generation,
+    )
+    store.delete(record)
+
+    assert not folder.exists()
+    assert observed_before_purge == ["original"]
+    assert not tuple(
+        (store.local_root / INTERNAL_DIRECTORY).glob(
+            f"{store_module.SKILL_TRASH_PREFIX}*"
+        )
+    )
+
+
+def test_delete_never_unlinks_replacement_at_recovery_visible_name(
+    tmp_path,
+    monkeypatch,
+):
+    store = SkillStore(tmp_path / "skills")
+    name = "delete-retirement-race"
+    folder = store.create(SkillDocument(name, "Original", "Procedure."))
+    original_marker = folder / "ORIGINAL-DATA"
+    original_marker.write_text("original", encoding="utf-8")
     record = DirectorySkillSource(
         root=store.local_root,
         source_id="agent-local",
@@ -2336,36 +2581,120 @@ def test_delete_preserves_nested_directory_swapped_after_identity_check(
         precedence=0,
     ).discover()[0][0]
     real_rename_no_replace = store_module._rename_directory_no_replace_at
-    real_rename = os.rename
-    swapped = False
+    raced_name = None
 
-    def swap_nested_before_quarantine(directory_fd, source_name, destination_name):
-        nonlocal swapped
-        if source_name == "resources" and not swapped:
-            swapped = True
-            real_rename(source_name, displaced, src_dir_fd=directory_fd)
-            real_rename(replacement, source_name, dst_dir_fd=directory_fd)
-        return real_rename_no_replace(directory_fd, source_name, destination_name)
+    def replace_source_after_retirement(
+        directory_fd,
+        source_name,
+        destination_name,
+        *,
+        destination_directory_fd=None,
+    ):
+        nonlocal raced_name
+        result = real_rename_no_replace(
+            directory_fd,
+            source_name,
+            destination_name,
+            destination_directory_fd=destination_directory_fd,
+        )
+        if source_name.startswith(f".{name}.delete."):
+            raced_name = source_name
+            replacement = store.local_root / source_name
+            replacement.mkdir()
+            (replacement / "REPLACEMENT-DATA").write_text(
+                "replacement",
+                encoding="utf-8",
+            )
+        return result
 
     monkeypatch.setattr(
         store_module,
         "_rename_directory_no_replace_at",
-        swap_nested_before_quarantine,
+        replace_source_after_retirement,
     )
 
-    with pytest.raises(SkillPathError, match="nested skill entry changed"):
+    store.delete(record)
+
+    assert raced_name is not None
+    assert (store.local_root / raced_name / "REPLACEMENT-DATA").read_text(
+        encoding="utf-8"
+    ) == "replacement"
+    assert not tuple(
+        (store.local_root / INTERNAL_DIRECTORY).glob(
+            f"{store_module.SKILL_TRASH_PREFIX}*"
+        )
+    )
+
+
+def test_delete_preserves_retired_generation_when_private_purge_fails(
+    tmp_path,
+    monkeypatch,
+):
+    store = SkillStore(tmp_path / "skills")
+    name = "delete-purge-retry"
+    folder = store.create(SkillDocument(name, "Original", "Procedure."))
+    marker = folder / "RECOVERY-DATA"
+    marker.write_text("recoverable", encoding="utf-8")
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    real_purge = store_module._purge_internal_directory_at
+
+    def fail_private_purge(*_args, **_kwargs):
+        raise OSError("simulated private trash purge failure")
+
+    monkeypatch.setattr(
+        store_module,
+        "_purge_internal_directory_at",
+        fail_private_purge,
+    )
+
+    store.delete(record)
+
+    retired = list(
+        (store.local_root / INTERNAL_DIRECTORY).glob(
+            f"{store_module.SKILL_TRASH_PREFIX}*"
+        )
+    )
+    assert len(retired) == 1
+    assert (retired[0] / marker.name).read_text(encoding="utf-8") == "recoverable"
+
+    monkeypatch.setattr(store_module, "_purge_internal_directory_at", real_purge)
+    SkillStore(store.local_root)
+
+    assert not tuple(
+        (store.local_root / INTERNAL_DIRECTORY).glob(
+            f"{store_module.SKILL_TRASH_PREFIX}*"
+        )
+    )
+
+
+def test_repeated_create_delete_does_not_accumulate_private_trash(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    source = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    )
+
+    for index in range(20):
+        name = f"repeat-delete-{index}"
+        store.create(SkillDocument(name, "Temporary", "Procedure."))
+        record = source.discover()[0][0]
         store.delete(record)
 
-    assert swapped
-    assert (displaced / "original.md").read_text(encoding="utf-8") == "original"
-    preserved = list(store.local_root.rglob("replacement.md"))
-    assert len(preserved) == 1
-    assert preserved[0].read_text(encoding="utf-8") == "replacement"
+    assert not tuple(
+        (store.local_root / INTERNAL_DIRECTORY).glob(
+            f"{store_module.SKILL_TRASH_PREFIX}*"
+        )
+    )
 
 
-def test_delete_preserves_quarantined_folder_if_recursive_removal_fails(
-    tmp_path, monkeypatch
-):
+def test_delete_preserves_quarantined_folder_if_retirement_fails(tmp_path, monkeypatch):
     store = SkillStore(tmp_path / "skills")
     original = store.create(
         SkillDocument("delete-restore", "Restore on failure", "Procedure.")
@@ -2382,24 +2711,35 @@ def test_delete_preserves_quarantined_folder_if_recursive_removal_fails(
 
     real_rename_no_replace = store_module._rename_directory_no_replace_at
 
-    def fail_removal(directory_fd, source_name, destination_name):
-        if source_name == "resources":
-            raise OSError("simulated recursive removal failure")
-        return real_rename_no_replace(directory_fd, source_name, destination_name)
+    def fail_retirement(
+        directory_fd,
+        source_name,
+        destination_name,
+        *,
+        destination_directory_fd=None,
+    ):
+        if source_name.startswith(".delete-restore.delete."):
+            raise OSError("simulated retirement failure")
+        return real_rename_no_replace(
+            directory_fd,
+            source_name,
+            destination_name,
+            destination_directory_fd=destination_directory_fd,
+        )
 
-    monkeypatch.setattr(store_module, "_rename_directory_no_replace_at", fail_removal)
+    monkeypatch.setattr(
+        store_module,
+        "_rename_directory_no_replace_at",
+        fail_retirement,
+    )
 
-    with pytest.raises(OSError, match="simulated recursive removal failure") as caught:
+    with pytest.raises(OSError, match="simulated retirement failure"):
         store.delete(record)
 
     quarantines = list(store.local_root.glob(".delete-restore.delete.*"))
     assert len(quarantines) == 1
     assert (quarantines[0] / "SKILL.md").is_file()
     assert not original.exists()
-    assert any(
-        "preserved as .delete-restore.delete." in note
-        for note in caught.value.__notes__
-    )
 
 
 def test_delete_accepts_a_maximum_length_resource_component(tmp_path):
@@ -2671,3 +3011,175 @@ def test_store_reaps_git_checkout_after_owner_process_is_killed(tmp_path):
     SkillStore(root)
 
     assert not workspace.exists()
+
+
+def test_recursive_cleanup_handles_more_than_python_recursion_limit(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    folder = store.create(SkillDocument("deep-cleanup", "Deep cleanup", "Procedure."))
+    identity = (folder.stat().st_dev, folder.stat().st_ino)
+    descriptor = os.open(
+        folder,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        for _ in range(1_100):
+            os.mkdir("d", mode=0o700, dir_fd=descriptor)
+            child = os.open(
+                "d",
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+    finally:
+        os.close(descriptor)
+
+    root_fd = os.open(
+        store.local_root,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        store_module._remove_expected_directory_at(
+            root_fd,
+            folder.name,
+            expected=identity,
+        )
+    finally:
+        os.close(root_fd)
+
+    assert not folder.exists()
+    retired_root = store.local_root / INTERNAL_DIRECTORY
+    assert not tuple(retired_root.glob(f"{store_module.SKILL_TRASH_PREFIX}*"))
+
+
+def test_primary_edit_rechecks_original_bytes_at_atomic_exchange(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    name = "exchange-precondition"
+    folder = store.create(SkillDocument(name, "Original", "Original procedure."))
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    external = serialize_skill_markdown(
+        SkillDocument(name, "External", "EXTERNAL procedure.")
+    )
+    desired = serialize_skill_markdown(
+        SkillDocument(name, "Desired", "Desired procedure.")
+    )
+    real_exchange = store_module._exchange_directories_at
+    injected = False
+
+    def mutate_at_exchange(source_fd, source_name, destination_fd, destination_name):
+        nonlocal injected
+        if not injected and destination_name == name:
+            injected = True
+            (folder / "SKILL.md").write_text(external, encoding="utf-8")
+        return real_exchange(source_fd, source_name, destination_fd, destination_name)
+
+    monkeypatch.setattr(
+        store_module,
+        "_exchange_directories_at",
+        mutate_at_exchange,
+    )
+
+    with pytest.raises(SkillConflictError, match="changed after it was read"):
+        store.edit_primary(record, desired)
+
+    assert injected
+    assert (folder / "SKILL.md").read_text(encoding="utf-8") == external
+    preserved = list(store.local_root.glob(".kestrel-edit-conflict-*"))
+    assert len(preserved) == 1
+    assert (preserved[0] / "SKILL.md").read_text(encoding="utf-8") == desired
+
+
+def test_edit_preserves_public_change_detected_after_exchange(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    name = "exchange-postcondition"
+    folder = store.create(SkillDocument(name, "Original", "Original procedure."))
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    external = serialize_skill_markdown(
+        SkillDocument(name, "External", "EXTERNAL procedure.")
+    )
+    desired = serialize_skill_markdown(
+        SkillDocument(name, "Desired", "Desired procedure.")
+    )
+    root_identity = (store.local_root.stat().st_dev, store.local_root.stat().st_ino)
+    real_inspect = store_module._inspect_child_at
+    injected = False
+
+    def mutate_public_candidate(parent_fd, child_name, *, expected, folder_name=None):
+        nonlocal injected
+        parent = os.fstat(parent_fd)
+        if (
+            not injected
+            and child_name == name
+            and (parent.st_dev, parent.st_ino) == root_identity
+            and expected != record.folder_identity
+        ):
+            injected = True
+            (folder / "SKILL.md").write_text(external, encoding="utf-8")
+        return real_inspect(
+            parent_fd,
+            child_name,
+            expected=expected,
+            folder_name=folder_name,
+        )
+
+    monkeypatch.setattr(store_module, "_inspect_child_at", mutate_public_candidate)
+
+    with pytest.raises(
+        SkillPublicationCleanupError,
+        match="both generations were preserved",
+    ):
+        store.edit_primary(record, desired)
+
+    assert injected
+    assert (folder / "SKILL.md").read_text(encoding="utf-8") == external
+    preserved = list(store.local_root.glob(".kestrel-edit-conflict-*"))
+    assert len(preserved) == 1
+    assert "Original procedure." in (preserved[0] / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_delete_restores_same_inode_change_made_at_quarantine(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    name = "delete-content-race"
+    folder = store.create(SkillDocument(name, "Original", "Original procedure."))
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    external = serialize_skill_markdown(
+        SkillDocument(name, "External", "EXTERNAL procedure.")
+    )
+    real_quarantine = store_module._quarantine_directory_at
+    injected = False
+
+    def mutate_then_quarantine(root_fd, child_name, *, expected):
+        nonlocal injected
+        if not injected and child_name == name:
+            injected = True
+            (folder / "SKILL.md").write_text(external, encoding="utf-8")
+        return real_quarantine(root_fd, child_name, expected=expected)
+
+    monkeypatch.setattr(
+        store_module,
+        "_quarantine_directory_at",
+        mutate_then_quarantine,
+    )
+
+    with pytest.raises(SkillConflictError, match="changed after it was read"):
+        store.delete(record)
+
+    assert injected
+    assert (folder / "SKILL.md").read_text(encoding="utf-8") == external

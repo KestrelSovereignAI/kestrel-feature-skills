@@ -8,6 +8,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
@@ -38,13 +39,14 @@ _YAML_IMPLICIT_WORD = re.compile(
 _YAML_TIMESTAMP = re.compile(r"\d{4}-\d{1,2}-\d{1,2}(?:[Tt]|[ \t]+|$)")
 _YAML_SEXAGESIMAL = re.compile(r"[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+(?:\.[0-9_]*)?")
 _MARKDOWN_REFERENCE_DEFINITION = re.compile(
-    r"(?m)^[ \t]{0,3}\[(?:\\[^\r\n]|[^\]\\\r\n])+\]:[ \t]*"
+    r"(?m)^[ \t]{0,3}\[(?:\\[^\r\n]|[^\]\\]){1,999}\]:[ \t]*"
     r"(?:\r?\n[ \t]{0,3})?"
     r"(?:<((?:\\[^\r\n]|[^<>\\\r\n])+)>|(\S+))"
 )
 _MARKDOWN_REFERENCE_DEFINITION_START = re.compile(
-    r"^[ \t]{0,3}\[(?:\\[^\r\n]|[^\]\\\r\n])+\]:"
+    r"^[ \t]{0,3}\[(?:\\[^\r\n]|[^\]\\]){1,999}\]:"
 )
+_MARKDOWN_REFERENCE_LABEL_PREFIX = re.compile(r"^[ \t]{0,3}\[")
 _MARKDOWN_BACKSLASH_ESCAPE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
 _MARKDOWN_AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*)>")
 # A CommonMark fence may be indented by at most three *columns*. Any tab in
@@ -79,6 +81,29 @@ _MARKDOWN_COMPLETE_HTML_TAG = re.compile(
     r")[ \t]*$"
 )
 _REMOTE_SCHEMES = frozenset({"http", "https", "mailto"})
+_HTML_URL_ATTRIBUTES = frozenset(
+    {
+        "action",
+        "background",
+        "cite",
+        "classid",
+        "codebase",
+        "data",
+        "formaction",
+        "href",
+        "icon",
+        "longdesc",
+        "manifest",
+        "poster",
+        "profile",
+        "src",
+        "usemap",
+        "xlink:href",
+    }
+)
+_HTML_UNSUPPORTED_URL_ATTRIBUTES = frozenset(
+    {"archive", "imagesrcset", "ping", "srcdoc", "srcset", "style"}
+)
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
@@ -436,19 +461,84 @@ def _reference_continuation_content(
     for _ in range(quote_depth):
         stripped = _strip_blockquote_prefix(content)
         if stripped is None:
-            return None
+            # A reference destination on the next line is paragraph-like and
+            # may lazily omit one or more enclosing blockquote markers.
+            break
         content = stripped
     if list_levels:
         prefix = _indent_prefix(content, list_levels[-1][0])
-        if prefix is None:
-            return None
-        content = content[prefix:]
+        if prefix is not None:
+            content = content[prefix:]
     return content
+
+
+def _container_ids(
+    levels: list[tuple[int, int]], *, blank_line: bool
+) -> tuple[int, ...]:
+    """Materialize list identities only for lines whose block state needs them."""
+
+    if blank_line:
+        return ()
+    return tuple(item_id for _indent, item_id in levels)
+
+
+def _reference_definition_from_lines(
+    content: str,
+    *,
+    line_index: int,
+    lines: list[str],
+    quote_depth: int,
+    list_levels: list[tuple[int, int]],
+) -> tuple[re.Match[str] | None, tuple[int, ...]]:
+    """Resolve a bounded CommonMark reference definition across source lines."""
+
+    match = _MARKDOWN_REFERENCE_DEFINITION.match(content)
+    if match is not None:
+        return match, ()
+    if _MARKDOWN_REFERENCE_LABEL_PREFIX.match(content) is None:
+        return None, ()
+
+    candidate = content
+    continuation_lines: list[int] = []
+    # CommonMark caps labels at 999 characters. The extra allowance covers the
+    # opening indentation, brackets, colon, and one bounded destination line.
+    limit = 999 + MAX_RESOURCE_PATH_BYTES
+    for continuation_index in range(line_index + 1, len(lines)):
+        continuation = _reference_continuation_content(
+            lines[continuation_index],
+            quote_depth=quote_depth,
+            list_levels=list_levels,
+        )
+        if continuation is None or not continuation.strip():
+            break
+        continuation_lines.append(continuation_index)
+        if _MARKDOWN_REFERENCE_DEFINITION_START.match(candidate) is not None:
+            # CommonMark accepts arbitrary additional indentation when the
+            # destination starts on the line after a complete ``[label]:``.
+            continuation = continuation.lstrip(" \t")
+        candidate = f"{candidate}\n{continuation}"
+        match = _MARKDOWN_REFERENCE_DEFINITION.match(candidate)
+        if match is not None:
+            return match, tuple(continuation_lines)
+        if len(candidate) > limit:
+            break
+        if _MARKDOWN_REFERENCE_DEFINITION_START.match(candidate) is not None:
+            # Once the label and colon are complete, only one destination line
+            # can remain in a CommonMark reference definition.
+            continue
+        if "]" in continuation:
+            break
+    return None, ()
 
 
 def _analyze_markdown(
     body: str,
-) -> tuple[str, tuple[str, ...], tuple[tuple[int, int], ...]]:
+) -> tuple[
+    str,
+    tuple[str, ...],
+    tuple[tuple[int, int], ...],
+    tuple[str, ...],
+]:
     """Normalize containers, mask code, and find block-valid definitions."""
 
     masked: list[str] = []
@@ -474,6 +564,7 @@ def _analyze_markdown(
     html_block_container: tuple[int, tuple[int, ...]] | None = None
     reference_destinations: list[str] = []
     reference_continuation_lines: set[int] = set()
+    html_blocks: list[list[str]] = []
     lines = body.splitlines(keepends=True)
     for line_index, line in enumerate(lines):
         raw_content = line.rstrip("\r\n")
@@ -487,22 +578,19 @@ def _analyze_markdown(
                     "Markdown container nesting exceeds validation complexity limit"
                 )
             content = stripped
-        explicit_container_marker = quote_depth > 0
+        previous_list_levels = list_levels
+        previous_list_quote_depth = list_quote_depth
 
         if quote_depth != list_quote_depth:
             list_levels = []
         list_quote_depth = quote_depth
         active_level: int | None = None
         retained_levels: list[tuple[int, int]] = []
-        if not content.strip():
+        blank_line = not content.strip()
+        if blank_line:
             retained_levels = list_levels
             active_level = list_levels[-1][0] if list_levels else None
-            continued_ids = (
-                tuple(item_id for _indent, item_id in retained_levels)
-                if active_level is not None
-                and _indent_prefix(content, active_level) is not None
-                else ()
-            )
+            continued_ids = ()
             content = ""
         else:
             available_indent = _leading_indent_columns(content)
@@ -528,7 +616,6 @@ def _analyze_markdown(
                     stripped := _strip_blockquote_prefix(content[marker_cursor:])
                 ) is not None:
                     quote_depth += 1
-                    explicit_container_marker = True
                     if (
                         quote_depth + len(retained_levels)
                         > MAX_MARKDOWN_CONTAINER_DEPTH
@@ -565,26 +652,45 @@ def _analyze_markdown(
                 active_level = absolute_indent
                 marker_cursor = remaining_start
                 paragraph_may_interrupt = False
-                explicit_container_marker = True
             content = content[marker_cursor:]
 
         list_levels = retained_levels
-        final_ids = tuple(item_id for _indent, item_id in retained_levels)
+        final_ids = _container_ids(retained_levels, blank_line=blank_line)
         container = (quote_depth, final_ids)
         continued_container = (quote_depth, continued_ids)
-        # A missing quote/list marker may lazily continue an open paragraph.
-        # Resolve that before four-column indentation can mask a live link as
-        # top-level code. Explicit new containers never use this exception.
+        # Missing quote/list markers may lazily continue an open paragraph,
+        # including when only an outer prefix is repeated on the new line.
+        # Resolve that before inline-block segmentation or indentation can
+        # hide a multiline link. Explicit new containers and block constructs
+        # that can interrupt a paragraph never use this exception.
+        previous_quote_depth, previous_list_ids = paragraph_container or (0, ())
+        current_quote_depth, current_list_ids = container
+        compatible_container_prefix = (
+            current_quote_depth <= previous_quote_depth
+            and current_list_ids == previous_list_ids[: len(current_list_ids)]
+        )
+        boundary_indent = _leading_indent_columns(content)
+        is_block_boundary = False
+        if boundary_indent <= 3:
+            stripped_for_boundary = content.lstrip(" \t")
+            opened_boundary_html = _html_block_terminator(stripped_for_boundary)
+            is_block_boundary = bool(
+                _MARKDOWN_FENCE.match(content)
+                or _MARKDOWN_NONPARAGRAPH_BLOCK.match(stripped_for_boundary)
+                or (opened_boundary_html is not None and opened_boundary_html[2])
+            )
         if (
             paragraph_open
             and paragraph_container is not None
             and container != paragraph_container
-            and not explicit_container_marker
+            and compatible_container_prefix
             and content.strip()
-            and _indent_prefix(content, 4) is not None
+            and not is_block_boundary
         ):
             container = paragraph_container
             continued_container = paragraph_container
+            list_levels = previous_list_levels
+            list_quote_depth = previous_list_quote_depth
         offset = len(masked)
         masked.extend(f"{content}{ending}")
         line_length = len(content) + len(ending)
@@ -619,6 +725,7 @@ def _analyze_markdown(
                 in_indented_code = False
                 paragraph_open = False
                 active_inline_block = None
+                html_blocks[-1].append(content)
                 mask(offset, offset + line_length)
                 marker = html_block_terminator[0]
                 terminator_line = (
@@ -686,41 +793,40 @@ def _analyze_markdown(
             else:
                 in_indented_code = False
                 stripped_content = content.lstrip(" \t")
-                reference_definition = (
-                    _MARKDOWN_REFERENCE_DEFINITION.match(content)
-                    if not paragraph_open
-                    else None
-                )
-                if (
-                    reference_definition is None
-                    and not paragraph_open
-                    and _MARKDOWN_REFERENCE_DEFINITION_START.match(content)
-                    and line_index + 1 < len(lines)
-                ):
-                    continuation = _reference_continuation_content(
-                        lines[line_index + 1],
-                        quote_depth=quote_depth,
-                        list_levels=retained_levels,
-                    )
-                    if continuation is not None:
-                        reference_definition = _MARKDOWN_REFERENCE_DEFINITION.match(
-                            f"{content}\n{continuation}"
+                if not paragraph_open:
+                    reference_definition, continuation_indexes = (
+                        _reference_definition_from_lines(
+                            content,
+                            line_index=line_index,
+                            lines=lines,
+                            quote_depth=quote_depth,
+                            list_levels=retained_levels,
                         )
-                        if reference_definition is not None:
-                            reference_continuation_lines.add(line_index + 1)
-                nonparagraph_block = _MARKDOWN_NONPARAGRAPH_BLOCK.match(
-                    stripped_content
+                    )
+                    reference_continuation_lines.update(continuation_indexes)
+                else:
+                    reference_definition = None
+                can_start_block = _leading_indent_columns(content) <= 3
+                nonparagraph_block = (
+                    _MARKDOWN_NONPARAGRAPH_BLOCK.match(stripped_content)
+                    if can_start_block
+                    else None
                 )
                 setext_underline = bool(
                     paragraph_open and _MARKDOWN_SETEXT_UNDERLINE.match(content)
                 )
-                opened_html_block = _html_block_terminator(stripped_content)
+                opened_html_block = (
+                    _html_block_terminator(stripped_content)
+                    if can_start_block
+                    else None
+                )
                 if setext_underline:
                     paragraph_open = False
                     active_inline_block = None
                 elif opened_html_block is not None and (
                     not paragraph_open or opened_html_block[2]
                 ):
+                    html_blocks.append([content])
                     mask(offset, offset + line_length)
                     if not _html_block_ends(content, opened_html_block):
                         html_block_terminator = opened_html_block
@@ -784,6 +890,7 @@ def _analyze_markdown(
         "".join(masked),
         tuple(reference_destinations),
         tuple((start, end) for start, end in inline_blocks),
+        tuple("\n".join(block) for block in html_blocks),
     )
 
 
@@ -970,10 +1077,61 @@ def _angle_destination(candidate: str) -> str | None:
     return None
 
 
+class _RawHTMLDestinationParser(HTMLParser):
+    """Collect single-URL HTML attributes and reject ambiguous URL carriers."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.destinations: list[str] = []
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        normalized: dict[str, str | None] = {}
+        for raw_name, value in attrs:
+            name = raw_name.casefold()
+            normalized.setdefault(name, value)
+            if name in _HTML_UNSUPPORTED_URL_ATTRIBUTES:
+                raise SkillPathError(
+                    f"unsupported URL-bearing raw HTML attribute in SKILL.md: {name}"
+                )
+            if name in _HTML_URL_ATTRIBUTES and value:
+                self.destinations.append(value)
+        if (
+            tag.casefold() == "meta"
+            and (normalized.get("http-equiv") or "").casefold() == "refresh"
+        ):
+            raise SkillPathError("HTML meta refresh is not supported in SKILL.md")
+
+
+def _mask_escaped_html_openers(body: str) -> str:
+    """Keep CommonMark-escaped ``<`` characters literal for HTML parsing."""
+
+    masked = list(body)
+    for position, character in enumerate(masked):
+        if character == "<" and _escaped_at(body, position):
+            masked[position] = " "
+    return "".join(masked)
+
+
+def _raw_html_destinations(fragments: tuple[str, ...]) -> tuple[str, ...]:
+    parser = _RawHTMLDestinationParser()
+    for fragment in fragments:
+        parser.feed(fragment)
+        parser.feed("\n")
+    parser.close()
+    return tuple(parser.destinations)
+
+
 def _local_markdown_destinations(body: str) -> tuple[str, ...]:
     destinations: list[str] = []
-    visible_body, reference_destinations, inline_blocks = _analyze_markdown(body)
+    visible_body, reference_destinations, inline_blocks, html_blocks = (
+        _analyze_markdown(body)
+    )
     raw_destinations: list[str] = []
+    inline_html_fragments: list[str] = []
     for block_start, block_end in inline_blocks:
         inline_body = visible_body[block_start:block_end]
         raw_destinations.extend(_inline_markdown_destinations(inline_body))
@@ -982,7 +1140,11 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
             for match in _MARKDOWN_AUTOLINK.finditer(inline_body)
             if not _escaped_at(inline_body, match.start())
         )
+        inline_html_fragments.append(_mask_escaped_html_openers(inline_body))
     raw_destinations.extend(reference_destinations)
+    raw_destinations.extend(
+        _raw_html_destinations(tuple(inline_html_fragments) + html_blocks)
+    )
     for candidate in raw_destinations:
         raw = candidate.strip()
         angle_destination = _angle_destination(raw)
@@ -1112,34 +1274,21 @@ def _read_regular_file_at(directory_fd: int, name: str, *, max_bytes: int) -> by
         os.close(descriptor)
 
 
-def _validate_reference_at(folder_fd: int, relative: str) -> None:
-    descriptor = os.dup(folder_fd)
-    try:
-        parts = _direct_relative_parts(relative)
-        for index, part in enumerate(parts):
-            try:
-                value = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
-            except FileNotFoundError as exc:
-                raise SkillPathError(f"path does not exist: {relative}") from exc
-            except OSError as exc:
-                raise SkillPathError(
-                    f"could not inspect skill path: {relative}"
-                ) from exc
-            if stat.S_ISLNK(value.st_mode):
-                raise SkillPathError("path escapes the skill folder")
-            if index == len(parts) - 1:
-                return
-            if not stat.S_ISDIR(value.st_mode):
-                raise SkillPathError(f"path does not exist: {relative}")
-            child = _open_pinned_directory_at(
-                descriptor,
-                part,
-                expected=(value.st_dev, value.st_ino),
-            )
-            os.close(descriptor)
-            descriptor = child
-    finally:
-        os.close(descriptor)
+def _validate_reference_in_snapshot(
+    relative: str,
+    captured: dict[str, ValidatedSkillFolderEntry],
+) -> None:
+    """Resolve one bundled link against the bytes and names already captured."""
+
+    parts = _direct_relative_parts(relative)
+    normalized = PurePosixPath(*parts).as_posix()
+    if normalized not in captured:
+        raise SkillPathError(f"path does not exist: {relative}")
+    for index in range(1, len(parts)):
+        parent = PurePosixPath(*parts[:index]).as_posix()
+        entry = captured.get(parent)
+        if entry is None or not entry.is_directory:
+            raise SkillPathError(f"path does not exist: {relative}")
 
 
 def inspect_skill_folder_descriptor(
@@ -1240,19 +1389,22 @@ def inspect_skill_folder_descriptor(
     scan(folder_fd, ())
     if not exact_primary_seen:
         raise SkillFormatError("skill folder must contain exact-case SKILL.md")
-    primary = _read_regular_file_at(
-        folder_fd,
-        SKILL_FILENAME,
-        max_bytes=MAX_SKILL_FILE_BYTES,
+    captured_entries = tuple(captured)
+    captured_by_path = {entry.path: entry for entry in captured_entries}
+    primary_entry = captured_by_path.get(SKILL_FILENAME)
+    if primary_entry is None or primary_entry.payload is None:
+        raise SkillPathError(f"skill resources must be regular files: {SKILL_FILENAME}")
+    document = parse_skill_markdown(
+        primary_entry.payload,
+        source=f"{folder_name}/{SKILL_FILENAME}",
     )
-    document = parse_skill_markdown(primary, source=f"{folder_name}/{SKILL_FILENAME}")
     if document.name != folder_name:
         raise SkillFormatError(
             f"frontmatter name {document.name!r} must match folder name {folder_name!r}"
         )
     for destination in _local_markdown_destinations(document.body):
-        _validate_reference_at(folder_fd, destination)
-    return ValidatedSkillFolder(document, tuple(captured))
+        _validate_reference_in_snapshot(destination, captured_by_path)
+    return ValidatedSkillFolder(document, captured_entries)
 
 
 def validate_skill_folder_descriptor(

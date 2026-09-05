@@ -362,6 +362,175 @@ def test_multiline_reference_style_markdown_escape_is_rejected(tmp_path):
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+@pytest.mark.parametrize("indentation", (4, 100, 4096))
+def test_indented_next_line_reference_destination_is_validated(
+    tmp_path,
+    indentation,
+):
+    value = SkillDocument(
+        "indented-reference-destination",
+        "Indented reference destination",
+        f"[click][outside]\n\n[outside]:\n{' ' * indentation}../outside.md",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "definition",
+    (
+        "> [outside]:\n    ../outside.md",
+        "> > [outside]:\n>     ../outside.md",
+    ),
+)
+def test_lazy_blockquote_reference_destination_is_validated(tmp_path, definition):
+    value = SkillDocument(
+        "lazy-quote-reference",
+        "Lazy quote reference",
+        f"[click][outside]\n\n{definition}",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "destination, error",
+    (
+        ("javascript:alert(1)", "unsupported link scheme"),
+        ("../outside.md", "traversal"),
+    ),
+)
+def test_multiline_reference_label_cannot_hide_unsafe_destination(
+    tmp_path, destination, error
+):
+    value = SkillDocument(
+        "wrapped-reference-label",
+        "Wrapped reference label",
+        f"[click][foo bar]\n\n[foo\nbar]: {destination}",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match=error):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_maximum_multiline_reference_label_cannot_bypass_destination_limit(tmp_path):
+    first_label_line = "a" * 500
+    second_label_line = "a" * 498
+    destination = "../" + "/".join(["x" * 200] * 5 + ["y" * 16])
+    assert len(f"{first_label_line}\n{second_label_line}") == 999
+    assert len(destination.encode("utf-8")) == 1024
+    value = SkillDocument(
+        "maximum-reference-label",
+        "Maximum multiline reference label",
+        f"[{first_label_line}\n{second_label_line}]: {destination}",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+def test_alternating_list_and_blockquote_reference_definition_is_validated(tmp_path):
+    value = SkillDocument(
+        "alternating-containers",
+        "Alternating Markdown containers",
+        "[open][bad]\n\n- > [bad]: ../outside.md",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "continuation, error",
+    (
+        ("[x](../outside.md)", "traversal"),
+        ("<javascript:alert(1)>", "unsupported link scheme"),
+    ),
+)
+def test_blockquote_lazy_continuation_is_resolved_before_code_masking(
+    tmp_path, continuation, error
+):
+    value = SkillDocument(
+        "lazy-quote-continuation",
+        "Lazy quote continuation",
+        f"> paragraph\n    {continuation}",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match=error):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "- [outside\nlink](../outside.md)",
+        "> [outside\nlink](../outside.md)",
+        "- [outside](\n../outside.md\n)",
+        "> [outside](\n../outside.md\n)",
+    ),
+)
+def test_lazy_container_continuation_cannot_hide_multiline_link(tmp_path, body):
+    value = SkillDocument("lazy-container-link", "Lazy container link", body)
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "> > [outside\n> link](../outside.md)",
+        "> > [outside](\n> ../outside.md\n> )",
+        "> paragraph\n    # [outside](../outside.md)",
+        "> paragraph\n\t# [outside](../outside.md)",
+    ),
+)
+def test_partial_or_indented_lazy_quote_continuation_is_validated(tmp_path, body):
+    value = SkillDocument("partial-lazy-quote", "Partial lazy quote", body)
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize("middle", ("***", "<!-- comment -->"))
+def test_indented_pseudo_block_stays_in_lazy_paragraph(tmp_path, middle):
+    value = SkillDocument(
+        "indented-pseudo-block",
+        "Indented pseudo block",
+        f"paragraph\n    {middle}\n    [outside](../outside.md)",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize("definition_indent", ("    ", "\t"))
+def test_lazy_list_paragraph_retains_state_for_later_reference_definition(
+    tmp_path,
+    definition_indent,
+):
+    value = SkillDocument(
+        "lazy-list-reference",
+        "Lazy list reference",
+        f"- paragraph\n[click][outside]\n\n{definition_indent}[outside]: ../outside.md",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_reference_definition_after_multiline_definition_is_validated(tmp_path):
     value = SkillDocument(
         "consecutive-references",
@@ -768,6 +937,42 @@ def test_markdown_container_depth_has_explicit_complexity_limit(marker):
         format_module._mask_markdown_code(body)
 
 
+def test_blank_lines_do_not_rewalk_the_retained_container_stack(monkeypatch):
+    real_container_ids = format_module._container_ids
+    observed_deep_blanks = 0
+
+    def record_container_materialization(levels, *, blank_line):
+        nonlocal observed_deep_blanks
+        if blank_line and len(levels) == format_module.MAX_MARKDOWN_CONTAINER_DEPTH:
+            observed_deep_blanks += 1
+        return real_container_ids(levels, blank_line=blank_line)
+
+    monkeypatch.setattr(
+        format_module,
+        "_container_ids",
+        record_container_materialization,
+    )
+    body = "- " * format_module.MAX_MARKDOWN_CONTAINER_DEPTH + "value\n" + "\n" * 256
+
+    format_module._analyze_markdown(body)
+
+    assert observed_deep_blanks == 256
+
+
+def test_blank_container_ids_return_without_iterating_levels():
+    class IterationWouldBeQuadratic:
+        def __iter__(self):
+            raise AssertionError("blank lines must not traverse retained containers")
+
+    assert (
+        format_module._container_ids(
+            IterationWouldBeQuadratic(),
+            blank_line=True,
+        )
+        == ()
+    )
+
+
 def test_regular_file_reader_rejects_fifo_before_open(tmp_path, monkeypatch):
     resource = tmp_path / "resource"
     os.mkfifo(resource)
@@ -1087,6 +1292,61 @@ def test_markdown_links_inside_html_blocks_remain_literal(tmp_path, body):
     assert validate_skill_folder(folder, source_root=tmp_path) == value
 
 
+@pytest.mark.parametrize(
+    "body, error",
+    (
+        ('<a href="../outside.md">outside</a>', "traversal"),
+        ('<img src="javascript:alert(1)">', "unsupported link scheme"),
+        (
+            '<a href="../outside.md" href="https://safe.example">outside</a>',
+            "traversal",
+        ),
+        (
+            '<img src="javascript:alert(1)" src="https://safe.example">',
+            "unsupported link scheme",
+        ),
+        (
+            '<div>\n<a href="../outside.md">outside</a>\n</div>',
+            "traversal",
+        ),
+    ),
+)
+def test_raw_html_url_attributes_cannot_bypass_containment(tmp_path, body, error):
+    value = SkillDocument("raw-html-link", "Raw HTML link", body)
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match=error):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        '`<a href="../outside.md">outside</a>`',
+        '```html\n<a href="../outside.md">outside</a>\n```',
+        r'\<a href="../outside.md">outside</a>',
+    ),
+)
+def test_literal_raw_html_examples_do_not_create_live_references(tmp_path, body):
+    value = SkillDocument("literal-html-link", "Literal HTML link", body)
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+@pytest.mark.parametrize("attribute", ("srcset", "style", "srcdoc"))
+def test_ambiguous_raw_html_url_attributes_are_rejected(tmp_path, attribute):
+    value = SkillDocument(
+        "ambiguous-html-link",
+        "Ambiguous HTML link",
+        f'<img {attribute}="../outside.md">',
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="URL-bearing raw HTML attribute"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_reference_definition_shape_cannot_interrupt_open_paragraph(tmp_path):
     value = SkillDocument(
         "paragraph-reference-shape",
@@ -1290,6 +1550,58 @@ def test_descriptor_scan_never_materializes_all_directory_names(tmp_path, monkey
         )
     finally:
         os.close(directory_fd)
+
+
+def test_descriptor_snapshot_parses_the_primary_bytes_it_captured(
+    tmp_path, monkeypatch
+):
+    original = document(description="Original captured description")
+    replacement = document(description="Concurrent replacement description")
+    folder = write_skill(tmp_path, original)
+    primary_path = folder / format_module.SKILL_FILENAME
+    original_payload = primary_path.read_bytes()
+    replacement_payload = serialize_skill_markdown(replacement).encode("utf-8")
+    real_read = format_module._read_regular_file_at
+    primary_reads = 0
+
+    def capture_then_replace(directory_fd, name, *, max_bytes):
+        nonlocal primary_reads
+        payload = real_read(directory_fd, name, max_bytes=max_bytes)
+        if name == format_module.SKILL_FILENAME:
+            primary_reads += 1
+            if primary_reads == 1:
+                staged = folder / ".concurrent-primary"
+                staged.write_bytes(replacement_payload)
+                os.replace(staged, primary_path)
+        return payload
+
+    monkeypatch.setattr(
+        format_module,
+        "_read_regular_file_at",
+        capture_then_replace,
+    )
+    directory_fd = os.open(
+        folder,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        snapshot = format_module.inspect_skill_folder_descriptor(
+            directory_fd,
+            folder_name=folder.name,
+        )
+    finally:
+        os.close(directory_fd)
+
+    captured_primary = next(
+        entry
+        for entry in snapshot.entries
+        if entry.path == format_module.SKILL_FILENAME
+    )
+    assert primary_reads == 1
+    assert captured_primary.payload == original_payload
+    assert snapshot.document == original
+    assert parse_skill_markdown(captured_primary.payload) == snapshot.document
+    assert primary_path.read_bytes() == replacement_payload
 
 
 @pytest.mark.parametrize(
