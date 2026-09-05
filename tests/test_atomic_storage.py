@@ -1390,6 +1390,123 @@ def test_crash_orphaned_edit_artifacts_are_outside_skill_discovery(tmp_path):
     assert errors == ()
 
 
+def test_store_reaps_crash_orphaned_generation_temporaries(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    survivor = store.create(
+        SkillDocument("generation-survivor", "Survivor", "Procedure.")
+    )
+    crash_artifacts = tuple(
+        store.local_root / f".kestrel-generation.tmp.crashed-{index}"
+        for index in range(3)
+    )
+    for artifact in crash_artifacts:
+        artifact.write_text("incomplete generation", encoding="utf-8")
+    interrupted_reaper = (
+        store._internal_root / ".kestrel-generation.reap.crashed-cleanup"
+    )
+    interrupted_reaper.write_text("retired generation", encoding="utf-8")
+
+    reopened = SkillStore(store.local_root)
+    monkeypatch.setattr(sources_module, "MAX_SOURCE_ENTRIES", 3)
+    records, errors = DirectorySkillSource(
+        root=reopened.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+        expected_root_identity=reopened.local_root_identity,
+    ).discover()
+
+    assert survivor.is_dir()
+    assert not any(artifact.exists() for artifact in crash_artifacts)
+    assert not interrupted_reaper.exists()
+    assert [item.name for item in records] == ["generation-survivor"]
+    assert errors == ()
+
+
+def test_store_waits_for_live_generation_writer_before_reaping(tmp_path, monkeypatch):
+    local = tmp_path / "skills"
+    folder = local / "live-generation-writer"
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument("live-generation-writer", "Live writer", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+    real_payload = sources_module._new_generation_payload
+    writer_paused = threading.Event()
+    release_writer = threading.Event()
+    reaper_started = threading.Event()
+    reaper_done = threading.Event()
+    writer_results = []
+    errors = []
+
+    def pause_after_temporary_open():
+        writer_paused.set()
+        assert release_writer.wait(timeout=5)
+        return real_payload()
+
+    def discover():
+        try:
+            writer_results.append(
+                DirectorySkillSource(
+                    root=local,
+                    source_id="agent-local",
+                    kind="agent-local",
+                    precedence=0,
+                ).discover()
+            )
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+
+    def reopen_store():
+        reaper_started.set()
+        try:
+            SkillStore(local)
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+        finally:
+            reaper_done.set()
+
+    monkeypatch.setattr(
+        sources_module,
+        "_new_generation_payload",
+        pause_after_temporary_open,
+    )
+    writer = threading.Thread(target=discover)
+    writer.start()
+    assert writer_paused.wait(timeout=5)
+    assert any(
+        path.name.startswith(".kestrel-generation.tmp.")
+        for path in (local / INTERNAL_DIRECTORY).iterdir()
+    )
+
+    reaper = threading.Thread(target=reopen_store)
+    reaper.start()
+    assert reaper_started.wait(timeout=5)
+    try:
+        assert not reaper_done.wait(timeout=0.1), (
+            "startup reaper did not wait for the live marker writer"
+        )
+    finally:
+        release_writer.set()
+    writer.join(timeout=5)
+    reaper.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert not reaper.is_alive()
+    assert errors == []
+    assert len(writer_results) == 1
+    records, discovery_errors = writer_results[0]
+    assert [record.name for record in records] == ["live-generation-writer"]
+    assert discovery_errors == ()
+    assert (folder / ".kestrel-generation").is_file()
+    assert not any(
+        path.name.startswith(".kestrel-generation.tmp.")
+        for path in (local / INTERNAL_DIRECTORY).iterdir()
+    )
+
+
 @pytest.mark.parametrize("operation", ("create", "install"))
 def test_publication_refuses_full_source_without_leaving_skill(
     tmp_path, monkeypatch, operation

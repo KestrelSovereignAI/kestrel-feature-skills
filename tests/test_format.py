@@ -1253,6 +1253,38 @@ def test_commonmark_entities_cannot_hide_escape_or_executable_scheme(
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "body, rendered_path",
+    (
+        ("[notes](notes&amp.md)", "notes&amp.md"),
+        ("[notes](notes&notanentity;.md)", "notes&notanentity;.md"),
+        (r"[notes](notes\&amp;.md)", "notes&amp;.md"),
+        ("[notes](notes&#58x.md)", "notes&"),
+    ),
+)
+def test_commonmark_destination_decoding_matches_rendered_resource_path(
+    tmp_path, body, rendered_path
+):
+    value = SkillDocument("literal-entity-link", "Literal entity link", body)
+    folder = write_skill(tmp_path, value)
+    (folder / rendered_path).write_text("notes", encoding="utf-8")
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_semicolonless_commonmark_entity_cannot_validate_against_decoy(tmp_path):
+    value = SkillDocument(
+        "literal-entity-decoy",
+        "Literal entity decoy",
+        "[notes](notes&amp.md)",
+    )
+    folder = write_skill(tmp_path, value)
+    (folder / "notes&.md").write_text("decoy", encoding="utf-8")
+
+    with pytest.raises(SkillPathError, match="does not exist"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_percent_encoded_colon_cannot_turn_a_local_escape_into_remote_url(tmp_path):
     value = SkillDocument(
         "encoded-scheme",

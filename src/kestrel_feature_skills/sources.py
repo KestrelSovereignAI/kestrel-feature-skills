@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
 import secrets
 import stat
+import threading
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -33,6 +36,7 @@ from .models import (
 
 PROVENANCE_FILENAME = ".kestrel-provenance.json"
 PROVENANCE_VERSION = 1
+INTERNAL_DIRECTORY = ".kestrel-internal"
 AGENT_LOCAL_PRECEDENCE = 0
 HOST_SHARED_PRECEDENCE = 100
 REMOTE_PRECEDENCE = 200
@@ -46,6 +50,8 @@ _PROVENANCE_BOUNDS = {
     "remote_url": 2048,
 }
 _GENERATION_TEMP_PREFIX = ".kestrel-generation.tmp."
+_GENERATION_LOCK_FILENAME = ".generation-marker.lock"
+_GENERATION_THREAD_LOCK = threading.RLock()
 
 
 def _json_safe_text(value: object) -> str:
@@ -58,6 +64,70 @@ def _new_generation_payload() -> bytes:
     """Return an unguessable, non-reusable local-folder generation witness."""
 
     return f"kestrel-skill-generation-v1:{secrets.token_hex(32)}\n".encode("ascii")
+
+
+@contextmanager
+def _generation_marker_workspace(root_fd: int) -> Iterator[int]:
+    """Pin and lock the private workspace shared by marker writers/reapers."""
+
+    with _GENERATION_THREAD_LOCK:
+        created_internal = False
+        try:
+            os.mkdir(INTERNAL_DIRECTORY, mode=0o700, dir_fd=root_fd)
+            created_internal = True
+        except FileExistsError:
+            pass
+        internal_stat = os.stat(
+            INTERNAL_DIRECTORY,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(internal_stat.st_mode):
+            raise SkillPathError("skill internal path must be a real directory")
+        internal_identity = (internal_stat.st_dev, internal_stat.st_ino)
+        internal_fd = os.open(INTERNAL_DIRECTORY, _DIRECTORY_FLAGS, dir_fd=root_fd)
+        lock_fd: int | None = None
+        locked = False
+        try:
+            opened_internal = os.fstat(internal_fd)
+            if (opened_internal.st_dev, opened_internal.st_ino) != internal_identity:
+                raise SkillPathError("skill internal path changed while opening it")
+            lock_fd = os.open(
+                _GENERATION_LOCK_FILENAME,
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=internal_fd,
+            )
+            lock_stat = os.fstat(lock_fd)
+            if not stat.S_ISREG(lock_stat.st_mode):
+                raise SkillPathError("generation marker lock must be a regular file")
+            lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            locked = True
+            lexical_lock = os.stat(
+                _GENERATION_LOCK_FILENAME,
+                dir_fd=internal_fd,
+                follow_symlinks=False,
+            )
+            if (lexical_lock.st_dev, lexical_lock.st_ino) != lock_identity:
+                raise SkillPathError(
+                    "generation marker lock changed while acquiring it"
+                )
+            if created_internal:
+                os.fsync(root_fd)
+            os.fsync(internal_fd)
+            yield internal_fd
+        finally:
+            if lock_fd is not None:
+                try:
+                    if locked:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+            os.close(internal_fd)
 
 
 def _read_generation_marker(folder_fd: int) -> bytes:
@@ -94,63 +164,78 @@ def _ensure_local_generation_marker(root_fd: int, folder_fd: int) -> None:
     except FileNotFoundError:
         pass
 
-    # Stage beside the skill folders, where hidden entries are never treated as
-    # skills. No partial internal file is ever visible in a resource inventory.
-    temporary = f"{_GENERATION_TEMP_PREFIX}{secrets.token_hex(16)}"
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-    descriptor = os.open(temporary, flags, 0o600, dir_fd=root_fd)
-    created = os.fstat(descriptor)
-    created_identity = (created.st_dev, created.st_ino)
-    completed = False
-    try:
-        payload = _new_generation_payload()
-        with os.fdopen(descriptor, "wb", closefd=False) as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        completed = True
-    finally:
-        os.close(descriptor)
-        if not completed:
+    # Private staging keeps a crashed writer outside the bounded public source.
+    # The shared lock also lets startup distinguish orphaned temporaries from a
+    # marker publication that is still live in another process.
+    with _generation_marker_workspace(root_fd) as artifact_fd:
+        try:
+            _read_generation_marker(folder_fd)
+            return
+        except FileNotFoundError:
+            pass
+        temporary = f"{_GENERATION_TEMP_PREFIX}{secrets.token_hex(16)}"
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=artifact_fd)
+        created = os.fstat(descriptor)
+        created_identity = (created.st_dev, created.st_ino)
+        completed = False
+        try:
+            payload = _new_generation_payload()
+            with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            completed = True
+        finally:
+            os.close(descriptor)
+            if not completed:
+                try:
+                    current = os.stat(
+                        temporary,
+                        dir_fd=artifact_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    if (current.st_dev, current.st_ino) == created_identity:
+                        os.unlink(temporary, dir_fd=artifact_fd)
+        try:
             try:
-                current = os.stat(temporary, dir_fd=root_fd, follow_symlinks=False)
+                os.link(
+                    temporary,
+                    GENERATION_FILENAME,
+                    src_dir_fd=artifact_fd,
+                    dst_dir_fd=folder_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                # Another feature instance won publication. Its completed
+                # hardlink is the sole generation owner for this folder.
+                _read_generation_marker(folder_fd)
+            else:
+                os.fsync(folder_fd)
+                _read_generation_marker(folder_fd)
+        finally:
+            try:
+                current = os.stat(
+                    temporary,
+                    dir_fd=artifact_fd,
+                    follow_symlinks=False,
+                )
             except FileNotFoundError:
                 pass
             else:
                 if (current.st_dev, current.st_ino) == created_identity:
-                    os.unlink(temporary, dir_fd=root_fd)
-    try:
-        try:
-            os.link(
-                temporary,
-                GENERATION_FILENAME,
-                src_dir_fd=root_fd,
-                dst_dir_fd=folder_fd,
-                follow_symlinks=False,
-            )
-        except FileExistsError:
-            # Another feature instance won publication. Its completed hardlink
-            # is the sole generation owner for this folder.
-            _read_generation_marker(folder_fd)
-        else:
-            os.fsync(folder_fd)
-            _read_generation_marker(folder_fd)
-    finally:
-        try:
-            current = os.stat(temporary, dir_fd=root_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            if (current.st_dev, current.st_ino) == created_identity:
-                os.unlink(temporary, dir_fd=root_fd)
-    os.fsync(root_fd)
-    os.fsync(folder_fd)
+                    os.unlink(temporary, dir_fd=artifact_fd)
+            os.fsync(artifact_fd)
+        os.fsync(folder_fd)
 
 
 def _folder_revision(
@@ -604,6 +689,7 @@ class SkillCatalog:
 __all__ = [
     "AGENT_LOCAL_PRECEDENCE",
     "HOST_SHARED_PRECEDENCE",
+    "INTERNAL_DIRECTORY",
     "MAX_SOURCE_ENTRIES",
     "PROVENANCE_FILENAME",
     "REMOTE_PRECEDENCE",

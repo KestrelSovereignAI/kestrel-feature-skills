@@ -3276,9 +3276,10 @@ async def test_delete_removes_shadowed_local_git_installation(
         await other.shutdown()
 
 
+@pytest.mark.parametrize("graph_cleanup_succeeds", (True, False))
 @pytest.mark.asyncio
-async def test_shadowed_delete_succeeds_when_host_winner_disappears(
-    feature, tmp_path, monkeypatch
+async def test_shadowed_delete_reports_graph_cleanup_when_host_winner_disappears(
+    feature, tmp_path, monkeypatch, graph_cleanup_succeeds
 ):
     name = "shadowed-delete-host-race"
     local = feature.agent.procedural_skills_root / name
@@ -3312,6 +3313,8 @@ async def test_shadowed_delete_succeeds_when_host_winner_disappears(
     monkeypatch.setenv("KESTREL_SHARED_SKILLS_DIR", str(shared))
     other = ProceduralSkillsFeature(feature.agent)
     await other.initialize()
+    node_id = other._node_id(name)
+    assert node_id in other.agent.storage.nodes
     real_delete = other._store.delete
 
     def delete_local_as_host_disappears(record):
@@ -3320,14 +3323,27 @@ async def test_shadowed_delete_succeeds_when_host_winner_disappears(
         shared_skill.rmdir()
 
     monkeypatch.setattr(other._store, "delete", delete_local_as_host_disappears)
+    if not graph_cleanup_succeeds:
+
+        async def fail_graph_cleanup(_name):
+            return False
+
+        monkeypatch.setattr(other, "_delete_index_node", fail_graph_cleanup)
     try:
         approved_revision = delete_revision(other, name)
         result = await other.skill_delete(name, approved_revision)
 
-        assert result.status is ToolResultStatus.OK
+        assert result.status is (
+            ToolResultStatus.OK if graph_cleanup_succeeds else ToolResultStatus.PARTIAL
+        )
         assert result.data["removed_file"] is True
         assert result.data["resolved_skill_retained"] is False
         assert result.data["remaining_source_kind"] is None
+        assert result.data["graph_deleted"] is graph_cleanup_succeeds
+        assert result.data["errors"] == (
+            [] if graph_cleanup_succeeds else ["graph index cleanup failed"]
+        )
+        assert (node_id not in other.agent.storage.nodes) is graph_cleanup_succeeds
         assert not local.exists()
         assert not shared_skill.exists()
     finally:

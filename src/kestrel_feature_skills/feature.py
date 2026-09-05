@@ -1363,7 +1363,7 @@ class ProceduralSkillsFeature(Feature):
             # even when cancellation lands on the final refresh await.
             try:
                 await self._drain_shielded_task(finalization)
-            except BaseException as finalization_error:
+            except BaseException as finalization_error:  # noqa: BLE001 - drain outcome
                 cancellation.add_note(
                     "cancelled skill state finalization also reported: "
                     f"{finalization_error}"
@@ -1502,14 +1502,24 @@ class ProceduralSkillsFeature(Feature):
             store.delete(record)
             await self._refresh_locked()
             remaining = self._snapshot.by_name().get(name)
+            graph_deleted = remaining is None
+            graph_retained = remaining is not None and name in self._indexed_names
+            errors: list[str] = []
+            if remaining is None and getattr(self.agent, "storage", None) is not None:
+                # Refresh already attempted the idempotent stale-node removal;
+                # retry once so its recoverable failure is reflected in this
+                # mutation result just as it is for an unshadowed deletion.
+                graph_deleted = await self._delete_index_node(name)
+            if not graph_deleted and not graph_retained:
+                errors.append("graph index cleanup failed")
             return {
                 "name": name,
                 "removed_file": True,
                 "config_deleted": False,
                 "config_retained": True,
-                "graph_deleted": False,
-                "graph_retained": name in self._indexed_names,
-                "errors": [],
+                "graph_deleted": graph_deleted,
+                "graph_retained": graph_retained,
+                "errors": errors,
                 "deleted_source_kind": record.source_kind,
                 "resolved_skill_retained": remaining is not None,
                 "remaining_source_kind": (

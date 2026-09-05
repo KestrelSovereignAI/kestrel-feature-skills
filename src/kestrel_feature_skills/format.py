@@ -51,6 +51,10 @@ _MARKDOWN_REFERENCE_DEFINITION_START = re.compile(
 )
 _MARKDOWN_REFERENCE_LABEL_PREFIX = re.compile(r"^[ \t]{0,3}\[")
 _MARKDOWN_BACKSLASH_ESCAPE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
+_MARKDOWN_UNESCAPE_TOKEN = re.compile(
+    r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])"
+    r"|(&(?:#[xX][0-9A-Fa-f]{1,6}|#[0-9]{1,7}|[A-Za-z][A-Za-z0-9]{0,30});)"
+)
 _MARKDOWN_AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*)>")
 # A CommonMark fence may be indented by at most three *columns*. Any tab in
 # the leading whitespace reaches at least column four, so it starts indented
@@ -1372,6 +1376,22 @@ def _raw_html_destinations(fragments: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(destinations)
 
 
+def _unescape_commonmark_destination(value: str) -> str:
+    """Resolve exactly one CommonMark escape or character-reference token."""
+
+    def replace(match: re.Match[str]) -> str:
+        escaped = match.group(1)
+        if escaped is not None:
+            return escaped
+        entity = match.group(2)
+        assert entity is not None
+        if entity.startswith("&#"):
+            return html.unescape(entity)
+        return html.entities.html5.get(entity[1:], entity)
+
+    return _MARKDOWN_UNESCAPE_TOKEN.sub(replace, value)
+
+
 def _local_markdown_destinations(body: str) -> tuple[str, ...]:
     destinations: list[str] = []
     visible_body, reference_destinations, inline_blocks, html_blocks = (
@@ -1407,14 +1427,18 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
             raw = angle_destination
         elif not raw.startswith("<"):
             raw = raw.split(maxsplit=1)[0]
-        raw = _MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", raw)
+        if character_references_decoded:
+            raw = _MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", raw)
+        else:
+            raw = _unescape_commonmark_destination(raw)
         if not raw or raw.startswith("#"):
             continue
         # HTMLParser has already resolved character references in raw HTML
-        # attributes. Markdown destinations still need exactly one decode before
-        # URL parsing. URL schemes are classified before percent-decoding so
-        # ``https%3A/...`` remains a local path subject to containment checks.
-        rendered = raw if character_references_decoded else html.unescape(raw)
+        # attributes. Markdown escapes and semicolon-terminated character
+        # references were resolved together above so replacement text cannot
+        # be decoded a second time. URL schemes are classified before percent-
+        # decoding so ``https%3A/...`` remains a local path subject to checks.
+        rendered = raw
         try:
             split = urlsplit(rendered)
         except ValueError as exc:

@@ -59,15 +59,17 @@ from .paths import (
     reject_symlink_chain,
 )
 from .sources import (
+    _GENERATION_TEMP_PREFIX,
+    INTERNAL_DIRECTORY,
     MAX_SOURCE_ENTRIES,
     PROVENANCE_FILENAME,
     _folder_revision,
+    _generation_marker_workspace,
     _new_generation_payload,
     serialize_provenance,
 )
 
 CLAIM_STALENESS_SECONDS = 60
-INTERNAL_DIRECTORY = ".kestrel-internal"
 GIT_CHECKOUT_PREFIX = ".kestrel-skill-git-"
 GIT_CHECKOUT_LOCK = ".checkout-owner.lock"
 SKILL_TRASH_PREFIX = ".kestrel-skill-trash-"
@@ -79,6 +81,7 @@ FAIL_CLOSED_STATE_VERSION = 1
 MAX_FAIL_CLOSED_ERROR_BYTES = 16_384
 MAX_EDITOR_FILE_BYTES = 262_144
 NAME_LOCK_BUCKETS = 256
+_GENERATION_REAP_PREFIX = ".kestrel-generation.reap."
 _MUTATION_LOCKS = tuple(threading.RLock() for _ in range(NAME_LOCK_BUCKETS))
 _SOURCE_PUBLICATION_LOCKS = tuple(threading.RLock() for _ in range(NAME_LOCK_BUCKETS))
 _PUBLICATION_STATE_LOCKS = tuple(threading.Lock() for _ in range(NAME_LOCK_BUCKETS))
@@ -1382,9 +1385,70 @@ class SkillStore:
         self._local_root_identity = root_identity
         self._internal_root = internal_root
         self._internal_root_identity = internal_identity
+        self._reap_generation_marker_temporaries()
         self._reap_retired_skill_folders()
         self._reap_publication_staging_folders()
         self._reap_git_checkout_workspaces()
+
+    def _reap_generation_marker_temporaries(self) -> None:
+        """Retire marker staging entries left by a crashed discovery process."""
+
+        root_fd = _open_directory(
+            self.local_root,
+            expected=self._local_root_identity,
+        )
+        try:
+            with _generation_marker_workspace(root_fd) as internal_fd:
+                for source_fd in (root_fd, internal_fd):
+                    recoverable_prefixes = (_GENERATION_TEMP_PREFIX,)
+                    if source_fd == internal_fd:
+                        recoverable_prefixes += (_GENERATION_REAP_PREFIX,)
+                    try:
+                        with os.scandir(source_fd) as entries:
+                            candidates = tuple(
+                                (entry.name, entry.stat(follow_symlinks=False))
+                                for entry in entries
+                                if entry.name.startswith(recoverable_prefixes)
+                            )
+                    except OSError:
+                        continue
+                    for name, value in candidates:
+                        expected = (value.st_dev, value.st_ino)
+                        quarantine = f"{_GENERATION_REAP_PREFIX}{uuid.uuid4().hex}"
+                        try:
+                            _rename_directory_no_replace_at(
+                                source_fd,
+                                name,
+                                quarantine,
+                                destination_directory_fd=internal_fd,
+                            )
+                        except (FileNotFoundError, OSError, SkillPathError):
+                            continue
+                        if _identity_at(internal_fd, quarantine) != expected:
+                            # A raced replacement was moved out of the public
+                            # source but is preserved for operator recovery.
+                            continue
+                        try:
+                            moved = os.stat(
+                                quarantine,
+                                dir_fd=internal_fd,
+                                follow_symlinks=False,
+                            )
+                            if stat.S_ISDIR(moved.st_mode):
+                                _purge_internal_directory_at(
+                                    internal_fd,
+                                    quarantine,
+                                    expected=expected,
+                                )
+                            else:
+                                _unlink_at(internal_fd, quarantine)
+                        except (OSError, SkillPathError):
+                            # The public source is already clear. Preserve any
+                            # changed private quarantine for a later recovery.
+                            continue
+                _fsync_directory_pair(root_fd, internal_fd)
+        finally:
+            os.close(root_fd)
 
     @staticmethod
     def _lock_git_checkout_workspace(workspace_fd: int) -> int | None:
