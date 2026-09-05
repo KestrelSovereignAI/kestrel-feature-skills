@@ -1431,6 +1431,7 @@ def test_malformed_inline_html_cannot_hide_later_live_url(tmp_path, body, error)
     (
         '<!-- <a href="../outside.md">literal comment</a> -->',
         '<?instruction <a href="../outside.md">literal instruction</a> ?>',
+        '<!element <a href="../outside.md">>',
         "<span title='<a href=\"../outside.md\">'>literal attribute</span>",
     ),
 )
@@ -1439,6 +1440,24 @@ def test_complete_raw_html_containers_keep_nested_tags_literal(tmp_path, body):
     folder = write_skill(tmp_path, value)
 
     assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_commonmark_0312_comment_allows_bare_double_hyphens(tmp_path):
+    value = SkillDocument(
+        "double-hyphen-comment",
+        "Current CommonMark comment grammar",
+        '<!-- bare -- hyphens keep <a href="../outside.md"> literal -->',
+    )
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+@pytest.mark.timeout(2)
+def test_unterminated_special_html_openers_are_scanned_in_bounded_time():
+    body = "text " + "<?" * 60_000
+
+    assert format_module._local_markdown_destinations(body) == ()
 
 
 @pytest.mark.parametrize(

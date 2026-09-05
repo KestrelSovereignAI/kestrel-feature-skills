@@ -1229,7 +1229,31 @@ def _commonmark_html_tag_end(body: str, start: int) -> int | None:
             return None
 
 
-def _commonmark_special_html_end(body: str, start: int) -> int | None:
+def _commonmark_special_terminator_end(
+    body: str,
+    cursor: int,
+    terminator: str,
+    missing_terminators: set[str],
+) -> int | None:
+    """Find a special token end without repeating a known-empty suffix scan."""
+
+    if terminator in missing_terminators:
+        return None
+    ending = body.find(terminator, cursor)
+    if ending < 0:
+        # Every later opener has a strict suffix of the range just searched.
+        # Remember the miss so adversarial repeated openers remain linear.
+        missing_terminators.add(terminator)
+        return None
+    return ending + len(terminator)
+
+
+def _commonmark_special_html_end(
+    body: str,
+    start: int,
+    *,
+    missing_terminators: set[str],
+) -> int | None:
     """Return the end of a complete comment, PI, declaration, or CDATA token."""
 
     if body.startswith("<!-->", start):
@@ -1237,27 +1261,39 @@ def _commonmark_special_html_end(body: str, start: int) -> int | None:
     if body.startswith("<!--->", start):
         return start + len("<!--->")
     if body.startswith("<!--", start):
-        ending = body.find("-->", start + len("<!--"))
-        return ending + len("-->") if ending >= 0 else None
+        # CommonMark 0.31.2 permits bare ``--`` inside comment text; the first
+        # complete ``-->`` sequence is the only delimiter that matters here.
+        return _commonmark_special_terminator_end(
+            body,
+            start + len("<!--"),
+            "-->",
+            missing_terminators,
+        )
     if body.startswith("<?", start):
-        ending = body.find("?>", start + len("<?"))
-        return ending + len("?>") if ending >= 0 else None
+        return _commonmark_special_terminator_end(
+            body,
+            start + len("<?"),
+            "?>",
+            missing_terminators,
+        )
     if body.startswith("<![CDATA[", start):
-        ending = body.find("]]>", start + len("<![CDATA["))
-        return ending + len("]]>") if ending >= 0 else None
+        return _commonmark_special_terminator_end(
+            body,
+            start + len("<![CDATA["),
+            "]]>",
+            missing_terminators,
+        )
     if not body.startswith("<!", start):
         return None
     cursor = start + len("<!")
-    name_start = cursor
-    while cursor < len(body) and "A" <= body[cursor] <= "Z":
-        cursor += 1
-    if cursor == name_start or cursor >= len(body) or body[cursor] not in " \t\n":
+    if cursor >= len(body) or not body[cursor].isascii() or not body[cursor].isalpha():
         return None
-    cursor = _commonmark_html_space_end(body, cursor)
-    if cursor is None:
-        return None
-    ending = body.find(">", cursor)
-    return ending + 1 if ending >= 0 else None
+    return _commonmark_special_terminator_end(
+        body,
+        cursor + 1,
+        ">",
+        missing_terminators,
+    )
 
 
 def _mask_non_commonmark_html_openers(body: str) -> str:
@@ -1265,6 +1301,7 @@ def _mask_non_commonmark_html_openers(body: str) -> str:
 
     masked = list(body)
     cursor = 0
+    missing_special_terminators: set[str] = set()
     while True:
         position = body.find("<", cursor)
         if position < 0:
@@ -1274,7 +1311,11 @@ def _mask_non_commonmark_html_openers(body: str) -> str:
             cursor = position + 1
             continue
         if body.startswith(("<!", "<?"), position):
-            ending = _commonmark_special_html_end(body, position)
+            ending = _commonmark_special_html_end(
+                body,
+                position,
+                missing_terminators=missing_special_terminators,
+            )
             if ending is None:
                 # An incomplete declaration is literal CommonMark. Mask only
                 # its opener so a later complete URL-bearing tag remains live.
