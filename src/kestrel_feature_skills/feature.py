@@ -1502,10 +1502,15 @@ class ProceduralSkillsFeature(Feature):
             store.delete(record)
             await self._refresh_locked()
             remaining = self._snapshot.by_name().get(name)
-            graph_deleted = remaining is None
-            graph_retained = remaining is not None and name in self._indexed_names
+            graph_storage = getattr(self.agent, "storage", None)
+            graph_deleted = graph_storage is None or remaining is None
+            graph_retained = (
+                graph_storage is not None
+                and remaining is not None
+                and name in self._indexed_names
+            )
             errors: list[str] = []
-            if remaining is None and getattr(self.agent, "storage", None) is not None:
+            if remaining is None and graph_storage is not None:
                 # Refresh already attempted the idempotent stale-node removal;
                 # retry once so its recoverable failure is reflected in this
                 # mutation result just as it is for an unshadowed deletion.

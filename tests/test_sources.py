@@ -800,6 +800,44 @@ def test_git_source_rejects_ambiguous_branch_and_annotated_tag(monkeypatch):
         )
 
 
+def test_git_source_rejects_suffix_matching_shorthand_ref(monkeypatch):
+    def fake_git(argv, *, timeout=120, cancel_event=None):
+        assert argv[:2] == ["ls-remote", "--exit-code"]
+        assert timeout == 60
+        assert cancel_event is None
+        return f"{'a' * 40}\trefs/heads/releases/main"
+
+    monkeypatch.setattr(git_source_module, "_run_git", fake_git)
+
+    with pytest.raises(GitSourceError, match="requested reference"):
+        GitSkillSource().remote_revision(
+            url="https://example.com/skills.git",
+            ref="main",
+        )
+
+
+def test_git_source_ignores_suffix_match_when_exact_shorthand_ref_exists(monkeypatch):
+    exact_revision = "b" * 40
+
+    def fake_git(argv, *, timeout=120, cancel_event=None):
+        assert argv[:2] == ["ls-remote", "--exit-code"]
+        assert timeout == 60
+        assert cancel_event is None
+        return (
+            f"{'a' * 40}\trefs/heads/releases/main\n{exact_revision}\trefs/heads/main"
+        )
+
+    monkeypatch.setattr(git_source_module, "_run_git", fake_git)
+
+    assert (
+        GitSkillSource().remote_revision(
+            url="https://example.com/skills.git",
+            ref="main",
+        )
+        == exact_revision
+    )
+
+
 def test_git_checkout_rejects_ambiguous_shorthand_before_clone(tmp_path, monkeypatch):
     branch_commit = "a" * 40
     tag_object = "b" * 40

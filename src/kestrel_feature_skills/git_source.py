@@ -503,6 +503,11 @@ class GitSkillSource:
         direct_by_reference: dict[str, list[str]] = {}
         peeled_by_reference: dict[str, list[str]] = {}
         object_id_length: int | None = None
+        expected_references = (
+            {ref}
+            if ref == "HEAD" or ref.startswith("refs/")
+            else {f"refs/heads/{ref}", f"refs/tags/{ref}"}
+        )
         for line in output.splitlines():
             fields = line.split()
             if len(fields) != 2 or not is_full_object_id(fields[0]):
@@ -517,11 +522,20 @@ class GitSkillSource:
                 )
             is_peeled = fields[1].endswith("^{}")
             base_reference = fields[1][:-3] if is_peeled else fields[1]
+            # ls-remote patterns also tail-match path components. Only an
+            # exact branch/tag spelling (or exact fully-qualified ref) can
+            # satisfy the caller's requested identity.
+            if base_reference not in expected_references:
+                continue
             revisions_by_reference = (
                 peeled_by_reference if is_peeled else direct_by_reference
             )
             revisions_by_reference.setdefault(base_reference, []).append(fields[0])
         base_references = direct_by_reference.keys() | peeled_by_reference.keys()
+        if not base_references:
+            raise GitSourceError(
+                f"remote ref {ref!r} did not resolve to the requested reference"
+            )
         if len(base_references) != 1:
             raise GitSourceError(f"remote ref {ref!r} did not resolve to one reference")
         base_reference = next(iter(base_references))

@@ -3276,6 +3276,64 @@ async def test_delete_removes_shadowed_local_git_installation(
         await other.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_shadowed_delete_without_graph_storage_is_a_successful_noop(
+    feature, tmp_path, monkeypatch
+):
+    name = "shadowed-delete-without-graph"
+    local = tmp_path / "no-graph-local"
+    local_skill = local / name
+    local_skill.mkdir(parents=True)
+    (local_skill / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Hidden Git installation", "Local procedure.")
+        ),
+        encoding="utf-8",
+    )
+    (local_skill / PROVENANCE_FILENAME).write_bytes(
+        serialize_provenance(
+            SkillProvenance(
+                kind="git",
+                source_id="https://example.com/skills.git",
+                locator=f"main:{name}",
+                revision="a" * 40,
+                remote_url="https://example.com/skills.git",
+            )
+        )
+    )
+    shared = tmp_path / "no-graph-shared"
+    shared_skill = shared / name
+    shared_skill.mkdir(parents=True)
+    (shared_skill / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Visible host skill", "Host procedure.")
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KESTREL_SHARED_SKILLS_DIR", str(shared))
+    agent = SimpleNamespace(
+        did="did:test:skills-no-graph",
+        agent_id="did:test:skills-no-graph",
+        procedural_skills_root=local,
+        _raw_storage=feature.agent._raw_storage,
+    )
+    other = ProceduralSkillsFeature(agent)
+    await other.initialize()
+    try:
+        result = await other.skill_delete(name, delete_revision(other, name))
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["graph_deleted"] is True
+        assert result.data["graph_retained"] is False
+        assert result.data["errors"] == []
+        assert result.data["resolved_skill_retained"] is True
+        assert result.data["remaining_source_kind"] == "host-shared"
+        assert not local_skill.exists()
+        assert shared_skill.is_dir()
+    finally:
+        await other.shutdown()
+
+
 @pytest.mark.parametrize("graph_cleanup_succeeds", (True, False))
 @pytest.mark.asyncio
 async def test_shadowed_delete_reports_graph_cleanup_when_host_winner_disappears(
