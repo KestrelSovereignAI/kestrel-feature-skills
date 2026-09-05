@@ -715,9 +715,10 @@ def test_git_source_rejects_git_invalid_ref_spellings(ref):
 def test_git_source_detects_when_recorded_commit_changes(monkeypatch, object_id_length):
     revisions = iter(("a" * object_id_length, "b" * object_id_length))
 
-    def fake_git(argv, *, timeout=120):
+    def fake_git(argv, *, timeout=120, cancel_event=None):
         assert argv[:2] == ["ls-remote", "--exit-code"]
         assert timeout == 60
+        assert cancel_event is None
         return f"{next(revisions)}\trefs/heads/main"
 
     monkeypatch.setattr(git_source_module, "_run_git", fake_git)
@@ -738,9 +739,10 @@ def test_git_source_compares_annotated_tag_peeled_commit(monkeypatch):
     tag_object = "a" * 40
     peeled_commit = "b" * 40
 
-    def fake_git(argv, *, timeout=120):
+    def fake_git(argv, *, timeout=120, cancel_event=None):
         assert argv[:2] == ["ls-remote", "--exit-code"]
         assert timeout == 60
+        assert cancel_event is None
         return f"{tag_object}\trefs/tags/v1.0.0\n{peeled_commit}\trefs/tags/v1.0.0^{{}}"
 
     monkeypatch.setattr(git_source_module, "_run_git", fake_git)
@@ -757,9 +759,10 @@ def test_git_source_rejects_ambiguous_branch_and_annotated_tag(monkeypatch):
     tag_object = "b" * 40
     tag_commit = "c" * 40
 
-    def fake_git(argv, *, timeout=120):
+    def fake_git(argv, *, timeout=120, cancel_event=None):
         assert argv[:2] == ["ls-remote", "--exit-code"]
         assert timeout == 60
+        assert cancel_event is None
         return (
             f"{branch_commit}\trefs/heads/main\n"
             f"{tag_object}\trefs/tags/main\n"
@@ -811,6 +814,28 @@ def test_git_checkout_rejects_ambiguous_shorthand_before_clone(tmp_path, monkeyp
             "main^{}",
         ]
     ]
+
+
+def test_git_checkout_forwards_cancellation_while_resolving_named_ref(
+    tmp_path, monkeypatch
+):
+    cancel_event = threading.Event()
+
+    def fake_git(argv, **kwargs):
+        assert argv[0] == "ls-remote"
+        assert kwargs.get("cancel_event") is cancel_event
+        raise GitSourceError("git source operation was cancelled")
+
+    monkeypatch.setattr(git_source_module, "_run_git", fake_git)
+
+    with pytest.raises(GitSourceError, match="cancelled"):
+        GitSkillSource().checkout(
+            url="https://example.com/skills.git",
+            ref="main",
+            skill_name="remote",
+            target=tmp_path / "checkout",
+            cancel_event=cancel_event,
+        )
 
 
 def test_git_checkout_rejects_a_named_ref_that_moves_after_resolution(

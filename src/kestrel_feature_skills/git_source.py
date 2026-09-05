@@ -377,6 +377,7 @@ class GitSkillSource:
             resolved_reference, resolved_revision = self._resolve_remote_ref(
                 url=url,
                 ref=ref,
+                cancel_event=cancel_event,
             )
         clone = [
             "clone",
@@ -485,12 +486,19 @@ class GitSkillSource:
             ref=ref,
         )
 
-    def _resolve_remote_ref(self, *, url: str, ref: str) -> tuple[str, str]:
+    def _resolve_remote_ref(
+        self,
+        *,
+        url: str,
+        ref: str,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[str, str]:
         """Resolve one validated ref to its canonical remote name and commit."""
 
         output = _run_git(
             ["ls-remote", "--exit-code", "--", url, ref, f"{ref}^{{}}"],
             timeout=60,
+            cancel_event=cancel_event,
         )
         direct_by_reference: dict[str, list[str]] = {}
         peeled_by_reference: dict[str, list[str]] = {}
