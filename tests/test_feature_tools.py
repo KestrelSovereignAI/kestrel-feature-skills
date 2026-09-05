@@ -765,6 +765,92 @@ async def test_state_change_rolls_back_when_folder_changes_during_persistence(
 
 
 @pytest.mark.asyncio
+async def test_state_change_stays_locally_disabled_when_rollback_cannot_persist(
+    feature, monkeypatch
+):
+    name = "state-rollback-failure"
+    await feature.skill_create(name, "Original", "Original procedure.")
+    record = feature.snapshot.by_name()[name]
+    folder = feature.agent.procedural_skills_root / name
+    replacement = serialize_skill_markdown(
+        SkillDocument(name, "Unapproved replacement", "Replacement procedure.")
+    )
+    real_set = feature._enablement.set
+
+    async def commit_enable_but_refuse_rollback(*args, **kwargs):
+        if kwargs["enabled"] is False:
+            raise DatabaseError("rollback database write failed")
+        state = await real_set(*args, **kwargs)
+        (folder / "SKILL.md").write_text(replacement, encoding="utf-8")
+        return state
+
+    monkeypatch.setattr(
+        feature._enablement,
+        "set",
+        commit_enable_but_refuse_rollback,
+    )
+
+    with pytest.raises(SkillConflictError, match="changed after it was read"):
+        await feature.set_skill_state(
+            name=name,
+            enabled=True,
+            priority=19,
+            expected_revision=record.revision,
+        )
+
+    assert (await feature._enablement.load())[name] == SkillState(True, 19)
+    assert feature.snapshot.by_name()[name].state == SkillState(False, 100)
+    assert "Unapproved replacement" not in feature.context_clause_text
+    assert (
+        "rollback database write failed"
+        in feature.catalog_payload()["enablement_error"]
+    )
+
+    monkeypatch.setattr(feature._enablement, "set", real_set)
+    await real_set(name, enabled=False, priority=100)
+    await feature.refresh()
+    assert feature.catalog_payload()["enablement_error"] is None
+    assert feature.snapshot.by_name()[name].state == SkillState(False, 100)
+
+
+@pytest.mark.asyncio
+async def test_disable_race_does_not_restore_enablement_to_replacement(
+    feature, monkeypatch
+):
+    name = "disable-raced-replacement"
+    await feature.skill_create(name, "Original", "Original procedure.")
+    await feature.skill_enable(name, priority=23)
+    record = feature.snapshot.by_name()[name]
+    folder = feature.agent.procedural_skills_root / name
+    replacement = serialize_skill_markdown(
+        SkillDocument(name, "Unapproved replacement", "Replacement procedure.")
+    )
+    real_set = feature._enablement.set
+    mutated = False
+
+    async def persist_then_replace(*args, **kwargs):
+        nonlocal mutated
+        state = await real_set(*args, **kwargs)
+        if not mutated:
+            mutated = True
+            (folder / "SKILL.md").write_text(replacement, encoding="utf-8")
+        return state
+
+    monkeypatch.setattr(feature._enablement, "set", persist_then_replace)
+
+    with pytest.raises(SkillConflictError, match="changed after it was read"):
+        await feature.set_skill_state(
+            name=name,
+            enabled=False,
+            expected_revision=record.revision,
+        )
+
+    assert (await feature._enablement.load())[name] == SkillState(False, 23)
+    assert feature.snapshot.by_name()[name].state == SkillState(False, 23)
+    assert "Unapproved replacement" not in feature.context_clause_text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mutation", ("replace", "remove"))
 async def test_state_change_rolls_back_when_folder_changes_during_final_refresh(
     feature, monkeypatch, mutation
@@ -1690,6 +1776,45 @@ async def test_failed_create_publication_keeps_raced_replacement_disabled(
 
 
 @pytest.mark.asyncio
+async def test_create_conflict_keeps_raced_replacement_disabled(feature, monkeypatch):
+    name = "create-conflict-raced-replacement"
+    prior_state = await feature._enablement.set(name, enabled=True, priority=17)
+    feature._states[name] = prior_state
+    published = feature.agent.procedural_skills_root / name
+
+    def publish_replacement_then_conflict(_document):
+        published.mkdir()
+        (published / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(
+                    name,
+                    "Unapproved replacement after create conflict",
+                    "Unapproved procedure.",
+                )
+            ),
+            encoding="utf-8",
+        )
+        raise SkillConflictError("a non-cooperating writer won publication")
+
+    monkeypatch.setattr(
+        feature._store,
+        "create_pinned",
+        publish_replacement_then_conflict,
+    )
+
+    result = await feature.skill_create(name, "Requested skill", "Procedure.")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert (await feature._enablement.load())[name] == SkillState(
+        False, DEFAULT_PRIORITY
+    )
+    assert feature.snapshot.by_name()[name].state == SkillState(False, DEFAULT_PRIORITY)
+    assert "Unapproved replacement after create conflict" not in (
+        feature.context_clause_text
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_rollback_preserves_concurrent_same_inode_resource(
     feature, monkeypatch
 ):
@@ -2241,6 +2366,7 @@ async def test_failed_folder_removal_retains_disabled_tombstone(feature, monkeyp
     result = await feature.skill_delete(name, approved_revision)
 
     assert result.status is ToolResultStatus.ERROR
+    assert "remains disabled" in result.error
     assert (await feature._enablement.load())[name] == SkillState(False, 23)
     assert feature.snapshot.by_name()[name].state == SkillState(False, 23)
     assert "Must not remain enabled" not in feature.context_clause_text
@@ -3328,6 +3454,67 @@ async def test_failed_install_publication_keeps_raced_replacement_disabled(
     )
     assert feature.snapshot.by_name()[name].state == SkillState(False, DEFAULT_PRIORITY)
     assert "Unapproved replacement after failed install publication" not in (
+        feature.context_clause_text
+    )
+
+
+@pytest.mark.asyncio
+async def test_install_conflict_keeps_raced_replacement_disabled(
+    feature, tmp_path, monkeypatch
+):
+    name = "install-conflict-raced-replacement"
+    prior_state = await feature._enablement.set(name, enabled=True, priority=19)
+    feature._states[name] = prior_state
+    published = feature.agent.procedural_skills_root / name
+    checkout_root = tmp_path / "checkout-install-conflict"
+    source = checkout_root / "skills" / name
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(SkillDocument(name, "Remote", "Procedure.")),
+        encoding="utf-8",
+    )
+
+    def fake_checkout(self, *, url, ref, skill_name, target, cancel_event=None):
+        return GitCheckout(
+            root=checkout_root,
+            skill_folder=source,
+            revision="a" * 40,
+            remote_url=url,
+            ref=ref,
+        )
+
+    def publish_replacement_then_conflict(*_args, **_kwargs):
+        published.mkdir()
+        (published / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(
+                    name,
+                    "Unapproved replacement after install conflict",
+                    "Unapproved procedure.",
+                )
+            ),
+            encoding="utf-8",
+        )
+        raise SkillConflictError("a non-cooperating writer won installation")
+
+    monkeypatch.setattr(
+        "kestrel_feature_skills.git_source.GitSkillSource.checkout",
+        fake_checkout,
+    )
+    monkeypatch.setattr(
+        feature._store,
+        "install_folder_pinned",
+        publish_replacement_then_conflict,
+    )
+
+    result = await feature.skill_install("https://example.com/repo.git", name, "main")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert (await feature._enablement.load())[name] == SkillState(
+        False, DEFAULT_PRIORITY
+    )
+    assert feature.snapshot.by_name()[name].state == SkillState(False, DEFAULT_PRIORITY)
+    assert "Unapproved replacement after install conflict" not in (
         feature.context_clause_text
     )
 

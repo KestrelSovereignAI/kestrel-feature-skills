@@ -480,6 +480,43 @@ async def test_delete_api_removes_only_resolved_local_skill(client, feature):
 
 
 @pytest.mark.asyncio
+async def test_delete_api_reports_retained_disable_after_folder_failure(
+    client, feature, monkeypatch
+):
+    await client.post(
+        "/api/procedural-skills",
+        json={
+            "name": "failed-api-delete",
+            "description": "Must remain disabled",
+            "body": "body",
+            "enabled": True,
+        },
+    )
+    record = await _record(client, "failed-api-delete")
+
+    def fail_removal(_record):
+        raise OSError("recursive removal failed")
+
+    monkeypatch.setattr(feature._store, "delete", fail_removal)
+    response = await client.delete(
+        "/api/procedural-skills/failed-api-delete",
+        headers={
+            "If-Match": record["delete_revision"],
+            "X-Kestrel-Allow-Destructive": "operator-confirmed-ui",
+        },
+    )
+
+    assert response.status_code == 500
+    assert "remains disabled" in response.json()["detail"]
+    retained = await _record(client, "failed-api-delete")
+    assert retained["enabled"] is False
+    assert (
+        "Must remain disabled"
+        not in (await client.get("/api/procedural-skills")).json()["context"]["text"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_delete_api_maps_invalid_skill_name_to_422(client):
     response = await client.delete(
         "/api/procedural-skills/INVALID!",

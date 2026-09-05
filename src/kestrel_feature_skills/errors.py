@@ -17,6 +17,10 @@ class SkillPublicationCleanupError(SkillPathError):
     """A failed publication left a same-named folder whose removal was unproven."""
 
 
+class SkillDeletionError(SkillError):
+    """A deletion failed after a client-visible safety state was committed."""
+
+
 class SkillConflictError(SkillError):
     """A create or install conflicts with an existing skill."""
 
@@ -50,6 +54,7 @@ __all__ = [
     "GitInputError",
     "GitSourceError",
     "SkillConflictError",
+    "SkillDeletionError",
     "SkillError",
     "SkillFormatError",
     "SkillNotFoundError",

@@ -15,6 +15,7 @@ from .errors import (
     GitInputError,
     GitSourceError,
     SkillConflictError,
+    SkillDeletionError,
     SkillFormatError,
     SkillNotFoundError,
     SkillPathError,
@@ -66,6 +67,8 @@ def _http_error(exc: Exception) -> HTTPException:
             status_code=500,
             detail=f"skill publication cleanup could not be confirmed: {exc}",
         )
+    if isinstance(exc, SkillDeletionError):
+        return HTTPException(status_code=500, detail=str(exc))
     if isinstance(exc, SkillConflictError):
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, (SkillReadOnlyError, SkillPrivacyError)):
@@ -278,6 +281,7 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
             SkillNotFoundError,
             SkillReadOnlyError,
             SkillConflictError,
+            SkillDeletionError,
             SkillFormatError,
             SkillPathError,
             SkillPrivacyError,

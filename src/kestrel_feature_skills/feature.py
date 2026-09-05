@@ -44,6 +44,7 @@ from .context import (
 from .enablement import DEFAULT_PRIORITY, SkillEnablementStore, validate_priority
 from .errors import (
     SkillConflictError,
+    SkillDeletionError,
     SkillError,
     SkillFormatError,
     SkillPathError,
@@ -199,6 +200,8 @@ class ProceduralSkillsFeature(Feature):
         )
         self._states: dict[str, SkillState] = {}
         self._enablement_error: str | None = None
+        self._fail_closed_states: dict[str, SkillState] = {}
+        self._fail_closed_errors: dict[str, str] = {}
         self._indexed_names: frozenset[str] = frozenset()
         self._indexed_payloads: dict[str, str] | None = None
         self._router = None
@@ -366,19 +369,61 @@ class ProceduralSkillsFeature(Feature):
         try:
             states = await self._enablement.load()
         except DatabaseError as exc:
-            self._enablement_error = str(exc)
-            states = self._states
+            states = self._with_fail_closed_states(self._states)
+            self._enablement_error = self._combined_enablement_error(str(exc))
             logger.warning(
                 "Could not reload procedural skill enablement; retaining the last known state: %s",
                 exc,
             )
         else:
+            self._clear_persisted_fail_closed_states(states)
+            states = self._with_fail_closed_states(states)
             self._states = dict(states)
-            self._enablement_error = None
+            self._enablement_error = self._combined_enablement_error()
         return await self._rebuild_snapshot_locked(
             states,
             publish_context=publish_context,
         )
+
+    def _combined_enablement_error(self, primary: str | None = None) -> str | None:
+        messages = ([primary] if primary else []) + list(
+            self._fail_closed_errors.values()
+        )
+        return "; ".join(messages) or None
+
+    def _with_fail_closed_states(
+        self,
+        states: dict[str, SkillState],
+    ) -> dict[str, SkillState]:
+        guarded = dict(states)
+        guarded.update(self._fail_closed_states)
+        return guarded
+
+    def _clear_persisted_fail_closed_states(
+        self,
+        observed_states: dict[str, SkillState],
+    ) -> None:
+        for name in tuple(self._fail_closed_states):
+            observed = observed_states.get(name)
+            if observed is None or not observed.enabled:
+                self._clear_fail_closed_state(name)
+
+    def _retain_fail_closed_state(
+        self,
+        name: str,
+        *,
+        priority: int,
+        error: str,
+    ) -> None:
+        state = SkillState(False, priority)
+        self._fail_closed_states[name] = state
+        self._fail_closed_errors[name] = error
+        self._states[name] = state
+        self._enablement_error = self._combined_enablement_error()
+
+    def _clear_fail_closed_state(self, name: str) -> None:
+        self._fail_closed_states.pop(name, None)
+        self._fail_closed_errors.pop(name, None)
 
     @staticmethod
     async def _scan_catalog_until_stopped(
@@ -721,6 +766,7 @@ class ProceduralSkillsFeature(Feature):
         previous_state: SkillState | None = None
         disabled_state: SkillState | None = None
         state_was_persisted = False
+        prior_local_identity = store.local_entry_identity(name)
         if enablement.available:
             previous_state, disabled_state = await self._prepare_disabled_state(
                 enablement,
@@ -736,7 +782,12 @@ class ProceduralSkillsFeature(Feature):
             if state_was_persisted:
                 restore_state = (
                     disabled_state
-                    if isinstance(publication_error, SkillPublicationCleanupError)
+                    if self._publication_failure_requires_disabled_state(
+                        store,
+                        name,
+                        publication_error,
+                        prior_local_identity=prior_local_identity,
+                    )
                     else previous_state
                 )
                 await self._restore_enablement_after_publication_failure(
@@ -816,6 +867,28 @@ class ProceduralSkillsFeature(Feature):
             "revision": record.revision,
         }
 
+    @staticmethod
+    def _publication_failure_requires_disabled_state(
+        store: SkillStore,
+        name: str,
+        publication_error: BaseException,
+        *,
+        prior_local_identity: tuple[int, int] | None,
+    ) -> bool:
+        """Retain the guard whenever failed publication may have a replacement."""
+
+        if isinstance(publication_error, SkillPublicationCleanupError):
+            return True
+        try:
+            current_identity = store.local_entry_identity(name)
+        except (OSError, SkillError) as inspection_error:
+            publication_error.add_note(
+                "the same-name local entry could not be inspected after publication "
+                f"failed: {inspection_error}"
+            )
+            return True
+        return current_identity is not None and current_identity != prior_local_identity
+
     async def _rollback_created_publication(
         self,
         store: SkillStore,
@@ -882,8 +955,19 @@ class ProceduralSkillsFeature(Feature):
                 f"{operation} failed ({publication_error}); "
                 f"enablement rollback also failed ({rollback_error})"
             )
-            self._enablement_error = message
+            current = self._states.get(name)
+            priority = (
+                previous_state.priority
+                if previous_state is not None
+                else (current.priority if current is not None else DEFAULT_PRIORITY)
+            )
+            self._retain_fail_closed_state(
+                name,
+                priority=priority,
+                error=message,
+            )
             raise DatabaseError(message) from rollback_error
+        self._clear_fail_closed_state(name)
 
     async def _prepare_disabled_state(
         self,
@@ -930,6 +1014,7 @@ class ProceduralSkillsFeature(Feature):
             )
             await self._drain_shielded_task(restoration)
             raise
+        self._clear_fail_closed_state(name)
         return previous_state, state
 
     async def edit_skill(
@@ -1075,7 +1160,9 @@ class ProceduralSkillsFeature(Feature):
         except DatabaseError as exc:
             self._enablement_error = str(exc)
             observed_states = await enablement.load()
-            self._states = dict(observed_states)
+            self._clear_persisted_fail_closed_states(observed_states)
+            self._states = self._with_fail_closed_states(observed_states)
+            self._enablement_error = self._combined_enablement_error(str(exc))
             await self._rebuild_snapshot_locked(self._states)
             raise
         try:
@@ -1088,6 +1175,7 @@ class ProceduralSkillsFeature(Feature):
                 consistency_error=consistency_error,
             )
             raise
+        self._clear_fail_closed_state(name)
         self._states[name] = state
         await self._refresh_locked()
         try:
@@ -1127,13 +1215,18 @@ class ProceduralSkillsFeature(Feature):
         previous_state: SkillState | None,
         consistency_error: BaseException,
     ) -> None:
-        """Restore the prior row and refresh after a generation race."""
+        """Restore only a fail-closed prior row after a generation race."""
 
+        safe_state = (
+            None
+            if previous_state is None
+            else SkillState(False, previous_state.priority)
+        )
         try:
             await self._restore_enablement_after_publication_failure(
                 enablement,
                 name,
-                previous_state,
+                safe_state,
                 consistency_error,
                 operation="skill state update",
             )
@@ -1225,9 +1318,12 @@ class ProceduralSkillsFeature(Feature):
             # quarantine name. Retaining the disabled tombstone is the only
             # fail-safe result when folder cleanup cannot be confirmed.
             if enablement.available:
-                deletion_error.add_note(
-                    "the skill was disabled before deletion and remains disabled"
-                )
+                caveat = "the skill was disabled before deletion and remains disabled"
+                deletion_error.add_note(caveat)
+                if isinstance(deletion_error, Exception):
+                    raise SkillDeletionError(
+                        f"skill folder deletion failed ({deletion_error}); {caveat}"
+                    ) from deletion_error
             raise
         config_deleted = True
         graph_deleted = True
@@ -1406,6 +1502,7 @@ class ProceduralSkillsFeature(Feature):
         previous_state: SkillState | None = None
         disabled_state: SkillState | None = None
         state_was_persisted = False
+        prior_local_identity = store.local_entry_identity(skill_name)
         if enablement.available:
             previous_state, disabled_state = await self._prepare_disabled_state(
                 enablement,
@@ -1424,7 +1521,12 @@ class ProceduralSkillsFeature(Feature):
             if state_was_persisted:
                 restore_state = (
                     disabled_state
-                    if isinstance(publication_error, SkillPublicationCleanupError)
+                    if self._publication_failure_requires_disabled_state(
+                        store,
+                        skill_name,
+                        publication_error,
+                        prior_local_identity=prior_local_identity,
+                    )
                     else previous_state
                 )
                 await self._restore_enablement_after_publication_failure(

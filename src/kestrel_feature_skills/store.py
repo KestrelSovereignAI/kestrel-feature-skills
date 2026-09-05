@@ -1646,6 +1646,19 @@ class SkillStore:
 
         return self._local_root_identity
 
+    def local_entry_identity(self, name: str) -> tuple[int, int] | None:
+        """Inspect one validated name through the pinned local-root descriptor."""
+
+        name = validate_skill_name(name)
+        root_fd = _open_directory(
+            self.local_root,
+            expected=self._local_root_identity,
+        )
+        try:
+            return _identity_at(root_fd, name)
+        finally:
+            os.close(root_fd)
+
     def try_acquire_publication_state_claim(
         self, name: str
     ) -> PublicationStateClaim | None:
