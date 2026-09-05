@@ -1420,13 +1420,21 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
         )
     )
     for candidate, character_references_decoded in raw_destinations:
-        raw = candidate.strip()
-        angle_destination = _angle_destination(raw)
-        if angle_destination is not None:
-            raw = angle_destination
-        elif not raw.startswith("<"):
-            raw = raw.split(maxsplit=1)[0]
-        if not character_references_decoded:
+        if character_references_decoded:
+            # HTMLParser returns the complete decoded attribute value. It is
+            # not a CommonMark destination followed by an optional title, so
+            # splitting on whitespace would validate a decoy path instead of
+            # the URL a browser actually resolves. Only ordinary surrounding
+            # spaces are trimmed here; decoded/literal controls are rejected
+            # below before URL handling can remove or collapse them.
+            raw = candidate.strip(" ")
+        else:
+            raw = candidate.strip()
+            angle_destination = _angle_destination(raw)
+            if angle_destination is not None:
+                raw = angle_destination
+            elif not raw.startswith("<"):
+                raw = raw.split(maxsplit=1)[0]
             raw = _unescape_commonmark_destination(raw)
         if not raw or raw.startswith("#"):
             continue
@@ -1436,7 +1444,9 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
         # be decoded a second time. URL schemes are classified before percent-
         # decoding so ``https%3A/...`` remains a local path subject to checks.
         rendered = raw
-        if any(character in rendered for character in "\t\r\n"):
+        if any(
+            ord(character) < 0x20 or ord(character) == 0x7F for character in rendered
+        ):
             raise SkillPathError("link URL contains control characters in SKILL.md")
         try:
             split = urlsplit(rendered)

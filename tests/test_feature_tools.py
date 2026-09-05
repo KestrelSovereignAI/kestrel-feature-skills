@@ -2902,6 +2902,70 @@ async def test_database_unavailable_delete_reports_retained_configuration(featur
 
 
 @pytest.mark.asyncio
+async def test_delete_retries_guard_cleanup_after_committed_unlink(
+    feature, monkeypatch
+):
+    name = "delete-marker-retry"
+    await feature.skill_create(name, "Delete marker retry", "Procedure.")
+    feature._retain_fail_closed_state(
+        name,
+        priority=DEFAULT_PRIORITY,
+        error="seeded deletion guard",
+    )
+    approved_revision = delete_revision(feature, name)
+    real_clear = feature._store.clear_fail_closed_state
+    calls = 0
+
+    def fail_after_first_unlink(candidate):
+        nonlocal calls
+        calls += 1
+        real_clear(candidate)
+        if calls == 1:
+            raise OSError("directory fsync failed after unlink")
+
+    monkeypatch.setattr(
+        feature._store, "clear_fail_closed_state", fail_after_first_unlink
+    )
+
+    result = await feature.skill_delete(name, approved_revision)
+
+    assert result.status is ToolResultStatus.OK
+    assert calls == 2
+    assert not (feature.agent.procedural_skills_root / name).exists()
+    assert name not in await feature._enablement.load()
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert name not in guarded
+
+
+@pytest.mark.asyncio
+async def test_delete_reports_partial_when_committed_guard_cleanup_stays_unproved(
+    feature, monkeypatch
+):
+    name = "delete-marker-partial"
+    await feature.skill_create(name, "Delete marker partial", "Procedure.")
+    feature._retain_fail_closed_state(
+        name,
+        priority=DEFAULT_PRIORITY,
+        error="seeded deletion guard",
+    )
+    approved_revision = delete_revision(feature, name)
+
+    def fail_clear(_candidate):
+        raise OSError("marker storage unavailable")
+
+    monkeypatch.setattr(feature._store, "clear_fail_closed_state", fail_clear)
+
+    result = await feature.skill_delete(name, approved_revision)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["removed_file"] is True
+    assert result.data["config_deleted"] is True
+    assert "marker cleanup remains incomplete" in result.error
+    assert not (feature.agent.procedural_skills_root / name).exists()
+    assert name not in await feature._enablement.load()
+
+
+@pytest.mark.asyncio
 async def test_delete_failure_cannot_enable_a_same_named_shared_fallback(
     feature, tmp_path, monkeypatch
 ):

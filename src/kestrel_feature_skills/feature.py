@@ -1630,12 +1630,17 @@ class ProceduralSkillsFeature(Feature):
             )
         if getattr(self.agent, "storage", None) is not None:
             graph_deleted = await self._delete_index_node(name)
+        guard_cleanup_pending = False
         if config_deleted:
             # The authoritative folder and database row are already absent.
             # Release the durable guard before context publication so a host
             # refresh failure cannot strand a tombstone with no retry target.
-            self._clear_fail_closed_state(name)
-            self._states.pop(name, None)
+            try:
+                self._clear_fail_closed_state(name)
+            except (OSError, SkillError):
+                # Continue through reconciliation and retry below. The delete
+                # is already committed and must never be reported as uncommitted.
+                guard_cleanup_pending = True
         refresh_error = await self._refresh_committed_mutation()
         if refresh_error is not None:
             errors.append(refresh_error)
@@ -1673,9 +1678,13 @@ class ProceduralSkillsFeature(Feature):
                 errors.insert(0, enablement_cleanup_error)
             else:
                 config_deleted = True
-        if config_deleted and name in self._fail_closed_states:
-            self._clear_fail_closed_state(name)
-            self._states.pop(name, None)
+        if config_deleted and (
+            guard_cleanup_pending or name in self._fail_closed_states
+        ):
+            try:
+                self._clear_fail_closed_state(name)
+            except (OSError, SkillError):
+                errors.append("durable fail-closed marker cleanup remains incomplete")
         return {
             "name": name,
             "removed_file": True,

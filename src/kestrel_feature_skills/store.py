@@ -1731,6 +1731,57 @@ class SkillStore:
             os.close(internal_fd)
 
     @contextmanager
+    def preserve_git_checkout_on_failure(self, workspace: Path) -> Iterator[None]:
+        """Arm recovery only across publication that can displace unique data."""
+
+        workspace = Path(workspace)
+        if workspace.parent != self._internal_root or not workspace.name.startswith(
+            GIT_CHECKOUT_PREFIX
+        ):
+            raise SkillPathError("Git checkout recovery requires an owned workspace")
+        internal_fd = _open_directory(
+            self._internal_root,
+            expected=self._internal_root_identity,
+        )
+        workspace_identity = _identity_at(internal_fd, workspace.name)
+        if workspace_identity is None:
+            os.close(internal_fd)
+            raise SkillPathError("Git checkout recovery workspace is unavailable")
+        try:
+            workspace_fd = _open_directory_at(
+                internal_fd,
+                workspace.name,
+                expected=workspace_identity,
+            )
+            try:
+                marker_fd = os.open(
+                    GIT_CHECKOUT_RECOVERY_MARKER,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=workspace_fd,
+                )
+                try:
+                    os.write(marker_fd, b"kestrel-edit-recovery-v1\n")
+                    os.fsync(marker_fd)
+                finally:
+                    os.close(marker_fd)
+                os.fsync(workspace_fd)
+                # An exception at the yield skips marker removal. The outer
+                # workspace manager then moves the failed publication into the
+                # private recovery domain.
+                yield
+                _unlink_at(workspace_fd, GIT_CHECKOUT_RECOVERY_MARKER)
+                os.fsync(workspace_fd)
+            finally:
+                os.close(workspace_fd)
+        finally:
+            os.close(internal_fd)
+
+    @contextmanager
     def git_checkout_workspace(self, *, cleanup_errors_fatal: bool = True):
         """Yield a crash-recoverable, exclusively owned Git staging folder.
 
@@ -1766,23 +1817,6 @@ class SkillStore:
                     try:
                         owner_lock_attempted = True
                         owner_lock = self._lock_git_checkout_workspace(workspace_fd)
-                        if owner_lock is not None and not cleanup_errors_fatal:
-                            marker_fd = os.open(
-                                GIT_CHECKOUT_RECOVERY_MARKER,
-                                os.O_WRONLY
-                                | os.O_CREAT
-                                | os.O_EXCL
-                                | getattr(os, "O_NOFOLLOW", 0)
-                                | getattr(os, "O_CLOEXEC", 0),
-                                0o600,
-                                dir_fd=workspace_fd,
-                            )
-                            try:
-                                os.write(marker_fd, b"kestrel-edit-recovery-v1\n")
-                                os.fsync(marker_fd)
-                            finally:
-                                os.close(marker_fd)
-                            os.fsync(workspace_fd)
                     finally:
                         os.close(workspace_fd)
                     if owner_lock is None:
@@ -2010,7 +2044,9 @@ class SkillStore:
             try:
                 os.unlink(marker_name, dir_fd=internal_fd)
             except FileNotFoundError:
-                return
+                pass
+            # An absent marker still needs an fsync: this is the retry proof
+            # after a prior unlink committed but its directory fsync failed.
             os.fsync(internal_fd)
         finally:
             os.close(internal_fd)
@@ -2656,12 +2692,13 @@ class SkillStore:
                 atomic_write_primary(staged_folder, payload, overwrite=True)
                 validate_skill_folder(staged_folder, source_root=staged_root)
                 candidate = inspect_skill_folder(staged_folder, source_root=staged_root)
-                self._publish_replacement_folder(
-                    root_fd=root_fd,
-                    staged_root=staged_root,
-                    record=record,
-                    candidate=candidate,
-                )
+                with self.preserve_git_checkout_on_failure(workspace):
+                    self._publish_replacement_folder(
+                        root_fd=root_fd,
+                        staged_root=staged_root,
+                        record=record,
+                        candidate=candidate,
+                    )
         return candidate.document
 
     def rollback_created(
@@ -2999,12 +3036,13 @@ class SkillStore:
                     staged_folder,
                     source_root=staged_root,
                 )
-                self._publish_replacement_folder(
-                    root_fd=root_fd,
-                    staged_root=staged_root,
-                    record=record,
-                    candidate=candidate,
-                )
+                with self.preserve_git_checkout_on_failure(workspace):
+                    self._publish_replacement_folder(
+                        root_fd=root_fd,
+                        staged_root=staged_root,
+                        record=record,
+                        candidate=candidate,
+                    )
 
     @staticmethod
     def file_is_editable(record: SkillRecord, relative_path: str) -> bool:

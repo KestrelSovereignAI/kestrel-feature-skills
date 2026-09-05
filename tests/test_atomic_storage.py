@@ -1047,6 +1047,13 @@ def test_nested_resource_write_failure_removes_new_empty_parent_directories(
     assert [item.name for item in records] == ["nested-write-failure"]
     assert [entry["path"] for entry in store.tree(records[0])] == ["SKILL.md"]
     assert errors == ()
+    recovery = tuple(
+        store._internal_root.glob(f"{store_module.SKILL_RECOVERY_PREFIX}*")
+    )
+    assert len(recovery) == 1
+    assert (
+        recovery[0] / "nested-write-failure" / "docs" / "new" / "note.md"
+    ).read_text(encoding="utf-8") == "replacement"
 
 
 def test_nested_resource_write_failure_preserves_preexisting_parent(
@@ -3465,6 +3472,7 @@ def test_failed_edit_workspace_survives_cleanup_and_startup_reaper(
     with (
         pytest.raises(RuntimeError, match="simulated failed edit"),
         store.git_checkout_workspace(cleanup_errors_fatal=False) as workspace,
+        store.preserve_git_checkout_on_failure(workspace),
     ):
         preserved = workspace / "failed-edit" / "SKILL.md"
         preserved.parent.mkdir()
@@ -3498,6 +3506,95 @@ def test_failed_edit_workspace_survives_cleanup_and_startup_reaper(
     assert (recovery[0] / "failed-edit" / "SKILL.md").read_text(
         encoding="utf-8"
     ) == "recover me"
+
+
+@pytest.mark.parametrize("operation", ("primary", "resource"))
+def test_validation_failures_do_not_accumulate_recovery_workspaces(tmp_path, operation):
+    store = SkillStore(tmp_path / "skills")
+    name = f"invalid-{operation}-retry"
+    store.create(SkillDocument(name, "Original", "Original procedure."))
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    invalid = serialize_skill_markdown(
+        SkillDocument(name, "Invalid link", "[missing](missing.md)")
+    )
+
+    for _ in range(5):
+        with pytest.raises(
+            (SkillPathError, SkillFormatError),
+            match="does not exist|editor file exceeds",
+        ):
+            if operation == "primary":
+                store.edit_primary(record, invalid)
+            else:
+                store.write_file(
+                    record,
+                    "notes.md",
+                    "x" * (store_module.MAX_EDITOR_FILE_BYTES + 1),
+                )
+
+    internal = store.local_root / INTERNAL_DIRECTORY
+    assert not tuple(internal.glob(f"{store_module.SKILL_RECOVERY_PREFIX}*"))
+    assert not tuple(internal.glob(f"{store_module.GIT_CHECKOUT_PREFIX}*"))
+
+
+def test_validated_primary_edit_survives_publication_preflight_failure(
+    tmp_path, monkeypatch
+):
+    store = SkillStore(tmp_path / "skills")
+    name = "validated-edit-recovery"
+    folder = store.create(SkillDocument(name, "Original", "Original procedure."))
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    desired = serialize_skill_markdown(
+        SkillDocument(name, "Desired", "Validated desired procedure.")
+    )
+
+    def fail_publication_fsync(*_args, **_kwargs):
+        raise OSError(errno.EIO, "publication preflight fsync failed")
+
+    monkeypatch.setattr(
+        store_module,
+        "_fsync_validated_directories_at",
+        fail_publication_fsync,
+    )
+
+    with pytest.raises(OSError, match="publication preflight fsync failed"):
+        store.edit_primary(record, desired)
+
+    assert "Original procedure." in (folder / "SKILL.md").read_text(encoding="utf-8")
+    recovery = tuple(
+        (store.local_root / INTERNAL_DIRECTORY).glob(
+            f"{store_module.SKILL_RECOVERY_PREFIX}*"
+        )
+    )
+    assert len(recovery) == 1
+    assert (recovery[0] / name / "SKILL.md").read_text(encoding="utf-8") == desired
+
+
+def test_clearing_absent_fail_closed_marker_fsyncs_retry_proof(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    internal_inode = store._internal_root.stat().st_ino
+    synced = []
+    real_fsync = os.fsync
+
+    def record_fsync(descriptor):
+        synced.append(os.fstat(descriptor).st_ino)
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(store_module.os, "fsync", record_fsync)
+
+    store.clear_fail_closed_state("already-absent")
+
+    assert synced == [internal_inode]
 
 
 def test_recursive_cleanup_handles_more_than_python_recursion_limit(tmp_path):

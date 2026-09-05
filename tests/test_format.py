@@ -1509,6 +1509,47 @@ def test_raw_html_url_attribute_cannot_resolve_against_double_decoded_decoy(tmp_
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+def test_raw_html_url_attribute_validates_complete_space_bearing_path(tmp_path):
+    value = SkillDocument(
+        "raw-html-space",
+        "Raw HTML space-bearing path",
+        '<a href="pre post.md">notes</a>',
+    )
+    folder = write_skill(tmp_path, value)
+    (folder / "pre post.md").write_text("notes", encoding="utf-8")
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_raw_html_url_attribute_cannot_validate_space_decoy(tmp_path):
+    value = SkillDocument(
+        "raw-html-space-decoy",
+        "Raw HTML space-bearing decoy",
+        '<a href="pre post.md">notes</a>',
+    )
+    folder = write_skill(tmp_path, value)
+    (folder / "pre").write_text("decoy", encoding="utf-8")
+
+    with pytest.raises(SkillPathError, match="does not exist"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize("separator", ("&Tab;", "&#9;", "\t"))
+def test_raw_html_url_attribute_rejects_controls_before_decoy_matching(
+    tmp_path, separator
+):
+    value = SkillDocument(
+        "raw-html-control-decoy",
+        "Raw HTML control decoy",
+        f'<a href="pre{separator}post.md">notes</a>',
+    )
+    folder = write_skill(tmp_path, value)
+    (folder / "pre").write_text("decoy", encoding="utf-8")
+
+    with pytest.raises(SkillPathError, match="control"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 @pytest.mark.parametrize(
     "body, decoy",
     (
