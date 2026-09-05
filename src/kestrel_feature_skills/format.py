@@ -50,7 +50,6 @@ _MARKDOWN_REFERENCE_DEFINITION_START = re.compile(
     r"^[ \t]{0,3}\[(?:\\[^\r\n]|[^\]\\]){1,999}\]:"
 )
 _MARKDOWN_REFERENCE_LABEL_PREFIX = re.compile(r"^[ \t]{0,3}\[")
-_MARKDOWN_BACKSLASH_ESCAPE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
 _MARKDOWN_UNESCAPE_TOKEN = re.compile(
     r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])"
     r"|(&(?:#[xX][0-9A-Fa-f]{1,6}|#[0-9]{1,7}|[A-Za-z][A-Za-z0-9]{0,30});)"
@@ -1427,9 +1426,7 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
             raw = angle_destination
         elif not raw.startswith("<"):
             raw = raw.split(maxsplit=1)[0]
-        if character_references_decoded:
-            raw = _MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", raw)
-        else:
+        if not character_references_decoded:
             raw = _unescape_commonmark_destination(raw)
         if not raw or raw.startswith("#"):
             continue
@@ -1439,6 +1436,8 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
         # be decoded a second time. URL schemes are classified before percent-
         # decoding so ``https%3A/...`` remains a local path subject to checks.
         rendered = raw
+        if any(character in rendered for character in "\t\r\n"):
+            raise SkillPathError("link URL contains control characters in SKILL.md")
         try:
             split = urlsplit(rendered)
         except ValueError as exc:

@@ -2529,6 +2529,64 @@ async def test_delete_reports_partial_after_authoritative_folder_removal(
 
 
 @pytest.mark.asyncio
+async def test_delete_finalizes_committed_outcome_when_context_publication_fails(
+    feature,
+):
+    name = "delete-context-publication-failure"
+    await feature.skill_create(name, "Delete despite context failure", "Procedure.")
+    await feature.skill_enable(name, priority=7)
+    folder = feature.agent.procedural_skills_root / name
+    approved_revision = delete_revision(feature, name)
+    feature.agent.feature_contribution_runtime = SimpleNamespace(
+        is_active=lambda candidate: candidate is feature
+    )
+
+    def fail_refresh(_candidate):
+        raise RuntimeError("simulated delete context publication failure")
+
+    feature.agent.refresh_feature_context_clauses = fail_refresh
+
+    result = await feature.skill_delete(name, approved_revision)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert "context publication failure" in result.error
+    assert result.data["removed_file"] is True
+    assert result.data["config_deleted"] is True
+    assert not folder.exists()
+    assert name not in await feature._enablement.load()
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert name not in guarded
+
+
+@pytest.mark.asyncio
+async def test_delete_releases_committed_guard_before_cancellable_refresh(
+    feature, monkeypatch
+):
+    name = "delete-cancelled-final-refresh"
+    await feature.skill_create(name, "Delete before cancellation", "Procedure.")
+    await feature.skill_enable(name, priority=7)
+    folder = feature.agent.procedural_skills_root / name
+    approved_revision = delete_revision(feature, name)
+
+    async def cancel_final_refresh():
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        feature,
+        "_refresh_committed_mutation",
+        cancel_final_refresh,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await feature.delete_skill(name=name, expected_revision=approved_revision)
+
+    assert not folder.exists()
+    assert name not in await feature._enablement.load()
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert name not in guarded
+
+
+@pytest.mark.asyncio
 async def test_delete_tool_rejects_a_replacement_created_after_approval(feature):
     name = "tool-stale-delete"
     await feature.skill_create(name, "Approved generation", "Approved procedure.")
@@ -2969,6 +3027,38 @@ async def test_invalid_frontmatter_edit_is_rejected_before_replace(feature):
     result = await feature.skill_edit("edit-me", "---\nname: edit-me\n---\nbody")
     assert result.status is ToolResultStatus.ERROR
     assert path.read_text() == original
+
+
+@pytest.mark.asyncio
+async def test_edit_reports_committed_outcome_when_context_publication_fails(feature):
+    name = "edit-context-publication-failure"
+    await feature.skill_create(name, "Original description", "Original procedure.")
+    await feature.skill_enable(name, priority=7)
+    replacement = serialize_skill_markdown(
+        SkillDocument(name, "Replacement description", "Replacement procedure.")
+    )
+    feature.agent.feature_contribution_runtime = SimpleNamespace(
+        is_active=lambda candidate: candidate is feature
+    )
+
+    def fail_refresh(_candidate):
+        raise RuntimeError("simulated edit context publication failure")
+
+    feature.agent.refresh_feature_context_clauses = fail_refresh
+
+    result = await feature.skill_edit(name, replacement)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert "context publication failure" in result.error
+    assert result.data["refresh_error"]
+    assert result.data["indexed"] is False
+    assert result.data["revision"] == feature.snapshot.by_name()[name].revision
+    assert feature.snapshot.by_name()[name].document.description == (
+        "Replacement description"
+    )
+    assert (feature.agent.procedural_skills_root / name / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == replacement
 
 
 @pytest.mark.asyncio

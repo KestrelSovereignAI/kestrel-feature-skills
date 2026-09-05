@@ -81,6 +81,10 @@ PROCEDURAL_SKILL_NODE_TYPE = "procedural_skill"
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
+class _ContextPublicationError(RuntimeError):
+    """A catalog refresh committed locally but failed to publish prompt bytes."""
+
+
 @dataclass(frozen=True, slots=True)
 class _InstalledSkillOperation:
     """One installed publication plus the state needed to compensate safely."""
@@ -317,10 +321,18 @@ class ProceduralSkillsFeature(Feature):
             # even when the local render is unchanged so the next deliberate
             # Skills refresh repairs that possible registry divergence.
             self._publish_context_transition()
-        except BaseException:
+        except asyncio.CancelledError:
+            self._context_render = previous
+            raise
+        except Exception as exc:
             # The core registry still owns ``previous``. Retain that exact
             # local value so a subsequent refresh sees a difference and retries
             # publication instead of treating the failed update as committed.
+            self._context_render = previous
+            raise _ContextPublicationError(
+                f"procedural skill context publication failure: {exc}"
+            ) from exc
+        except BaseException:
             self._context_render = previous
             raise
         self._context_publication_uncertain = False
@@ -418,6 +430,20 @@ class ProceduralSkillsFeature(Feature):
             states,
             publish_context=publish_context,
         )
+
+    async def _refresh_committed_mutation(self) -> str | None:
+        """Refresh a committed mutation, preserving a publication error as data."""
+
+        try:
+            await self._refresh_locked()
+        except _ContextPublicationError as exc:
+            # Graph reconciliation follows context publication. Its cached
+            # success set therefore describes the prior snapshot when this
+            # exception occurs and must not be reported for the new revision.
+            self._indexed_payloads = None
+            self._indexed_names = frozenset()
+            return str(exc)
+        return None
 
     def _combined_enablement_error(self, primary: str | None = None) -> str | None:
         messages = [
@@ -1227,7 +1253,7 @@ class ProceduralSkillsFeature(Feature):
                 operation="editing",
             )
             store.write_file(record, relative_path, content)
-            await self._refresh_locked()
+            refresh_error = await self._refresh_committed_mutation()
             resolved = self._snapshot.by_name().get(name)
             if resolved is None:
                 raise SkillFormatError(
@@ -1244,6 +1270,7 @@ class ProceduralSkillsFeature(Feature):
             "path": relative_path,
             "indexed": name in self._indexed_names,
             "revision": resolved.revision,
+            "refresh_error": refresh_error,
         }
 
     async def set_skill_state(
@@ -1500,7 +1527,7 @@ class ProceduralSkillsFeature(Feature):
         )
         if deleting_shadowed_local:
             store.delete(record)
-            await self._refresh_locked()
+            refresh_error = await self._refresh_committed_mutation()
             remaining = self._snapshot.by_name().get(name)
             graph_storage = getattr(self.agent, "storage", None)
             graph_deleted = graph_storage is None or remaining is None
@@ -1510,6 +1537,8 @@ class ProceduralSkillsFeature(Feature):
                 and name in self._indexed_names
             )
             errors: list[str] = []
+            if refresh_error is not None:
+                errors.append(refresh_error)
             if remaining is None and graph_storage is not None:
                 # Refresh already attempted the idempotent stale-node removal;
                 # retry once so its recoverable failure is reflected in this
@@ -1601,7 +1630,15 @@ class ProceduralSkillsFeature(Feature):
             )
         if getattr(self.agent, "storage", None) is not None:
             graph_deleted = await self._delete_index_node(name)
-        await self._refresh_locked()
+        if config_deleted:
+            # The authoritative folder and database row are already absent.
+            # Release the durable guard before context publication so a host
+            # refresh failure cannot strand a tombstone with no retry target.
+            self._clear_fail_closed_state(name)
+            self._states.pop(name, None)
+        refresh_error = await self._refresh_committed_mutation()
+        if refresh_error is not None:
+            errors.append(refresh_error)
         remaining = self._snapshot.by_name().get(name)
         graph_retained = remaining is not None and name in self._indexed_names
         if (
@@ -1636,7 +1673,7 @@ class ProceduralSkillsFeature(Feature):
                 errors.insert(0, enablement_cleanup_error)
             else:
                 config_deleted = True
-        if config_deleted:
+        if config_deleted and name in self._fail_closed_states:
             self._clear_fail_closed_state(name)
             self._states.pop(name, None)
         return {
@@ -2304,6 +2341,13 @@ class ProceduralSkillsFeature(Feature):
             )
         except (SkillError, OSError, DatabaseError, RuntimeError) as exc:
             return ToolResult.failed(str(exc))
+        refresh_error = payload["refresh_error"]
+        if refresh_error:
+            return ToolResult.partial(
+                f"Edited {name}/{relative_path} on disk.",
+                str(refresh_error),
+                data=payload,
+            )
         return ToolResult.ok(
             f"Edited {name}/{relative_path} without executing it.", data=payload
         )

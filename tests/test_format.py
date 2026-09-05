@@ -1285,6 +1285,25 @@ def test_semicolonless_commonmark_entity_cannot_validate_against_decoy(tmp_path)
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "entity",
+    ("&Tab;", "&NewLine;", "&#9;", "&#10;", "&#13;", "&#x9;", "&#xA;", "&#xD;"),
+)
+def test_commonmark_control_entity_cannot_validate_against_collapsed_decoy(
+    tmp_path, entity
+):
+    value = SkillDocument(
+        "control-entity-decoy",
+        "Control entity decoy",
+        f"[notes](pre{entity}post)",
+    )
+    folder = write_skill(tmp_path, value)
+    (folder / "prepost").write_text("decoy", encoding="utf-8")
+
+    with pytest.raises(SkillPathError, match="control"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_percent_encoded_colon_cannot_turn_a_local_escape_into_remote_url(tmp_path):
     value = SkillDocument(
         "encoded-scheme",
@@ -1487,6 +1506,22 @@ def test_raw_html_url_attribute_cannot_resolve_against_double_decoded_decoy(tmp_
     (folder / "notes&v1.md").write_text("decoy", encoding="utf-8")
 
     with pytest.raises(SkillPathError, match="does not exist"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "body, decoy",
+    (
+        ('<a href="..\\%73ecret.md">outside</a>', "..secret.md"),
+        ('<a href="notes\\.md">notes</a>', "notes.md"),
+    ),
+)
+def test_raw_html_backslash_url_cannot_validate_against_decoy(tmp_path, body, decoy):
+    value = SkillDocument("raw-html-backslash", "Raw HTML backslash", body)
+    folder = write_skill(tmp_path, value)
+    (folder / decoy).write_text("decoy", encoding="utf-8")
+
+    with pytest.raises(SkillPathError, match="backslash"):
         validate_skill_folder(folder, source_root=tmp_path)
 
 
