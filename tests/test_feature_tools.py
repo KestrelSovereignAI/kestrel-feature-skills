@@ -1639,6 +1639,95 @@ async def test_create_reports_unpersisted_custom_priority_without_database(
 
 
 @pytest.mark.asyncio
+async def test_database_unavailable_create_preserves_existing_durable_quarantine(
+    feature,
+):
+    name = "offline-create-quarantined"
+    prior = await feature._enablement.set(name, enabled=True, priority=17)
+    feature._states[name] = prior
+    feature._retain_fail_closed_state(
+        name,
+        priority=17,
+        error="an earlier rollback could not verify the enabled row",
+    )
+    database = feature._enablement.db
+    feature._enablement.db = None
+    try:
+        created = await feature.create_skill(
+            name=name,
+            description="Offline replacement must remain quarantined",
+            body="Procedure.",
+        )
+    finally:
+        feature._enablement.db = database
+
+    assert created["enabled"] is False
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert guarded[name] == SkillState(False, 17)
+
+    observer = ProceduralSkillsFeature(feature.agent)
+    await observer.initialize()
+    try:
+        assert observer.snapshot.by_name()[name].state == SkillState(False, 17)
+        assert "Offline replacement must remain quarantined" not in (
+            observer.context_clause_text
+        )
+    finally:
+        await observer.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_create_fences_replacement_before_first_enablement_await(
+    feature, monkeypatch
+):
+    name = "create-preawait-replacement"
+    prior = await feature._enablement.set(name, enabled=True, priority=17)
+    feature._states[name] = prior
+    entered_load = asyncio.Event()
+    release_load = asyncio.Event()
+    original_load = feature._enablement.load
+
+    async def pause_before_reading_prior_state():
+        entered_load.set()
+        await release_load.wait()
+        return await original_load()
+
+    monkeypatch.setattr(feature._enablement, "load", pause_before_reading_prior_state)
+    creation = asyncio.create_task(
+        feature.create_skill(
+            name=name,
+            description="Cooperating creator",
+            body="Procedure.",
+        )
+    )
+    await asyncio.wait_for(entered_load.wait(), timeout=5)
+
+    folder = feature.agent.procedural_skills_root / name
+    folder.mkdir()
+    (folder / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(
+                name,
+                "Unapproved replacement during the first state await",
+                "Unapproved procedure.",
+            )
+        ),
+        encoding="utf-8",
+    )
+    observer = ProceduralSkillsFeature(feature.agent)
+    try:
+        await observer.initialize()
+        assert observer.snapshot.by_name()[name].state.enabled is False
+        assert "Unapproved replacement during the first state await" not in (
+            observer.context_clause_text
+        )
+    finally:
+        release_load.set()
+        await asyncio.gather(creation, return_exceptions=True)
+        await observer.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_create_enable_rejects_a_generation_changed_during_state_write(
     feature, monkeypatch
 ):
@@ -2691,7 +2780,7 @@ async def test_failed_folder_removal_retains_disabled_tombstone(feature, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_cancelled_disabled_guard_restores_enabled_shared_state(
+async def test_cancelled_disabled_guard_keeps_restored_shared_state_quarantined(
     feature, tmp_path, monkeypatch
 ):
     name = "cancelled-local-override"
@@ -2752,8 +2841,10 @@ async def test_cancelled_disabled_guard_restores_enabled_shared_state(
     assert not (feature.agent.procedural_skills_root / name).exists()
     resolved = feature.snapshot.by_name()[name]
     assert resolved.source_kind == "host-shared"
-    assert resolved.state == SkillState(True, 17)
-    assert "Approved shared skill" in feature.context_clause_text
+    assert resolved.state.enabled is False
+    assert "Approved shared skill" not in feature.context_clause_text
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert guarded[name].enabled is False
 
 
 @pytest.mark.asyncio
@@ -3659,6 +3750,62 @@ async def test_git_install_is_not_published_when_disabled_state_cannot_persist(
 
 
 @pytest.mark.asyncio
+async def test_database_unavailable_install_preserves_existing_durable_quarantine(
+    feature, tmp_path, monkeypatch
+):
+    name = "offline-install-quarantined"
+    prior = await feature._enablement.set(name, enabled=True, priority=19)
+    feature._states[name] = prior
+    feature._retain_fail_closed_state(
+        name,
+        priority=19,
+        error="an earlier install rollback could not verify the enabled row",
+    )
+    checkout_root = tmp_path / "offline-install-checkout"
+    source = checkout_root / "skills" / name
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Offline remote replacement", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+
+    async def fake_checkout(*, source_url, ref, skill_name, target):
+        return GitCheckout(
+            root=checkout_root,
+            skill_folder=source,
+            revision="e" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    monkeypatch.setattr(feature, "_checkout_git_until_stopped", fake_checkout)
+    database = feature._enablement.db
+    feature._enablement.db = None
+    try:
+        installed = await feature.install_skill(
+            source_url="https://example.com/repo.git",
+            skill_name=name,
+            ref="main",
+        )
+    finally:
+        feature._enablement.db = database
+
+    assert installed["enabled"] is False
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert guarded[name] == SkillState(False, 19)
+
+    observer = ProceduralSkillsFeature(feature.agent)
+    await observer.initialize()
+    try:
+        assert observer.snapshot.by_name()[name].state == SkillState(False, 19)
+        assert "Offline remote replacement" not in observer.context_clause_text
+    finally:
+        await observer.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("prior_state", (SkillState(True, 7), None))
 async def test_failed_git_install_restores_prior_enablement_state(
     feature, tmp_path, monkeypatch, prior_state
@@ -3725,6 +3872,7 @@ async def test_failed_install_publication_keeps_raced_replacement_disabled(
         serialize_skill_markdown(SkillDocument(name, "Remote", "Procedure.")),
         encoding="utf-8",
     )
+    original_atomic_replace = store_module._atomic_replace_file_at
 
     def fake_checkout(self, *, url, ref, skill_name, target, cancel_event=None):
         return GitCheckout(
@@ -3741,6 +3889,8 @@ async def test_failed_install_publication_keeps_raced_replacement_disabled(
                 f"{store_module.SKILL_PUBLICATION_STAGING_PREFIX}install-*"
             )
         )
+        if not candidates:
+            return original_atomic_replace(*_args, **_kwargs)
         assert len(candidates) == 1
         candidates[0].rename(displaced)
         published.mkdir()

@@ -940,15 +940,20 @@ class ProceduralSkillsFeature(Feature):
                 f"{resolved_priority} could not be persisted; the new skill uses "
                 f"default priority {DEFAULT_PRIORITY}"
             )
+        retain_existing_fail_closed = preserve_fail_closed and not state_was_persisted
         try:
-            release_token = self._releasing_fail_closed_names.set(frozenset((name,)))
+            releasing_names = (
+                frozenset() if retain_existing_fail_closed else frozenset((name,))
+            )
+            release_token = self._releasing_fail_closed_names.set(releasing_names)
             try:
                 await self._refresh_locked()
             finally:
                 self._releasing_fail_closed_names.reset(release_token)
             record = SkillStore.get(self._snapshot, name)
             store.assert_created_current(folder, identity=created_identity)
-            self._clear_fail_closed_state(name)
+            if not retain_existing_fail_closed:
+                self._clear_fail_closed_state(name)
         except BaseException as consistency_error:
             await self._rollback_created_publication(
                 store,
@@ -1089,6 +1094,20 @@ class ProceduralSkillsFeature(Feature):
         """Persist a disabled publication guard without losing prior state."""
 
         preserve_fail_closed = name in self._fail_closed_states
+        if not preserve_fail_closed:
+            # This synchronous durable marker is the first side effect under the
+            # same-name claim. Database reads and writes await external work, while
+            # direct filesystem publishers do not honor that claim; sibling
+            # feature instances must therefore see the name disabled before the
+            # first state await can yield to such a replacement.
+            self._retain_fail_closed_state(
+                name,
+                priority=priority,
+                error=(
+                    f"{operation} is being finalized; the skill remains disabled "
+                    "until its filesystem generation and database row are verified"
+                ),
+            )
         try:
             previous_state = (await enablement.load()).get(name)
         except DatabaseError as exc:
@@ -1120,13 +1139,16 @@ class ProceduralSkillsFeature(Feature):
                     previous_state,
                     guard_error,
                     operation=operation,
-                    preserve_fail_closed=preserve_fail_closed,
+                    # Even a successful row restoration cannot prove that a
+                    # non-cooperating filesystem writer did not replace this name
+                    # while either state await was in flight. Keep the durable
+                    # fence until an explicit successful publication/state
+                    # operation validates the current generation.
+                    preserve_fail_closed=True,
                 )
             )
             await self._drain_shielded_task(restoration)
             raise
-        if not preserve_fail_closed:
-            self._clear_fail_closed_state(name)
         return previous_state, state
 
     async def edit_skill(
@@ -1533,9 +1555,18 @@ class ProceduralSkillsFeature(Feature):
         if not graph_deleted and not graph_retained:
             errors.append("graph index cleanup failed")
         if enablement_cleanup_error is not None:
-            final_refresh_observed_absent = bool(
-                self._enablement_error is None and name not in self._states
-            )
+            # The final refresh also loads durable quarantine markers, so its
+            # aggregate enablement error/state cannot distinguish a healthy
+            # absent database row from the intentional fail-closed tombstone.
+            # Re-read the raw row while the same-name claim is still held and
+            # release the marker only when absence is directly observed.
+            final_refresh_observed_absent = False
+            try:
+                final_observed_states = await enablement.load()
+            except DatabaseError:
+                pass
+            else:
+                final_refresh_observed_absent = name not in final_observed_states
             if not (
                 enablement_cleanup_observed_absent or final_refresh_observed_absent
             ):
@@ -1543,6 +1574,7 @@ class ProceduralSkillsFeature(Feature):
                 errors.insert(0, enablement_cleanup_error)
         if config_deleted:
             self._clear_fail_closed_state(name)
+            self._states.pop(name, None)
         return {
             "name": name,
             "removed_file": True,
@@ -1633,7 +1665,11 @@ class ProceduralSkillsFeature(Feature):
                             f"{skill_name}; the shadowed local publication was "
                             "rolled back"
                         )
-                    self._clear_fail_closed_state(skill_name)
+                    if not (
+                        operation.preserve_fail_closed
+                        and not operation.state_was_persisted
+                    ):
+                        self._clear_fail_closed_state(skill_name)
             except BaseException as installation_error:
                 # Context-manager exit is part of installation finalization. Keep
                 # the same-name claim through compensation so another feature
