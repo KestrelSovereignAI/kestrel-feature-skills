@@ -18,6 +18,8 @@ from .models import SkillDocument
 from .paths import contained_path
 
 SKILL_FILENAME = "SKILL.md"
+GENERATION_FILENAME = ".kestrel-generation"
+_GENERATION_PAYLOAD_RE = re.compile(rb"kestrel-skill-generation-v1:([0-9a-f]{64})\n\Z")
 MAX_SKILL_FILE_BYTES = 262_144
 MAX_DESCRIPTION_BYTES = 512
 MAX_FOLDER_FILES = 256
@@ -156,6 +158,15 @@ def _validate_resource_payload(payload: bytes, *, source: str) -> None:
         payload.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise SkillFormatError(f"{source} must be UTF-8 text") from exc
+
+
+def validate_generation_payload(payload: bytes) -> None:
+    """Require the fixed, bounded syntax of internal generation metadata."""
+
+    if _GENERATION_PAYLOAD_RE.fullmatch(payload) is None:
+        raise SkillFormatError(
+            f"{GENERATION_FILENAME} is not valid Kestrel generation metadata"
+        )
 
 
 def validate_skill_name(name: object) -> str:
@@ -1535,6 +1546,8 @@ def _validate_reference_in_snapshot(
 
     parts = _direct_relative_parts(relative)
     normalized = PurePosixPath(*parts).as_posix()
+    if normalized == GENERATION_FILENAME:
+        raise SkillPathError("internal skill generation metadata is not a resource")
     if normalized not in captured:
         raise SkillPathError(f"path does not exist: {relative}")
     for index in range(1, len(parts)):
@@ -1568,9 +1581,10 @@ def inspect_skill_folder_descriptor(
                 name = entry.name
                 relative_parts = (*parents, name)
                 relative = PurePosixPath(*relative_parts).as_posix()
+                internal_generation = not parents and name == GENERATION_FILENAME
                 if not parents and name == SKILL_FILENAME:
                     exact_primary_seen = True
-                entry_count += 1
+                entry_count += 0 if internal_generation else 1
                 if entry_count > MAX_FOLDER_ENTRIES:
                     raise SkillFormatError(
                         f"skill folder exceeds {MAX_FOLDER_ENTRIES} filesystem entries"
@@ -1623,8 +1637,10 @@ def inspect_skill_folder_descriptor(
                     max_bytes=MAX_SKILL_FILE_BYTES,
                 )
                 _validate_resource_payload(payload, source=relative)
-                file_count += 1
-                byte_count += len(payload)
+                if internal_generation:
+                    validate_generation_payload(payload)
+                file_count += 0 if internal_generation else 1
+                byte_count += 0 if internal_generation else len(payload)
                 if file_count > MAX_FOLDER_FILES:
                     raise SkillFormatError(
                         f"skill folder exceeds {MAX_FOLDER_FILES} files"

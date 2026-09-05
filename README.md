@@ -56,9 +56,15 @@ read limit. Each configured source root is also capped at 4,096 immediate
 entries before sorting or per-skill validation, so reload work remains bounded
 even when the directory contains non-skill or hidden files.
 
-Mutation locks and crash-safe edit temporaries live below the single hidden
-`<agent-data>/skills/.kestrel-internal/` directory. They are never placed in a
-published skill folder or charged individually against source discovery.
+Mutation locks, durable fail-closed state, and crash-safe edit temporaries live
+below the single hidden `<agent-data>/skills/.kestrel-internal/` directory.
+They are never charged individually against source discovery. Each agent-local
+folder also has an implementation-owned `.kestrel-generation` marker whose
+random value prevents a stale approval from matching a deleted and recreated
+folder even if its filesystem inode is reused. That marker is hidden from the
+resource inventory and does not consume the documented user file or byte
+budget; an atomic initializer may briefly use an equally hidden
+`.kestrel-generation.tmp.*` hardlink source at the agent-local source root.
 Deletion atomically retires the complete skill generation into this private
 directory before returning; it never recursively unlinks a public or
 recovery-visible name. It then best-effort purges the retired generation only

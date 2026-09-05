@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
@@ -15,8 +16,10 @@ from types import MappingProxyType
 
 from .errors import SkillError, SkillFormatError, SkillPathError
 from .format import (
+    GENERATION_FILENAME,
     ValidatedSkillFolder,
     inspect_skill_folder_descriptor,
+    validate_generation_payload,
     validate_skill_name,
 )
 from .git_source import is_full_object_id, validate_ref, validate_remote_url
@@ -42,12 +45,112 @@ _PROVENANCE_BOUNDS = {
     "revision": 200,
     "remote_url": 2048,
 }
+_GENERATION_TEMP_PREFIX = ".kestrel-generation.tmp."
 
 
 def _json_safe_text(value: object) -> str:
     """Preserve readable text while escaping filesystem surrogate code points."""
 
     return str(value).encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+def _new_generation_payload() -> bytes:
+    """Return an unguessable, non-reusable local-folder generation witness."""
+
+    return f"kestrel-skill-generation-v1:{secrets.token_hex(32)}\n".encode("ascii")
+
+
+def _read_generation_marker(folder_fd: int) -> bytes:
+    """Read and validate the pinned local generation marker."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(GENERATION_FILENAME, flags, dir_fd=folder_fd)
+    try:
+        value = os.fstat(descriptor)
+        if not stat.S_ISREG(value.st_mode):
+            raise SkillPathError(f"{GENERATION_FILENAME} must be a regular file")
+        payload = os.read(descriptor, 256)
+        if os.read(descriptor, 1):
+            raise SkillFormatError(f"{GENERATION_FILENAME} exceeds its fixed size")
+        validate_generation_payload(payload)
+        lexical = os.stat(
+            GENERATION_FILENAME,
+            dir_fd=folder_fd,
+            follow_symlinks=False,
+        )
+        if (lexical.st_dev, lexical.st_ino) != (value.st_dev, value.st_ino):
+            raise SkillPathError(f"{GENERATION_FILENAME} changed during discovery")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_local_generation_marker(root_fd: int, folder_fd: int) -> None:
+    """Create missing local generation metadata without replacing an owner value."""
+
+    try:
+        _read_generation_marker(folder_fd)
+        return
+    except FileNotFoundError:
+        pass
+
+    # Stage beside the skill folders, where hidden entries are never treated as
+    # skills. No partial internal file is ever visible in a resource inventory.
+    temporary = f"{_GENERATION_TEMP_PREFIX}{secrets.token_hex(16)}"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(temporary, flags, 0o600, dir_fd=root_fd)
+    created = os.fstat(descriptor)
+    created_identity = (created.st_dev, created.st_ino)
+    completed = False
+    try:
+        payload = _new_generation_payload()
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        completed = True
+    finally:
+        os.close(descriptor)
+        if not completed:
+            try:
+                current = os.stat(temporary, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                if (current.st_dev, current.st_ino) == created_identity:
+                    os.unlink(temporary, dir_fd=root_fd)
+    try:
+        try:
+            os.link(
+                temporary,
+                GENERATION_FILENAME,
+                src_dir_fd=root_fd,
+                dst_dir_fd=folder_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            # Another feature instance won publication. Its completed hardlink
+            # is the sole generation owner for this folder.
+            _read_generation_marker(folder_fd)
+        else:
+            os.fsync(folder_fd)
+            _read_generation_marker(folder_fd)
+    finally:
+        try:
+            current = os.stat(temporary, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if (current.st_dev, current.st_ino) == created_identity:
+                os.unlink(temporary, dir_fd=root_fd)
+    os.fsync(root_fd)
+    os.fsync(folder_fd)
 
 
 def _folder_revision(
@@ -354,6 +457,8 @@ class DirectorySkillSource(SkillSource):
                         raise SkillPathError(
                             "skill folder changed identity during discovery"
                         )
+                    if self.kind == "agent-local":
+                        _ensure_local_generation_marker(root_fd, folder_fd)
                     snapshot = inspect_skill_folder_descriptor(
                         folder_fd,
                         folder_name=folder_name,

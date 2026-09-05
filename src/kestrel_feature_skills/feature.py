@@ -10,6 +10,7 @@ import logging
 import os
 import threading
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -202,6 +203,11 @@ class ProceduralSkillsFeature(Feature):
         self._enablement_error: str | None = None
         self._fail_closed_states: dict[str, SkillState] = {}
         self._fail_closed_errors: dict[str, str] = {}
+        self._durable_fail_closed_names: set[str] = set()
+        self._releasing_fail_closed_names: ContextVar[frozenset[str]] = ContextVar(
+            f"skills-releasing-fail-closed-{id(self)}",
+            default=frozenset(),
+        )
         self._indexed_names: frozenset[str] = frozenset()
         self._indexed_payloads: dict[str, str] | None = None
         self._router = None
@@ -366,18 +372,35 @@ class ProceduralSkillsFeature(Feature):
     async def _refresh_locked(self, *, publish_context: bool = True) -> CatalogSnapshot:
         if self._catalog is None or self._enablement is None:
             raise RuntimeError("ProceduralSkillsFeature is not initialized")
+        durable_state_available = self._load_durable_fail_closed_states()
         try:
             states = await self._enablement.load()
         except DatabaseError as exc:
-            states = self._with_fail_closed_states(self._states)
+            states = dict(self._states)
+            if not durable_state_available:
+                states = {
+                    name: SkillState(False, state.priority)
+                    for name, state in states.items()
+                }
+            states = self._with_fail_closed_states(
+                states,
+                exclude=self._releasing_fail_closed_names.get(),
+            )
             self._enablement_error = self._combined_enablement_error(str(exc))
             logger.warning(
                 "Could not reload procedural skill enablement; retaining the last known state: %s",
                 exc,
             )
         else:
-            self._clear_persisted_fail_closed_states(states)
-            states = self._with_fail_closed_states(states)
+            if not durable_state_available:
+                states = {
+                    name: SkillState(False, state.priority)
+                    for name, state in states.items()
+                }
+            states = self._with_fail_closed_states(
+                states,
+                exclude=self._releasing_fail_closed_names.get(),
+            )
             self._states = dict(states)
             self._enablement_error = self._combined_enablement_error()
         return await self._rebuild_snapshot_locked(
@@ -394,19 +417,36 @@ class ProceduralSkillsFeature(Feature):
     def _with_fail_closed_states(
         self,
         states: dict[str, SkillState],
+        *,
+        exclude: frozenset[str] = frozenset(),
     ) -> dict[str, SkillState]:
         guarded = dict(states)
-        guarded.update(self._fail_closed_states)
+        guarded.update(
+            (name, state)
+            for name, state in self._fail_closed_states.items()
+            if name not in exclude
+        )
         return guarded
 
-    def _clear_persisted_fail_closed_states(
-        self,
-        observed_states: dict[str, SkillState],
-    ) -> None:
-        for name in tuple(self._fail_closed_states):
-            observed = observed_states.get(name)
-            if observed is None or not observed.enabled:
-                self._clear_fail_closed_state(name)
+    def _load_durable_fail_closed_states(self) -> bool:
+        """Merge crash-safe quarantine state before interpreting database rows."""
+
+        if self._store is None:
+            return False
+        try:
+            states, errors = self._store.load_fail_closed_states()
+        except (OSError, SkillError) as exc:
+            message = f"could not load durable skill quarantine state: {exc}"
+            self._enablement_error = self._combined_enablement_error(message)
+            logger.error(message)
+            return False
+        for name in self._durable_fail_closed_names - states.keys():
+            self._fail_closed_states.pop(name, None)
+            self._fail_closed_errors.pop(name, None)
+        self._fail_closed_states.update(states)
+        self._fail_closed_errors.update(errors)
+        self._durable_fail_closed_names = set(states)
+        return True
 
     def _retain_fail_closed_state(
         self,
@@ -420,10 +460,31 @@ class ProceduralSkillsFeature(Feature):
         self._fail_closed_errors[name] = error
         self._states[name] = state
         self._enablement_error = self._combined_enablement_error()
+        if self._store is None:
+            raise RuntimeError("ProceduralSkillsFeature is not initialized")
+        try:
+            self._store.retain_fail_closed_state(
+                name,
+                priority=priority,
+                error=error,
+            )
+            self._durable_fail_closed_names.add(name)
+        except (OSError, SkillError) as marker_error:
+            message = (
+                f"{error}; durable fail-closed marker could not be persisted "
+                f"({marker_error})"
+            )
+            self._fail_closed_errors[name] = message
+            self._enablement_error = self._combined_enablement_error()
+            raise SkillPublicationCleanupError(message) from marker_error
 
     def _clear_fail_closed_state(self, name: str) -> None:
+        if self._store is not None:
+            self._store.clear_fail_closed_state(name)
+        self._durable_fail_closed_names.discard(name)
         self._fail_closed_states.pop(name, None)
         self._fail_closed_errors.pop(name, None)
+        self._enablement_error = self._combined_enablement_error()
 
     @staticmethod
     async def _scan_catalog_until_stopped(
@@ -1153,6 +1214,14 @@ class ProceduralSkillsFeature(Feature):
         store.assert_current(record)
         previous_state_present = name in self._states
         previous_state = self._states.get(name, record.state)
+        self._retain_fail_closed_state(
+            name,
+            priority=previous_state.priority,
+            error=(
+                "skill state update is being finalized; the skill remains disabled "
+                "until its folder generation is revalidated"
+            ),
+        )
         try:
             state = await enablement.set(
                 name, enabled=enabled, priority=resolved_priority
@@ -1160,7 +1229,9 @@ class ProceduralSkillsFeature(Feature):
         except DatabaseError as exc:
             self._enablement_error = str(exc)
             observed_states = await enablement.load()
-            self._clear_persisted_fail_closed_states(observed_states)
+            observed = observed_states.get(name)
+            if observed is None or not observed.enabled:
+                self._clear_fail_closed_state(name)
             self._states = self._with_fail_closed_states(observed_states)
             self._enablement_error = self._combined_enablement_error(str(exc))
             await self._rebuild_snapshot_locked(self._states)
@@ -1175,10 +1246,56 @@ class ProceduralSkillsFeature(Feature):
                 consistency_error=consistency_error,
             )
             raise
-        self._clear_fail_closed_state(name)
         self._states[name] = state
-        await self._refresh_locked()
+        finalization = asyncio.create_task(
+            self._finalize_skill_state_change(
+                store=store,
+                enablement=enablement,
+                name=name,
+                record=record,
+                previous_state=(previous_state if previous_state_present else None),
+            )
+        )
         try:
+            refreshed = await asyncio.shield(finalization)
+        except asyncio.CancelledError as cancellation:
+            # State persistence already committed. Keep the independently owned
+            # generation check and any required rollback inside the name claim,
+            # even when cancellation lands on the final refresh await.
+            try:
+                await self._drain_shielded_task(finalization)
+            except BaseException as finalization_error:
+                cancellation.add_note(
+                    "cancelled skill state finalization also reported: "
+                    f"{finalization_error}"
+                )
+            raise
+        return {
+            "name": name,
+            "enabled": refreshed.state.enabled,
+            "priority": refreshed.state.priority,
+            "indexed": name in self._indexed_names,
+            "context_bytes": len(self._context_render.text.encode("utf-8")),
+            "revision": refreshed.revision,
+        }
+
+    async def _finalize_skill_state_change(
+        self,
+        *,
+        store: SkillStore,
+        enablement: SkillEnablementStore,
+        name: str,
+        record: SkillRecord,
+        previous_state: SkillState | None,
+    ) -> SkillRecord:
+        """Refresh and validate one committed state write before releasing its claim."""
+
+        try:
+            release_token = self._releasing_fail_closed_names.set(frozenset((name,)))
+            try:
+                await self._refresh_locked()
+            finally:
+                self._releasing_fail_closed_names.reset(release_token)
             refreshed = SkillStore.get(self._snapshot, name)
             if not _same_resolved_folder(record, refreshed):
                 raise SkillConflictError(
@@ -1190,22 +1307,19 @@ class ProceduralSkillsFeature(Feature):
             # removal during the refresh cannot leave the requested state on a
             # different or future same-named generation.
             store.assert_current(record)
+            # The database row, refreshed catalog, and original folder are now
+            # mutually consistent. This synchronous unlink is the commit point
+            # that lets sibling processes observe the approved enabled state.
+            self._clear_fail_closed_state(name)
         except BaseException as consistency_error:
             await self._rollback_state_after_consistency_error(
                 enablement=enablement,
                 name=name,
-                previous_state=(previous_state if previous_state_present else None),
+                previous_state=previous_state,
                 consistency_error=consistency_error,
             )
             raise
-        return {
-            "name": name,
-            "enabled": refreshed.state.enabled,
-            "priority": refreshed.state.priority,
-            "indexed": name in self._indexed_names,
-            "context_bytes": len(self._context_render.text.encode("utf-8")),
-            "revision": refreshed.revision,
-        }
+        return refreshed
 
     async def _rollback_state_after_consistency_error(
         self,

@@ -7,6 +7,7 @@ import errno
 import fcntl
 import hashlib
 import hmac
+import json
 import logging
 import os
 import shutil
@@ -22,6 +23,7 @@ from pathlib import Path
 
 from .errors import (
     SkillConflictError,
+    SkillError,
     SkillFormatError,
     SkillNotFoundError,
     SkillPathError,
@@ -29,6 +31,7 @@ from .errors import (
     SkillReadOnlyError,
 )
 from .format import (
+    GENERATION_FILENAME,
     MAX_SKILL_FILE_BYTES,
     PRIMARY_WRITER_CLAIM,
     PRIMARY_WRITER_TEMP_PREFIX,
@@ -43,7 +46,13 @@ from .format import (
     validate_skill_folder_descriptor,
     validate_skill_name,
 )
-from .models import CatalogSnapshot, SkillDocument, SkillProvenance, SkillRecord
+from .models import (
+    CatalogSnapshot,
+    SkillDocument,
+    SkillProvenance,
+    SkillRecord,
+    SkillState,
+)
 from .paths import (
     direct_child,
     lexical_contained_path,
@@ -53,6 +62,7 @@ from .sources import (
     MAX_SOURCE_ENTRIES,
     PROVENANCE_FILENAME,
     _folder_revision,
+    _new_generation_payload,
     serialize_provenance,
 )
 
@@ -63,6 +73,10 @@ GIT_CHECKOUT_LOCK = ".checkout-owner.lock"
 SKILL_TRASH_PREFIX = ".kestrel-skill-trash-"
 SKILL_TRASH_LOCK = ".skill-trash.lock"
 SKILL_PUBLICATION_STAGING_PREFIX = ".kestrel-skill-publication-"
+FAIL_CLOSED_STATE_PREFIX = ".fail-closed-state-"
+FAIL_CLOSED_STATE_SUFFIX = ".json"
+FAIL_CLOSED_STATE_VERSION = 1
+MAX_FAIL_CLOSED_ERROR_BYTES = 16_384
 MAX_EDITOR_FILE_BYTES = 262_144
 NAME_LOCK_BUCKETS = 256
 _MUTATION_LOCKS = tuple(threading.RLock() for _ in range(NAME_LOCK_BUCKETS))
@@ -99,6 +113,13 @@ def _mutation_lock_name(root: Path, name: str) -> str:
 def _publication_state_lock_name(root: Path, name: str) -> str:
     bucket = _name_lock_bucket(root, name, domain="publication-state")
     return f".publication-state-bucket-{bucket:03d}.lock"
+
+
+def _fail_closed_state_name(name: str) -> str:
+    return (
+        f"{FAIL_CLOSED_STATE_PREFIX}{validate_skill_name(name)}"
+        f"{FAIL_CLOSED_STATE_SUFFIX}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +396,30 @@ def _identity_at(directory_fd: int, name: str) -> tuple[int, int] | None:
     except FileNotFoundError:
         return None
     return value.st_dev, value.st_ino
+
+
+def _read_bounded_regular_file_at(
+    directory_fd: int,
+    name: str,
+    *,
+    max_bytes: int,
+) -> bytes:
+    """Read one pinned private metadata file without following a replacement."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        value = os.fstat(descriptor)
+        if not stat.S_ISREG(value.st_mode) or value.st_size > max_bytes:
+            raise SkillPathError("skill fail-closed metadata is not a bounded file")
+        payload = os.read(descriptor, max_bytes + 1)
+        if len(payload) > max_bytes or os.read(descriptor, 1):
+            raise SkillPathError("skill fail-closed metadata exceeds its size limit")
+        if _identity_at(directory_fd, name) != (value.st_dev, value.st_ino):
+            raise SkillPathError("skill fail-closed metadata changed while reading")
+        return payload
+    finally:
+        os.close(descriptor)
 
 
 def _require_source_publication_capacity_at(root_fd: int) -> None:
@@ -1659,6 +1704,127 @@ class SkillStore:
         finally:
             os.close(root_fd)
 
+    def retain_fail_closed_state(
+        self,
+        name: str,
+        *,
+        priority: int,
+        error: str,
+    ) -> None:
+        """Durably disable one name when its database rollback is uncertain."""
+
+        name = validate_skill_name(name)
+        normalized_error = (
+            str(error).encode("utf-8", errors="backslashreplace").decode("utf-8")[:2048]
+        )
+        payload = (
+            json.dumps(
+                {
+                    "version": FAIL_CLOSED_STATE_VERSION,
+                    "name": name,
+                    "priority": priority,
+                    "error": normalized_error,
+                },
+                sort_keys=True,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+        if len(payload) > MAX_FAIL_CLOSED_ERROR_BYTES:
+            raise SkillPathError("skill fail-closed metadata exceeds its size limit")
+        internal_fd = _open_directory(
+            self._internal_root,
+            expected=self._internal_root_identity,
+        )
+        try:
+            _atomic_replace_file_at(
+                internal_fd,
+                _fail_closed_state_name(name),
+                payload,
+            )
+            os.fsync(internal_fd)
+        finally:
+            os.close(internal_fd)
+
+    def load_fail_closed_states(
+        self,
+    ) -> tuple[dict[str, SkillState], dict[str, str]]:
+        """Load every durable fail-closed marker, treating corruption as disabled."""
+
+        states: dict[str, SkillState] = {}
+        errors: dict[str, str] = {}
+        internal_fd = _open_directory(
+            self._internal_root,
+            expected=self._internal_root_identity,
+        )
+        try:
+            with os.scandir(internal_fd) as entries:
+                candidates = tuple(
+                    entry.name
+                    for entry in entries
+                    if entry.name.startswith(FAIL_CLOSED_STATE_PREFIX)
+                    and entry.name.endswith(FAIL_CLOSED_STATE_SUFFIX)
+                )
+            for marker_name in sorted(candidates):
+                name = marker_name[
+                    len(FAIL_CLOSED_STATE_PREFIX) : -len(FAIL_CLOSED_STATE_SUFFIX)
+                ]
+                try:
+                    name = validate_skill_name(name)
+                except SkillFormatError:
+                    continue
+                priority = 100
+                message = (
+                    "durable fail-closed metadata is malformed; the skill remains "
+                    "disabled until an explicit state update succeeds"
+                )
+                try:
+                    raw = _read_bounded_regular_file_at(
+                        internal_fd,
+                        marker_name,
+                        max_bytes=MAX_FAIL_CLOSED_ERROR_BYTES,
+                    )
+                    value = json.loads(raw.decode("ascii"))
+                    if (
+                        not isinstance(value, dict)
+                        or value.get("version") != FAIL_CLOSED_STATE_VERSION
+                        or value.get("name") != name
+                        or isinstance(value.get("priority"), bool)
+                        or not isinstance(value.get("priority"), int)
+                        or not -100_000 <= value["priority"] <= 100_000
+                        or not isinstance(value.get("error"), str)
+                    ):
+                        raise ValueError("invalid fail-closed marker fields")
+                    priority = value["priority"]
+                    message = value["error"]
+                except (OSError, UnicodeError, ValueError, SkillError):
+                    # The marker name alone is authoritative. Corruption must
+                    # never turn a durable quarantine into implicit enablement.
+                    pass
+                states[name] = SkillState(False, priority)
+                errors[name] = message
+        finally:
+            os.close(internal_fd)
+        return states, errors
+
+    def clear_fail_closed_state(self, name: str) -> None:
+        """Remove a durable guard only after an explicit state operation succeeds."""
+
+        marker_name = _fail_closed_state_name(name)
+        internal_fd = _open_directory(
+            self._internal_root,
+            expected=self._internal_root_identity,
+        )
+        try:
+            try:
+                os.unlink(marker_name, dir_fd=internal_fd)
+            except FileNotFoundError:
+                return
+            os.fsync(internal_fd)
+        finally:
+            os.close(internal_fd)
+
     def try_acquire_publication_state_claim(
         self, name: str
     ) -> PublicationStateClaim | None:
@@ -1806,7 +1972,15 @@ class SkillStore:
                         payload,
                         overwrite=False,
                     )
-                    if set(os.listdir(folder_fd)) != {SKILL_FILENAME}:
+                    _write_tmp_at(
+                        folder_fd,
+                        GENERATION_FILENAME,
+                        _new_generation_payload(),
+                    )
+                    if set(os.listdir(folder_fd)) != {
+                        SKILL_FILENAME,
+                        GENERATION_FILENAME,
+                    }:
                         raise SkillConflictError(
                             "created skill staging folder changed during publication"
                         )
@@ -2142,7 +2316,10 @@ class SkillStore:
                         expected=folder_identity,
                     )
                     try:
-                        if set(os.listdir(descriptor)) != {SKILL_FILENAME}:
+                        if set(os.listdir(descriptor)) != {
+                            SKILL_FILENAME,
+                            GENERATION_FILENAME,
+                        }:
                             raise SkillPathError(
                                 "created skill contents changed; rollback preserved them"
                             )
@@ -2254,6 +2431,8 @@ class SkillStore:
 
     def read_file(self, record: SkillRecord, relative_path: str) -> str:
         validate_resource_path(relative_path)
+        if relative_path == GENERATION_FILENAME:
+            raise SkillPathError("internal skill generation metadata is not a resource")
         folder = self._require_real_folder(record)
         folder_fd = _open_directory(folder, expected=record.folder_identity)
         try:
@@ -2373,6 +2552,7 @@ class SkillStore:
             path = Path(entry.path)
             if len(path.parts) == 1 and (
                 path.name == PROVENANCE_FILENAME
+                or path.name == GENERATION_FILENAME
                 or path.name == PRIMARY_WRITER_CLAIM
                 or path.name.startswith(PRIMARY_WRITER_TEMP_PREFIX)
             ):
@@ -2418,10 +2598,15 @@ class SkillStore:
             source_folder, source_root=source_folder.parent
         )
         document = source_snapshot.document
+        generation_payload = _new_generation_payload()
         with tempfile.TemporaryDirectory(prefix=".kestrel-skill-install-") as temporary:
             staged_root = Path(temporary).resolve(strict=True)
             staged_folder = staged_root / document.name
             _materialize_validated_folder(source_snapshot, staged_folder)
+            atomic_replace_file(
+                staged_folder / GENERATION_FILENAME,
+                generation_payload,
+            )
             provenance_payload = serialize_provenance(provenance)
             atomic_replace_file(
                 staged_folder / PROVENANCE_FILENAME,
@@ -2478,6 +2663,7 @@ class SkillStore:
                             if relative.as_posix() in {
                                 SKILL_FILENAME,
                                 PROVENANCE_FILENAME,
+                                GENERATION_FILENAME,
                             }:
                                 continue
                             parent_fd, filename = _open_parent_at(
@@ -2504,6 +2690,11 @@ class SkillStore:
                             target_fd,
                             PROVENANCE_FILENAME,
                             provenance_payload,
+                        )
+                        _atomic_replace_file_at(
+                            target_fd,
+                            GENERATION_FILENAME,
+                            generation_payload,
                         )
                         _atomic_write_primary_at(
                             target_fd,

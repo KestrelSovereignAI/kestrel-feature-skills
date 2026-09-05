@@ -318,6 +318,24 @@ def test_markdown_reference_escape_rejected(tmp_path, destination):
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+def test_markdown_cannot_expose_internal_generation_metadata(tmp_path):
+    value = SkillDocument(
+        "generation-reference",
+        "Generation reference",
+        "[internal](.kestrel-generation)",
+    )
+    folder = tmp_path / value.name
+    folder.mkdir()
+    (folder / "SKILL.md").write_text(serialize_skill_markdown(value), encoding="utf-8")
+    (folder / ".kestrel-generation").write_text(
+        f"kestrel-skill-generation-v1:{'0' * 64}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillPathError, match="not a resource"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 @pytest.mark.parametrize(
     "body",
     (

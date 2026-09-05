@@ -22,6 +22,7 @@ from kestrel_feature_skills.git_source import (
 from kestrel_feature_skills.models import SkillDocument, SkillProvenance, SkillState
 from kestrel_feature_skills.sources import (
     AGENT_LOCAL_PRECEDENCE,
+    GENERATION_FILENAME,
     HOST_SHARED_PRECEDENCE,
     MAX_SOURCE_ENTRIES,
     PROVENANCE_FILENAME,
@@ -466,6 +467,27 @@ def test_record_revision_binds_folder_generation_content_and_state(tmp_path):
         len(value) == 64 for value in (initial, content_changed, enabled, recreated)
     )
     assert len({initial, content_changed, enabled, recreated}) == 4
+
+
+def test_record_revision_generation_marker_is_replaced_with_the_folder(tmp_path):
+    local = tmp_path / "local"
+    shared = tmp_path / "shared"
+    local.mkdir()
+    shared.mkdir()
+    folder = make_skill(local, "restart-generation", "Restart generation")
+
+    running_catalog = catalog(local, shared)
+    first = running_catalog.refresh().by_name()["restart-generation"].revision
+    stable = running_catalog.refresh().by_name()["restart-generation"].revision
+    first_generation = (folder / GENERATION_FILENAME).read_bytes()
+    shutil.rmtree(folder)
+    folder = make_skill(local, "restart-generation", "Restart generation")
+    recreated = running_catalog.refresh().by_name()["restart-generation"].revision
+    recreated_generation = (folder / GENERATION_FILENAME).read_bytes()
+
+    assert stable == first
+    assert recreated != first
+    assert recreated_generation != first_generation
 
 
 def test_source_root_disappearing_during_resolution_is_a_visible_error(

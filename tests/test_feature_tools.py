@@ -806,9 +806,22 @@ async def test_state_change_stays_locally_disabled_when_rollback_cannot_persist(
         in feature.catalog_payload()["enablement_error"]
     )
 
+    restarted = ProceduralSkillsFeature(feature.agent)
+    await restarted.initialize()
+    try:
+        assert restarted.snapshot.by_name()[name].state == SkillState(False, 100)
+        assert "Unapproved replacement" not in restarted.context_clause_text
+    finally:
+        await restarted.shutdown()
+
     monkeypatch.setattr(feature._enablement, "set", real_set)
-    await real_set(name, enabled=False, priority=100)
-    await feature.refresh()
+    guarded_revision = feature.snapshot.by_name()[name].revision
+    await feature.set_skill_state(
+        name=name,
+        enabled=False,
+        priority=100,
+        expected_revision=guarded_revision,
+    )
     assert feature.catalog_payload()["enablement_error"] is None
     assert feature.snapshot.by_name()[name].state == SkillState(False, 100)
 
@@ -874,7 +887,8 @@ async def test_state_change_rolls_back_when_folder_changes_during_final_refresh(
         if mutation == "replace":
             (folder / "SKILL.md").write_text(replacement, encoding="utf-8")
         else:
-            (folder / "SKILL.md").unlink()
+            for child in folder.iterdir():
+                child.unlink()
             folder.rmdir()
 
     monkeypatch.setattr(feature, "_refresh_locked", refresh_then_mutate)
@@ -898,6 +912,130 @@ async def test_state_change_rolls_back_when_folder_changes_during_final_refresh(
         (folder / "SKILL.md").write_text(replacement, encoding="utf-8")
         await feature.refresh()
         assert feature.snapshot.by_name()[name].state == SkillState(False, 100)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_state_refresh_rolls_back_a_replaced_generation(
+    feature, monkeypatch
+):
+    name = "cancelled-state-replacement"
+    await feature.skill_create(name, "Original", "Original procedure.")
+    record = feature.snapshot.by_name()[name]
+    folder = feature.agent.procedural_skills_root / name
+    replacement = serialize_skill_markdown(
+        SkillDocument(name, "Unapproved replacement", "Replacement procedure.")
+    )
+    real_refresh = feature._refresh_locked
+    final_refresh_started = asyncio.Event()
+    release_final_refresh = asyncio.Event()
+    rollback_started = asyncio.Event()
+    release_rollback = asyncio.Event()
+    refresh_calls = 0
+    real_set = feature._enablement.set
+
+    async def pause_rollback(*args, **kwargs):
+        if kwargs["enabled"] is False:
+            rollback_started.set()
+            await release_rollback.wait()
+        return await real_set(*args, **kwargs)
+
+    async def pause_final_refresh():
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if refresh_calls == 3:
+            final_refresh_started.set()
+            await release_final_refresh.wait()
+        return await real_refresh()
+
+    monkeypatch.setattr(feature, "_refresh_locked", pause_final_refresh)
+    monkeypatch.setattr(feature._enablement, "set", pause_rollback)
+    update = asyncio.create_task(
+        feature.set_skill_state(
+            name=name,
+            enabled=True,
+            priority=19,
+            expected_revision=record.revision,
+        )
+    )
+    try:
+        await asyncio.wait_for(final_refresh_started.wait(), timeout=5)
+        (folder / "SKILL.md").write_text(replacement, encoding="utf-8")
+        update.cancel()
+        await asyncio.sleep(0)
+        assert not update.done(), "cancellation skipped state consistency cleanup"
+        release_final_refresh.set()
+        await asyncio.wait_for(rollback_started.wait(), timeout=5)
+        update.cancel()
+        await asyncio.sleep(0)
+        assert not update.done(), "repeated cancellation skipped state rollback"
+        release_rollback.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await update
+
+        assert (await feature._enablement.load())[name] == SkillState(False, 100)
+        assert feature.snapshot.by_name()[name].state == SkillState(False, 100)
+        assert "Unapproved replacement" not in feature.context_clause_text
+    finally:
+        release_final_refresh.set()
+        release_rollback.set()
+        if not update.done():
+            update.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(update, return_exceptions=True),
+                timeout=5,
+            )
+
+
+@pytest.mark.asyncio
+async def test_state_finalization_guard_is_visible_to_another_feature_instance(
+    feature, monkeypatch
+):
+    name = "cross-instance-state-guard"
+    await feature.skill_create(name, "Guarded", "Guarded procedure.")
+    record = feature.snapshot.by_name()[name]
+    observer = ProceduralSkillsFeature(feature.agent)
+    await observer.initialize()
+    real_refresh = feature._refresh_locked
+    final_refresh_started = asyncio.Event()
+    release_final_refresh = asyncio.Event()
+    refresh_calls = 0
+
+    async def pause_final_refresh(**kwargs):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if refresh_calls == 3:
+            final_refresh_started.set()
+            await release_final_refresh.wait()
+        return await real_refresh(**kwargs)
+
+    monkeypatch.setattr(feature, "_refresh_locked", pause_final_refresh)
+    update = asyncio.create_task(
+        feature.set_skill_state(
+            name=name,
+            enabled=True,
+            expected_revision=record.revision,
+        )
+    )
+    try:
+        await asyncio.wait_for(final_refresh_started.wait(), timeout=5)
+        await observer.refresh()
+        assert observer.snapshot.by_name()[name].state.enabled is False
+        assert "Guarded" not in observer.context_clause_text
+
+        release_final_refresh.set()
+        result = await update
+        assert result["enabled"] is True
+        await observer.refresh()
+        assert observer.snapshot.by_name()[name].state.enabled is True
+        assert "Guarded" in observer.context_clause_text
+    finally:
+        release_final_refresh.set()
+        if not update.done():
+            update.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await update
+        await observer.shutdown()
 
 
 @pytest.mark.asyncio
@@ -972,7 +1110,7 @@ async def test_state_change_rolls_back_when_final_refresh_resolves_a_new_overrid
     "initial_enabled, requested_enabled",
     ((False, True), (True, False)),
 )
-async def test_ambiguous_state_write_reconciles_cached_context(
+async def test_ambiguous_state_write_keeps_cached_context_fail_closed(
     feature, monkeypatch, initial_enabled, requested_enabled
 ):
     name = "ambiguous-state"
@@ -1000,10 +1138,8 @@ async def test_ambiguous_state_write_reconciles_cached_context(
 
     assert result.status is ToolResultStatus.ERROR
     assert (await feature._enablement.load())[name].enabled is requested_enabled
-    assert feature.snapshot.by_name()[name].state.enabled is requested_enabled
-    assert (
-        "Ambiguous state description" in feature.context_clause_text
-    ) is requested_enabled
+    assert feature.snapshot.by_name()[name].state.enabled is False
+    assert "Ambiguous state description" not in feature.context_clause_text
 
 
 @pytest.mark.asyncio
