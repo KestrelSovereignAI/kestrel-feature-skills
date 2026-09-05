@@ -364,6 +364,13 @@ def _list_marker_prefix(line: str, start: int = 0) -> tuple[int, int, str] | Non
         return None
     marker_end = len(match.group(1)) + len(match.group(2))
     whitespace = match.group(3)
+    if not line[match.end() :].strip():
+        # For an empty list item CommonMark ignores the amount of whitespace
+        # after the marker: subsequent blocks are indented by marker width +
+        # one column. Treating every trailing space as content indentation can
+        # turn a live reference definition into apparent indented code and let
+        # it bypass containment validation.
+        return len(line) - start, marker_end + 1, match.group(2)
     whitespace_columns = 0
     consumed_whitespace = 0
     for character in whitespace:

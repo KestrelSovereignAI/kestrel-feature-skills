@@ -739,6 +739,25 @@ def test_reference_definition_in_ordered_list_continuation_is_validated(tmp_path
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "blank_item",
+    (
+        "1.   ",
+        "-    ",
+    ),
+)
+def test_reference_definition_after_blank_list_item_is_validated(tmp_path, blank_item):
+    value = SkillDocument(
+        "blank-list-reference",
+        "Blank list reference",
+        f"[outside][target]\n\n{blank_item}\n    [target]: ../secret.md",
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match="traversal"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_link_example_inside_indented_code_block_is_literal(tmp_path):
     value = SkillDocument(
         "indented-code",

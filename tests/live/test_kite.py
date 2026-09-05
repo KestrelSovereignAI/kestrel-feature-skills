@@ -165,6 +165,8 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-literal-separator",
         "kite-fence-exit",
         "kite-list-reference",
+        "kite-blank-ordered-reference",
+        "kite-blank-bullet-reference",
         "kite-sibling-fence",
         "kite-tab-pseudo-fence",
         "kite-cross-paragraph-code",
@@ -742,6 +744,19 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             "10. [outside][target]\n\n    [target]: ../kite-outside.md\n",
             encoding="utf-8",
         )
+        for blank_name, blank_item in (
+            ("kite-blank-ordered-reference", "1.   "),
+            ("kite-blank-bullet-reference", "-    "),
+        ):
+            blank_reference_folder = root / blank_name
+            blank_reference_folder.mkdir()
+            (blank_reference_folder / "SKILL.md").write_text(
+                f'---\nname: "{blank_name}"\n'
+                'description: "Blank list reference escape attempt"\n---\n\n'
+                f"[outside][target]\n\n{blank_item}\n"
+                "    [target]: ../kite-outside.md\n",
+                encoding="utf-8",
+            )
         sibling_fence_folder = root / "kite-sibling-fence"
         sibling_fence_folder.mkdir()
         (sibling_fence_folder / "SKILL.md").write_text(
