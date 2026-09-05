@@ -90,6 +90,7 @@ class _InstalledSkillOperation:
     previous_state: SkillState | None
     disabled_state: SkillState | None
     state_was_persisted: bool
+    preserve_fail_closed: bool
 
 
 def _same_resolved_folder(left: SkillRecord, right: SkillRecord) -> bool:
@@ -130,6 +131,15 @@ def _require_expected_revision(
 
     if expected_revision is None:
         return
+    if (
+        not isinstance(expected_revision, str)
+        or len(expected_revision) != 64
+        or any(character not in "0123456789abcdef" for character in expected_revision)
+    ):
+        raise SkillConflictError(
+            f"skill {record.name!r} received an invalid revision token for {operation}; "
+            "reload and retry"
+        )
     if not hmac.compare_digest(record.revision, expected_revision):
         raise SkillConflictError(
             f"skill {record.name!r} changed before {operation}; reload and retry"
@@ -824,6 +834,8 @@ class ProceduralSkillsFeature(Feature):
         resolved_priority: int,
     ) -> dict[str, object]:
         name = document.name
+        self._load_durable_fail_closed_states()
+        preserve_fail_closed = name in self._fail_closed_states
         previous_state: SkillState | None = None
         disabled_state: SkillState | None = None
         state_was_persisted = False
@@ -857,10 +869,20 @@ class ProceduralSkillsFeature(Feature):
                     restore_state,
                     publication_error,
                     operation="skill create",
+                    preserve_fail_closed=preserve_fail_closed,
                 )
             raise
         state_error: str | None = None
         if enablement.available and enabled:
+            if not preserve_fail_closed:
+                self._retain_fail_closed_state(
+                    name,
+                    priority=resolved_priority,
+                    error=(
+                        "skill create enablement is being finalized; the skill remains "
+                        "disabled until its published generation is revalidated"
+                    ),
+                )
             try:
                 state = await enablement.set(
                     name, enabled=True, priority=resolved_priority
@@ -881,6 +903,7 @@ class ProceduralSkillsFeature(Feature):
                         previous_state=previous_state,
                         disabled_state=SkillState(False, resolved_priority),
                         publication_error=load_error,
+                        preserve_fail_closed=preserve_fail_closed,
                     )
                     await self._refresh_locked()
                     raise
@@ -894,6 +917,7 @@ class ProceduralSkillsFeature(Feature):
                         previous_state=previous_state,
                         disabled_state=SkillState(False, resolved_priority),
                         publication_error=exc,
+                        preserve_fail_closed=preserve_fail_closed,
                     )
                     await self._refresh_locked()
                     raise
@@ -916,8 +940,28 @@ class ProceduralSkillsFeature(Feature):
                 f"{resolved_priority} could not be persisted; the new skill uses "
                 f"default priority {DEFAULT_PRIORITY}"
             )
-        await self._refresh_locked()
-        record = SkillStore.get(self._snapshot, name)
+        try:
+            release_token = self._releasing_fail_closed_names.set(frozenset((name,)))
+            try:
+                await self._refresh_locked()
+            finally:
+                self._releasing_fail_closed_names.reset(release_token)
+            record = SkillStore.get(self._snapshot, name)
+            store.assert_created_current(folder, identity=created_identity)
+            self._clear_fail_closed_state(name)
+        except BaseException as consistency_error:
+            await self._rollback_created_publication(
+                store,
+                enablement,
+                folder,
+                identity=created_identity,
+                previous_state=previous_state,
+                disabled_state=SkillState(False, resolved_priority),
+                publication_error=consistency_error,
+                preserve_fail_closed=preserve_fail_closed,
+            )
+            await self._refresh_locked()
+            raise
         return {
             "name": name,
             "folder": str(folder),
@@ -960,6 +1004,7 @@ class ProceduralSkillsFeature(Feature):
         previous_state: SkillState | None,
         disabled_state: SkillState,
         publication_error: BaseException,
+        preserve_fail_closed: bool = False,
     ) -> None:
         """Restore prior state only after inode-pinned filesystem rollback succeeds."""
 
@@ -978,6 +1023,7 @@ class ProceduralSkillsFeature(Feature):
                 disabled_state if rollback_error is not None else previous_state,
                 publication_error,
                 operation="skill create state update",
+                preserve_fail_closed=preserve_fail_closed,
             )
         )
         try:
@@ -999,6 +1045,7 @@ class ProceduralSkillsFeature(Feature):
         publication_error: BaseException,
         *,
         operation: str,
+        preserve_fail_closed: bool = False,
     ) -> None:
         try:
             if previous_state is None:
@@ -1028,7 +1075,8 @@ class ProceduralSkillsFeature(Feature):
                 error=message,
             )
             raise DatabaseError(message) from rollback_error
-        self._clear_fail_closed_state(name)
+        if not preserve_fail_closed:
+            self._clear_fail_closed_state(name)
 
     async def _prepare_disabled_state(
         self,
@@ -1040,6 +1088,7 @@ class ProceduralSkillsFeature(Feature):
     ) -> tuple[SkillState | None, SkillState]:
         """Persist a disabled publication guard without losing prior state."""
 
+        preserve_fail_closed = name in self._fail_closed_states
         try:
             previous_state = (await enablement.load()).get(name)
         except DatabaseError as exc:
@@ -1071,11 +1120,13 @@ class ProceduralSkillsFeature(Feature):
                     previous_state,
                     guard_error,
                     operation=operation,
+                    preserve_fail_closed=preserve_fail_closed,
                 )
             )
             await self._drain_shielded_task(restoration)
             raise
-        self._clear_fail_closed_state(name)
+        if not preserve_fail_closed:
+            self._clear_fail_closed_state(name)
         return previous_state, state
 
     async def edit_skill(
@@ -1490,6 +1541,8 @@ class ProceduralSkillsFeature(Feature):
             ):
                 config_deleted = False
                 errors.insert(0, enablement_cleanup_error)
+        if config_deleted:
+            self._clear_fail_closed_state(name)
         return {
             "name": name,
             "removed_file": True,
@@ -1580,6 +1633,7 @@ class ProceduralSkillsFeature(Feature):
                             f"{skill_name}; the shadowed local publication was "
                             "rolled back"
                         )
+                    self._clear_fail_closed_state(skill_name)
             except BaseException as installation_error:
                 # Context-manager exit is part of installation finalization. Keep
                 # the same-name claim through compensation so another feature
@@ -1613,6 +1667,8 @@ class ProceduralSkillsFeature(Feature):
         provenance: SkillProvenance,
         skill_name: str,
     ) -> _InstalledSkillOperation:
+        self._load_durable_fail_closed_states()
+        preserve_fail_closed = skill_name in self._fail_closed_states
         previous_state: SkillState | None = None
         disabled_state: SkillState | None = None
         state_was_persisted = False
@@ -1649,6 +1705,7 @@ class ProceduralSkillsFeature(Feature):
                     restore_state,
                     publication_error,
                     operation="skill install publication",
+                    preserve_fail_closed=preserve_fail_closed,
                 )
             raise
         return _InstalledSkillOperation(
@@ -1657,6 +1714,7 @@ class ProceduralSkillsFeature(Feature):
             previous_state=previous_state,
             disabled_state=disabled_state,
             state_was_persisted=state_was_persisted,
+            preserve_fail_closed=preserve_fail_closed,
         )
 
     async def _rollback_installed_publication(
@@ -1692,6 +1750,7 @@ class ProceduralSkillsFeature(Feature):
                     ),
                     publication_error,
                     operation="skill install finalization",
+                    preserve_fail_closed=operation.preserve_fail_closed,
                 )
             )
             try:

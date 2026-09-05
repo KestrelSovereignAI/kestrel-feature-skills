@@ -131,6 +131,10 @@ class CreatedSkillPublication:
     primary_size: int
     primary_mtime_ns: int
     primary_ctime_ns: int
+    generation_identity: tuple[int, int]
+    generation_size: int
+    generation_mtime_ns: int
+    generation_ctime_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1993,12 +1997,21 @@ class SkillStore:
                         dir_fd=folder_fd,
                         follow_symlinks=False,
                     )
+                    generation = os.stat(
+                        GENERATION_FILENAME,
+                        dir_fd=folder_fd,
+                        follow_symlinks=False,
+                    )
                     published = CreatedSkillPublication(
                         folder_identity=created_identity,
                         primary_identity=(primary.st_dev, primary.st_ino),
                         primary_size=primary.st_size,
                         primary_mtime_ns=primary.st_mtime_ns,
                         primary_ctime_ns=primary.st_ctime_ns,
+                        generation_identity=(generation.st_dev, generation.st_ino),
+                        generation_size=generation.st_size,
+                        generation_mtime_ns=generation.st_mtime_ns,
+                        generation_ctime_ns=generation.st_ctime_ns,
                     )
                     os.fsync(folder_fd)
                 finally:
@@ -2345,6 +2358,28 @@ class SkillStore:
                             raise SkillPathError(
                                 "created skill contents changed; rollback preserved them"
                             )
+                        generation = os.stat(
+                            GENERATION_FILENAME,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                        observed_generation = (
+                            generation.st_dev,
+                            generation.st_ino,
+                            generation.st_size,
+                            generation.st_mtime_ns,
+                            generation.st_ctime_ns,
+                        )
+                        expected_generation = (
+                            *identity.generation_identity,
+                            identity.generation_size,
+                            identity.generation_mtime_ns,
+                            identity.generation_ctime_ns,
+                        )
+                        if observed_generation != expected_generation:
+                            raise SkillPathError(
+                                "created skill generation changed; rollback preserved it"
+                            )
                     finally:
                         os.close(descriptor)
                 except BaseException as inspection_error:
@@ -2363,6 +2398,83 @@ class SkillStore:
                 quarantine,
                 expected=folder_identity,
             )
+
+    def assert_created_current(
+        self,
+        folder: Path,
+        *,
+        identity: CreatedSkillPublication,
+    ) -> None:
+        """Require an exact created publication to remain at its public name."""
+
+        name = validate_skill_name(folder.name)
+        if self.local_root / name != folder:
+            raise SkillPathError("created skill folder changed before finalization")
+        with _serialized_skill_mutation(
+            self.local_root,
+            self._internal_root,
+            name,
+            root_identity=self._local_root_identity,
+            internal_root_identity=self._internal_root_identity,
+        ) as (root_fd, _artifact_fd):
+            descriptor = _open_directory_at(
+                root_fd,
+                name,
+                expected=identity.folder_identity,
+            )
+            try:
+                if set(os.listdir(descriptor)) != {
+                    SKILL_FILENAME,
+                    GENERATION_FILENAME,
+                }:
+                    raise SkillPathError(
+                        "created skill contents changed before finalization"
+                    )
+                primary = os.stat(
+                    SKILL_FILENAME,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                observed_primary = (
+                    primary.st_dev,
+                    primary.st_ino,
+                    primary.st_size,
+                    primary.st_mtime_ns,
+                    primary.st_ctime_ns,
+                )
+                expected_primary = (
+                    *identity.primary_identity,
+                    identity.primary_size,
+                    identity.primary_mtime_ns,
+                    identity.primary_ctime_ns,
+                )
+                generation = os.stat(
+                    GENERATION_FILENAME,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                observed_generation = (
+                    generation.st_dev,
+                    generation.st_ino,
+                    generation.st_size,
+                    generation.st_mtime_ns,
+                    generation.st_ctime_ns,
+                )
+                expected_generation = (
+                    *identity.generation_identity,
+                    identity.generation_size,
+                    identity.generation_mtime_ns,
+                    identity.generation_ctime_ns,
+                )
+                if (
+                    observed_primary != expected_primary
+                    or observed_generation != expected_generation
+                ):
+                    raise SkillPathError(
+                        "created skill generation changed before finalization"
+                    )
+            finally:
+                os.close(descriptor)
 
     def rollback_installed(
         self,

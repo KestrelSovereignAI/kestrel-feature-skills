@@ -1639,6 +1639,135 @@ async def test_create_reports_unpersisted_custom_priority_without_database(
 
 
 @pytest.mark.asyncio
+async def test_create_enable_rejects_a_generation_changed_during_state_write(
+    feature, monkeypatch
+):
+    name = "create-enable-generation-race"
+    folder = feature.agent.procedural_skills_root / name
+    replacement = serialize_skill_markdown(
+        SkillDocument(
+            name,
+            "Unapproved replacement during create enable",
+            "Unapproved replacement procedure.",
+        )
+    )
+    original_set = feature._enablement.set
+    replacement_published = False
+
+    async def persist_then_replace(*args, **kwargs):
+        nonlocal replacement_published
+        state = await original_set(*args, **kwargs)
+        if kwargs["enabled"] is True and not replacement_published:
+            replacement_published = True
+            (folder / "SKILL.md").write_text(replacement, encoding="utf-8")
+        return state
+
+    monkeypatch.setattr(feature._enablement, "set", persist_then_replace)
+
+    with pytest.raises((SkillConflictError, SkillPathError), match="changed"):
+        await feature.create_skill(
+            name=name,
+            description="Approved create generation",
+            body="Approved procedure.",
+            enabled=True,
+            priority=19,
+        )
+
+    assert replacement_published is True
+    assert (await feature._enablement.load())[name].enabled is False
+    await feature.refresh()
+    assert feature.snapshot.by_name()[name].state.enabled is False
+    assert "Unapproved replacement during create enable" not in (
+        feature.context_clause_text
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_enable_rejects_generation_marker_rotation_during_state_write(
+    feature, monkeypatch
+):
+    name = "create-enable-marker-race"
+    folder = feature.agent.procedural_skills_root / name
+    original_set = feature._enablement.set
+    marker_rotated = False
+
+    async def persist_then_rotate_marker(*args, **kwargs):
+        nonlocal marker_rotated
+        state = await original_set(*args, **kwargs)
+        if kwargs["enabled"] is True and not marker_rotated:
+            marker_rotated = True
+            (folder / store_module.GENERATION_FILENAME).write_text(
+                f"kestrel-skill-generation-v1:{'0' * 64}\n",
+                encoding="ascii",
+            )
+        return state
+
+    monkeypatch.setattr(feature._enablement, "set", persist_then_rotate_marker)
+
+    with pytest.raises(SkillPathError, match="generation changed"):
+        await feature.create_skill(
+            name=name,
+            description="Approved marker generation",
+            body="Approved procedure.",
+            enabled=True,
+        )
+
+    assert marker_rotated is True
+    assert (await feature._enablement.load())[name].enabled is False
+    assert feature.snapshot.by_name()[name].state.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_create_enable_guard_is_visible_to_another_feature_instance(
+    feature, monkeypatch
+):
+    name = "create-enable-cross-instance-guard"
+    final_refresh_started = asyncio.Event()
+    release_final_refresh = asyncio.Event()
+    original_refresh = feature._refresh_locked
+    paused = False
+
+    async def pause_final_refresh(**kwargs):
+        nonlocal paused
+        if not paused:
+            paused = True
+            final_refresh_started.set()
+            await release_final_refresh.wait()
+        return await original_refresh(**kwargs)
+
+    monkeypatch.setattr(feature, "_refresh_locked", pause_final_refresh)
+    creation = asyncio.create_task(
+        feature.create_skill(
+            name=name,
+            description="Guarded create enable",
+            body="Guarded create procedure.",
+            enabled=True,
+            priority=23,
+        )
+    )
+    observer = ProceduralSkillsFeature(feature.agent)
+    try:
+        await asyncio.wait_for(final_refresh_started.wait(), timeout=5)
+        assert (await feature._enablement.load())[name] == SkillState(True, 23)
+        await observer.initialize()
+        assert observer.snapshot.by_name()[name].state == SkillState(False, 23)
+        assert "Guarded create enable" not in observer.context_clause_text
+
+        release_final_refresh.set()
+        created = await creation
+        assert created["enabled"] is True
+        await observer.refresh()
+        assert observer.snapshot.by_name()[name].state == SkillState(True, 23)
+        assert "Guarded create enable" in observer.context_clause_text
+    finally:
+        release_final_refresh.set()
+        if not creation.done():
+            creation.cancel()
+            await asyncio.gather(creation, return_exceptions=True)
+        await observer.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_failed_create_cannot_reenable_from_stale_persisted_state(
     feature, monkeypatch
 ):
@@ -1738,6 +1867,45 @@ async def test_ambiguous_prepublication_disable_restores_prior_create_state(
 
     assert not (feature.agent.procedural_skills_root / name).exists()
     assert (await feature._enablement.load())[name] == SkillState(True, 17)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_create_preserves_an_existing_durable_fail_closed_guard(
+    feature,
+):
+    name = "duplicate-create-quarantined"
+    await feature.skill_create(
+        name,
+        "Previously quarantined skill",
+        "Quarantined procedure.",
+        enabled=True,
+        priority=17,
+    )
+    feature._retain_fail_closed_state(
+        name,
+        priority=17,
+        error="prior state rollback remained uncertain",
+    )
+    await feature.refresh()
+    assert feature.snapshot.by_name()[name].state == SkillState(False, 17)
+
+    contender = ProceduralSkillsFeature(feature.agent)
+    await contender.initialize()
+    try:
+        with pytest.raises(SkillConflictError, match="already exists"):
+            await contender.create_skill(
+                name=name,
+                description="Duplicate must not clear quarantine",
+                body="Duplicate procedure.",
+            )
+
+        assert (await contender._enablement.load())[name] == SkillState(True, 17)
+        await contender.refresh()
+        assert contender.snapshot.by_name()[name].state == SkillState(False, 17)
+        assert "Previously quarantined skill" not in contender.context_clause_text
+        assert name in contender._durable_fail_closed_names
+    finally:
+        await contender.shutdown()
 
 
 @pytest.mark.asyncio
@@ -2197,6 +2365,20 @@ async def test_delete_tool_rejects_a_replacement_created_after_approval(feature)
     assert "changed before deletion" in result.error
     assert feature.snapshot.by_name()[name].document.description == (
         "Replacement generation"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_tool_rejects_non_ascii_revision_as_a_tool_error(feature):
+    name = "tool-invalid-delete-revision"
+    await feature.skill_create(name, "Keep this generation", "Keep this procedure.")
+
+    result = await feature.skill_delete(name, delete_revision="é" * 64)
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "revision" in result.error
+    assert feature.snapshot.by_name()[name].document.description == (
+        "Keep this generation"
     )
 
 
