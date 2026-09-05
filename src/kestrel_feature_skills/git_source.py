@@ -268,9 +268,17 @@ def _run_git(
     if cancel_event is not None and cancel_event.is_set():
         raise GitSourceError("git source operation was cancelled")
     with (
+        tempfile.TemporaryDirectory(prefix=".kestrel-git-cwd-") as git_cwd_text,
         tempfile.TemporaryFile() as stdout_file,
         tempfile.TemporaryFile() as stderr_file,
     ):
+        git_cwd = Path(git_cwd_text).resolve(strict=True)
+        # Global and system config suppression does not disable discovery of an
+        # enclosing worktree's .git/config. Start every command below a fresh,
+        # private non-repository directory and stop repository discovery at its
+        # parent. Commands that deliberately use ``-C <checkout>`` still read
+        # only that newly-created checkout's local configuration.
+        environment["GIT_CEILING_DIRECTORIES"] = str(git_cwd.parent)
         try:
             process = subprocess.Popen(
                 command,
@@ -278,6 +286,7 @@ def _run_git(
                 stderr=stderr_file,
                 start_new_session=True,
                 env=environment,
+                cwd=git_cwd,
             )
         except FileNotFoundError as exc:
             raise GitSourceError("git executable is unavailable") from exc

@@ -1287,6 +1287,27 @@ def test_git_runner_rejects_host_transport_rewrites(tmp_path, monkeypatch):
         )
 
 
+def test_git_runner_does_not_inherit_enclosing_repository_config(tmp_path, monkeypatch):
+    enclosing = tmp_path / "enclosing-repository"
+    git_source_module._run_git(["init", "-q", str(enclosing)])
+    git_source_module._run_git(
+        [
+            "-C",
+            str(enclosing),
+            "config",
+            "url.https://attacker.example/.insteadOf",
+            "https://approved.example/",
+        ]
+    )
+    monkeypatch.chdir(enclosing)
+
+    effective = git_source_module._run_git(
+        ["ls-remote", "--get-url", "https://approved.example/skills.git"]
+    )
+
+    assert effective == "https://approved.example/skills.git"
+
+
 def test_git_runner_uses_sanitized_config_https_only_protocols_and_no_redirects(
     tmp_path, monkeypatch
 ):
