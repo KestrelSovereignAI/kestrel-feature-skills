@@ -165,6 +165,48 @@ async def test_same_name_creates_serialize_disabled_guard_with_publication(
 
 
 @pytest.mark.asyncio
+async def test_refresh_rechecks_state_after_a_racing_publication(feature, monkeypatch):
+    name = "refresh-publication-guard-race"
+    reader = ProceduralSkillsFeature(feature.agent)
+    await reader.initialize()
+    await feature._enablement.set(name, enabled=True, priority=DEFAULT_PRIORITY)
+    scan_started = threading.Event()
+    release_scan = threading.Event()
+    real_scan = reader._catalog.refresh
+
+    def pause_before_catalog_scan(states):
+        scan_started.set()
+        assert release_scan.wait(timeout=10)
+        return real_scan(states)
+
+    monkeypatch.setattr(reader._catalog, "refresh", pause_before_catalog_scan)
+    refresh = asyncio.create_task(reader.refresh())
+    assert await asyncio.to_thread(scan_started.wait, 5)
+    try:
+        created = await feature.skill_create(
+            name,
+            "Racing publication must remain disabled",
+            "Unapproved procedure.",
+        )
+        assert created.status is ToolResultStatus.OK
+        assert (await feature._enablement.load())[name] == SkillState(
+            False, DEFAULT_PRIORITY
+        )
+    finally:
+        release_scan.set()
+    try:
+        await refresh
+        raced = reader.snapshot.by_name()[name]
+        assert raced.state == SkillState(False, DEFAULT_PRIORITY)
+        assert "Racing publication must remain disabled" not in (
+            reader.context_clause_text
+        )
+    finally:
+        release_scan.set()
+        await reader.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_same_name_install_waits_for_create_guard_and_publication(
     feature, monkeypatch
 ):
@@ -2492,7 +2534,7 @@ async def test_failed_create_publication_restores_prior_enablement(
 
 
 @pytest.mark.asyncio
-async def test_refresh_retains_last_known_enablement_during_database_outage(
+async def test_refresh_fails_closed_when_database_outage_prevents_postscan_proof(
     feature, monkeypatch
 ):
     await feature.skill_create("last-known", "Retain enabled state", "body")
@@ -2505,9 +2547,10 @@ async def test_refresh_retains_last_known_enablement_during_database_outage(
     await feature.refresh()
 
     record = feature.snapshot.by_name()["last-known"]
-    assert record.state.enabled is True
+    assert record.state.enabled is False
     assert record.state.priority == 9
-    assert "Retain enabled state" in feature.context_clause_text
+    assert "Retain enabled state" not in feature.context_clause_text
+    assert "database offline" in feature.catalog_payload()["enablement_error"]
 
 
 @pytest.mark.asyncio

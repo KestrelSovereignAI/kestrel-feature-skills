@@ -392,15 +392,60 @@ class ProceduralSkillsFeature(Feature):
                 await self._refresh_locked()
             yield True
 
-    async def _refresh_locked(self, *, publish_context: bool = True) -> CatalogSnapshot:
+    async def _refresh_locked(
+        self,
+        *,
+        publish_context: bool = True,
+        initial_states: dict[str, SkillState] | None = None,
+        primary_enablement_error: str | None = None,
+    ) -> CatalogSnapshot:
         if self._catalog is None or self._enablement is None:
+            raise RuntimeError("ProceduralSkillsFeature is not initialized")
+        states = (
+            await self._load_refresh_states(
+                primary_error=primary_enablement_error,
+            )
+            if initial_states is None
+            else initial_states
+        )
+        while True:
+            snapshot = await self._scan_catalog_until_stopped(
+                self._catalog,
+                states,
+            )
+            verified_states = await self._load_refresh_states(
+                primary_error=primary_enablement_error,
+                database_failure_is_unsafe=True,
+            )
+            if verified_states == states:
+                break
+            # A sibling process changed a durable guard or database row while
+            # the folder scan was in flight. Discard that mixed-time snapshot
+            # before it can reach the prompt or graph, and scan again using the
+            # newly observed state. Continuous churn can delay a refresh, but
+            # it can never publish an unapproved folder generation as enabled.
+            states = verified_states
+        return await self._publish_snapshot_locked(
+            snapshot,
+            publish_context=publish_context,
+        )
+
+    async def _load_refresh_states(
+        self,
+        *,
+        primary_error: str | None = None,
+        database_failure_is_unsafe: bool = False,
+    ) -> dict[str, SkillState]:
+        """Read database and durable guards for one side of a catalog scan."""
+
+        if self._enablement is None:
             raise RuntimeError("ProceduralSkillsFeature is not initialized")
         durable_state_available = self._load_durable_fail_closed_states()
         try:
             states = await self._enablement.load()
         except DatabaseError as exc:
             states = dict(self._states)
-            if not durable_state_available:
+            if database_failure_is_unsafe or not durable_state_available:
                 states = {
                     name: SkillState(False, state.priority)
                     for name, state in states.items()
@@ -409,7 +454,10 @@ class ProceduralSkillsFeature(Feature):
                 states,
                 exclude=self._releasing_fail_closed_names.get(),
             )
-            self._enablement_error = self._combined_enablement_error(str(exc))
+            database_error = str(exc)
+            if primary_error and primary_error != database_error:
+                database_error = f"{primary_error}; {database_error}"
+            self._enablement_error = self._combined_enablement_error(database_error)
             logger.warning(
                 "Could not reload procedural skill enablement; retaining the last known state: %s",
                 exc,
@@ -425,11 +473,8 @@ class ProceduralSkillsFeature(Feature):
                 exclude=self._releasing_fail_closed_names.get(),
             )
             self._states = dict(states)
-            self._enablement_error = self._combined_enablement_error()
-        return await self._rebuild_snapshot_locked(
-            states,
-            publish_context=publish_context,
-        )
+            self._enablement_error = self._combined_enablement_error(primary_error)
+        return states
 
     async def _refresh_committed_mutation(self) -> str | None:
         """Refresh a committed mutation, preserving a publication error as data."""
@@ -549,20 +594,15 @@ class ProceduralSkillsFeature(Feature):
                     break
             raise
 
-    async def _rebuild_snapshot_locked(
+    async def _publish_snapshot_locked(
         self,
-        states: dict[str, SkillState],
+        snapshot: CatalogSnapshot,
         *,
         publish_context: bool = True,
     ) -> CatalogSnapshot:
-        """Rebuild catalog, prompt clause, and graph index from observed state."""
+        """Publish one state-stable catalog to the prompt and graph index."""
 
-        if self._catalog is None:
-            raise RuntimeError("ProceduralSkillsFeature is not initialized")
-        self._snapshot = await self._scan_catalog_until_stopped(
-            self._catalog,
-            states,
-        )
+        self._snapshot = snapshot
         replacement = render_context_clause(
             self._snapshot,
             max_bytes=DEFAULT_CONTEXT_BUDGET_BYTES,
@@ -1360,7 +1400,10 @@ class ProceduralSkillsFeature(Feature):
                 self._clear_fail_closed_state(name)
             self._states = self._with_fail_closed_states(observed_states)
             self._enablement_error = self._combined_enablement_error(str(exc))
-            await self._rebuild_snapshot_locked(self._states)
+            await self._refresh_locked(
+                initial_states=self._states,
+                primary_enablement_error=str(exc),
+            )
             raise
         try:
             store.assert_current(record)

@@ -140,6 +140,27 @@ def _hold_git_checkout_workspace_from_separate_process(root, result):
         result.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
+def _crash_after_delete_detach(root):
+    """Exit immediately after a delete moves its expected public folder."""
+
+    store = SkillStore(Path(root))
+    record = DirectorySkillSource(
+        root=store.local_root,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=0,
+    ).discover()[0][0]
+    real_quarantine = store_module._quarantine_directory_at
+
+    def detach_then_exit(*args, **kwargs):
+        real_quarantine(*args, **kwargs)
+        os._exit(86)
+
+    store_module._quarantine_directory_at = detach_then_exit
+    store.delete(record)
+    os._exit(87)
+
+
 def test_atomic_create_leaves_no_temporary_or_claim_files(tmp_path):
     root = tmp_path / "skills"
     store = SkillStore(root)
@@ -2760,24 +2781,45 @@ def test_delete_preserves_replacement_swapped_during_atomic_quarantine(
     record = source.discover()[0][0]
     displaced = tmp_path / "displaced-quarantine-original"
     replacement_marker = original / "replacement-must-return.md"
-    real_rename = os.rename
+    real_rename_no_replace = store_module._rename_directory_no_replace_at
     swapped = False
 
-    def swap_as_quarantine_starts(source_name, destination_name, **kwargs):
+    def swap_as_quarantine_starts(
+        directory_fd,
+        source_name,
+        destination_name,
+        *,
+        destination_directory_fd=None,
+    ):
         nonlocal swapped
-        if source_name == record.name and not swapped:
+        if (
+            source_name == record.name
+            and destination_name.startswith(store_module.SKILL_RECOVERY_PREFIX)
+            and not swapped
+        ):
             swapped = True
-            real_rename(original, displaced)
+            original.rename(displaced)
             original.mkdir()
             replacement_marker.write_text("replacement", encoding="utf-8")
-        return real_rename(source_name, destination_name, **kwargs)
+        return real_rename_no_replace(
+            directory_fd,
+            source_name,
+            destination_name,
+            destination_directory_fd=destination_directory_fd,
+        )
 
-    monkeypatch.setattr(store_module.os, "rename", swap_as_quarantine_starts)
+    monkeypatch.setattr(
+        store_module,
+        "_rename_directory_no_replace_at",
+        swap_as_quarantine_starts,
+    )
 
     with pytest.raises(SkillPathError, match="changed during deletion"):
         store.delete(record)
 
-    quarantines = list(store.local_root.glob(".delete-quarantine-race.delete.*"))
+    quarantines = list(
+        store._internal_root.glob(f"{store_module.SKILL_RECOVERY_PREFIX}*")
+    )
     assert len(quarantines) == 1
     assert (quarantines[0] / replacement_marker.name).read_text(
         encoding="utf-8"
@@ -2786,7 +2828,7 @@ def test_delete_preserves_replacement_swapped_during_atomic_quarantine(
     assert not original.exists()
 
 
-def test_delete_pins_quarantined_folder_during_recursive_removal(tmp_path, monkeypatch):
+def test_delete_pins_private_quarantine_during_validation(tmp_path, monkeypatch):
     store = SkillStore(tmp_path / "skills")
     folder = store.create(
         SkillDocument("delete-recursive-race", "Original", "Procedure.")
@@ -2812,9 +2854,11 @@ def test_delete_pins_quarantined_folder_during_recursive_removal(tmp_path, monke
         expected=None,
     ):
         nonlocal replacement_marker, swapped
-        if name.startswith(".delete-recursive-race.delete.") and not swapped:
+        if name.startswith(store_module.SKILL_RECOVERY_PREFIX) and not swapped:
             swapped = True
-            quarantines = list(store.local_root.glob(".delete-recursive-race.delete.*"))
+            quarantines = list(
+                store._internal_root.glob(f"{store_module.SKILL_RECOVERY_PREFIX}*")
+            )
             assert len(quarantines) == 1
             quarantine = quarantines[0]
             quarantine.rename(displaced)
@@ -2837,8 +2881,38 @@ def test_delete_pins_quarantined_folder_during_recursive_removal(tmp_path, monke
         assert displaced.is_dir()
     finally:
         shutil.rmtree(displaced, ignore_errors=True)
-        for quarantine in store.local_root.glob(".delete-recursive-race.delete.*"):
+        for quarantine in store._internal_root.glob(
+            f"{store_module.SKILL_RECOVERY_PREFIX}*"
+        ):
             shutil.rmtree(quarantine, ignore_errors=True)
+
+
+def test_delete_crash_does_not_strand_a_public_quarantine(tmp_path):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    name = "crash-delete-recovery"
+    store.create(SkillDocument(name, "Crash delete", "Procedure."))
+    context = multiprocessing.get_context("spawn")
+    deleter = context.Process(
+        target=_crash_after_delete_detach,
+        args=(str(root),),
+    )
+
+    deleter.start()
+    deleter.join(timeout=10)
+    if deleter.is_alive():  # pragma: no cover - prevents a leaked test process
+        deleter.terminate()
+        deleter.join(timeout=5)
+        pytest.fail("crashing deleter did not finish")
+
+    assert deleter.exitcode == 86
+    SkillStore(root)
+    assert not tuple(root.glob(f".{name}.delete.*"))
+    recovery = tuple(
+        (root / INTERNAL_DIRECTORY).glob(f"{store_module.SKILL_RECOVERY_PREFIX}*")
+    )
+    assert len(recovery) == 1
+    assert (recovery[0] / "SKILL.md").is_file()
 
 
 def test_delete_retires_whole_generation_without_unlinking_nested_entries(
@@ -2914,9 +2988,11 @@ def test_delete_never_unlinks_replacement_at_recovery_visible_name(
             destination_name,
             destination_directory_fd=destination_directory_fd,
         )
-        if source_name.startswith(f".{name}.delete."):
+        if source_name.startswith(
+            store_module.SKILL_RECOVERY_PREFIX
+        ) and destination_name.startswith(store_module.SKILL_TRASH_PREFIX):
             raced_name = source_name
-            replacement = store.local_root / source_name
+            replacement = store._internal_root / source_name
             replacement.mkdir()
             (replacement / "REPLACEMENT-DATA").write_text(
                 "replacement",
@@ -2933,7 +3009,7 @@ def test_delete_never_unlinks_replacement_at_recovery_visible_name(
     store.delete(record)
 
     assert raced_name is not None
-    assert (store.local_root / raced_name / "REPLACEMENT-DATA").read_text(
+    assert (store._internal_root / raced_name / "REPLACEMENT-DATA").read_text(
         encoding="utf-8"
     ) == "replacement"
     assert not tuple(
@@ -3035,7 +3111,9 @@ def test_delete_preserves_quarantined_folder_if_retirement_fails(tmp_path, monke
         *,
         destination_directory_fd=None,
     ):
-        if source_name.startswith(".delete-restore.delete."):
+        if source_name.startswith(
+            store_module.SKILL_RECOVERY_PREFIX
+        ) and destination_name.startswith(store_module.SKILL_TRASH_PREFIX):
             raise OSError("simulated retirement failure")
         return real_rename_no_replace(
             directory_fd,
@@ -3053,7 +3131,9 @@ def test_delete_preserves_quarantined_folder_if_retirement_fails(tmp_path, monke
     with pytest.raises(OSError, match="simulated retirement failure"):
         store.delete(record)
 
-    quarantines = list(store.local_root.glob(".delete-restore.delete.*"))
+    quarantines = list(
+        store._internal_root.glob(f"{store_module.SKILL_RECOVERY_PREFIX}*")
+    )
     assert len(quarantines) == 1
     assert (quarantines[0] / "SKILL.md").is_file()
     assert not original.exists()
@@ -3955,12 +4035,17 @@ def test_delete_restores_same_inode_change_made_at_quarantine(tmp_path, monkeypa
     real_quarantine = store_module._quarantine_directory_at
     injected = False
 
-    def mutate_then_quarantine(root_fd, child_name, *, expected):
+    def mutate_then_quarantine(root_fd, child_name, *, expected, internal_fd=None):
         nonlocal injected
         if not injected and child_name == name:
             injected = True
             (folder / "SKILL.md").write_text(external, encoding="utf-8")
-        return real_quarantine(root_fd, child_name, expected=expected)
+        return real_quarantine(
+            root_fd,
+            child_name,
+            expected=expected,
+            internal_fd=internal_fd,
+        )
 
     monkeypatch.setattr(
         store_module,

@@ -843,6 +843,7 @@ def _quarantine_directory_at(
     name: str,
     *,
     expected: tuple[int, int],
+    internal_fd: int | None = None,
 ) -> str:
     """Atomically detach one expected directory before durable retirement."""
 
@@ -853,18 +854,37 @@ def _quarantine_directory_at(
     if not stat.S_ISDIR(before.st_mode) or (before.st_dev, before.st_ino) != expected:
         raise SkillPathError("local skill folder changed during deletion")
 
-    quarantine = f".{name}.delete.{uuid.uuid4().hex}"
+    quarantine = (
+        f".{name}.delete.{uuid.uuid4().hex}"
+        if internal_fd is None
+        else f"{SKILL_RECOVERY_PREFIX}{uuid.uuid4().hex}"
+    )
     try:
-        os.rename(
-            name,
-            quarantine,
-            src_dir_fd=root_fd,
-            dst_dir_fd=root_fd,
-        )
+        if internal_fd is None:
+            os.rename(
+                name,
+                quarantine,
+                src_dir_fd=root_fd,
+                dst_dir_fd=root_fd,
+            )
+        else:
+            # A delete's first detach goes straight into the private recovery
+            # domain. A crash before validation therefore leaves authored data
+            # under a durable, operator-recoverable name instead of an ignored
+            # dot-directory in the public source root.
+            _rename_directory_no_replace_at(
+                root_fd,
+                name,
+                quarantine,
+                destination_directory_fd=internal_fd,
+            )
     except OSError as exc:
         raise SkillPathError("local skill folder changed during deletion") from exc
 
-    moved = _identity_at(root_fd, quarantine)
+    quarantine_fd = root_fd if internal_fd is None else internal_fd
+    moved = _identity_at(quarantine_fd, quarantine)
+    if internal_fd is not None:
+        _fsync_directory_pair(root_fd, internal_fd)
     if moved == expected:
         return quarantine
 
@@ -934,6 +954,7 @@ def _remove_quarantined_directory_at(
     quarantine: str,
     *,
     expected: tuple[int, int],
+    source_directory_fd: int | None = None,
 ) -> None:
     """Move an owned detached generation into durable implementation trash.
 
@@ -943,27 +964,28 @@ def _remove_quarantined_directory_at(
     """
 
     internal_fd = _open_directory_at(root_fd, INTERNAL_DIRECTORY)
+    source_fd = root_fd if source_directory_fd is None else source_directory_fd
     try:
         with _serialized_skill_trash(internal_fd):
-            if _identity_at(root_fd, quarantine) != expected:
+            if _identity_at(source_fd, quarantine) != expected:
                 raise SkillPathError(
                     "quarantined skill directory changed before retirement; "
                     f"its replacement was preserved as {quarantine}"
                 )
             retired = f"{SKILL_TRASH_PREFIX}{uuid.uuid4().hex}"
             _rename_directory_no_replace_at(
-                root_fd,
+                source_fd,
                 quarantine,
                 retired,
                 destination_directory_fd=internal_fd,
             )
             if _identity_at(internal_fd, retired) != expected:
-                _fsync_directory_pair(root_fd, internal_fd)
+                _fsync_directory_pair(source_fd, internal_fd)
                 raise SkillPathError(
                     "quarantined skill directory changed during retirement; "
                     f"the unexpected generation was preserved as {retired}"
                 )
-            _fsync_directory_pair(root_fd, internal_fd)
+            _fsync_directory_pair(source_fd, internal_fd)
             try:
                 _purge_internal_directory_at(
                     internal_fd,
@@ -1065,19 +1087,22 @@ def _restore_quarantined_directory_at(
     name: str,
     *,
     expected: tuple[int, int],
+    source_directory_fd: int | None = None,
 ) -> None:
     """Restore preserved rollback data without overwriting a raced replacement."""
 
-    if _identity_at(root_fd, quarantine) != expected:
+    source_fd = root_fd if source_directory_fd is None else source_directory_fd
+    if _identity_at(source_fd, quarantine) != expected:
         raise SkillPathError(
             "quarantined skill folder changed while rollback inspected it; "
             f"remaining data is preserved as {quarantine}"
         )
     try:
         _rename_directory_no_replace_at(
-            root_fd,
+            source_fd,
             quarantine,
             name,
+            destination_directory_fd=root_fd,
         )
     except FileExistsError as exc:
         raise SkillPathError(
@@ -1088,6 +1113,7 @@ def _restore_quarantined_directory_at(
         raise SkillPathError(
             "restored skill folder changed identity after rollback inspection"
         )
+    _fsync_directory_pair(source_fd, root_fd)
 
 
 def _open_parent_at(
@@ -3353,7 +3379,7 @@ class SkillStore:
             record.name,
             root_identity=self._local_root_identity,
             internal_root_identity=self._internal_root_identity,
-        ) as (root_fd, _artifact_fd):
+        ) as (root_fd, internal_fd):
             expected = self._require_local(record)
             try:
                 current = expected.lstat()
@@ -3369,10 +3395,11 @@ class SkillStore:
                 root_fd,
                 record.name,
                 expected=expected_identity,
+                internal_fd=internal_fd,
             )
             try:
                 snapshot = _inspect_child_at(
-                    root_fd,
+                    internal_fd,
                     quarantine,
                     expected=expected_identity,
                     folder_name=record.name,
@@ -3385,6 +3412,7 @@ class SkillStore:
                         quarantine,
                         record.name,
                         expected=expected_identity,
+                        source_directory_fd=internal_fd,
                     )
                 except Exception as restoration_error:  # noqa: BLE001
                     inspection_error.add_note(str(restoration_error))
@@ -3393,6 +3421,7 @@ class SkillStore:
                 root_fd,
                 quarantine,
                 expected=expected_identity,
+                source_directory_fd=internal_fd,
             )
 
     def assert_current(self, record: SkillRecord) -> None:
