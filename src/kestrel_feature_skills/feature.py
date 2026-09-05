@@ -1225,9 +1225,14 @@ class ProceduralSkillsFeature(Feature):
                         self._enablement_error = None
         if getattr(self.agent, "storage", None) is not None:
             graph_deleted = await self._delete_index_node(name)
-            if not graph_deleted:
-                errors.append("graph index cleanup failed")
         await self._refresh_locked()
+        if not graph_deleted and getattr(self.agent, "storage", None) is not None:
+            # The refresh performs the same idempotent stale-index cleanup. Ask
+            # once more after it completes so a transient first failure cannot
+            # leave the result claiming cleanup is incomplete after it succeeded.
+            graph_deleted = await self._delete_index_node(name)
+        if not graph_deleted:
+            errors.append("graph index cleanup failed")
         if enablement_cleanup_error is not None:
             final_refresh_observed_absent = bool(
                 self._enablement_error is None and name not in self._states

@@ -1142,23 +1142,169 @@ class _RawHTMLDestinationParser(HTMLParser):
             raise SkillPathError("HTML meta refresh is not supported in SKILL.md")
 
 
-def _mask_escaped_html_openers(body: str) -> str:
-    """Keep CommonMark-escaped ``<`` characters literal for HTML parsing."""
+def _commonmark_html_space_end(body: str, cursor: int) -> int | None:
+    """Consume CommonMark HTML spacing with at most one line ending."""
+
+    line_ending_seen = False
+    while cursor < len(body) and body[cursor] in " \t\n":
+        if body[cursor] == "\n":
+            if line_ending_seen:
+                return None
+            line_ending_seen = True
+        cursor += 1
+    return cursor
+
+
+def _commonmark_html_tag_end(body: str, start: int) -> int | None:
+    """Return the exclusive end of one complete CommonMark open/close tag."""
+
+    cursor = start + 1
+    closing = cursor < len(body) and body[cursor] == "/"
+    if closing:
+        cursor += 1
+    if cursor >= len(body) or not body[cursor].isascii() or not body[cursor].isalpha():
+        return None
+    cursor += 1
+    while cursor < len(body) and (
+        (body[cursor].isascii() and body[cursor].isalnum()) or body[cursor] == "-"
+    ):
+        cursor += 1
+
+    if closing:
+        cursor = _commonmark_html_space_end(body, cursor)
+        if cursor is None or cursor >= len(body) or body[cursor] != ">":
+            return None
+        return cursor + 1
+
+    separator_available = False
+    while True:
+        if separator_available:
+            separator_seen = True
+            separator_available = False
+        else:
+            separator_start = cursor
+            cursor = _commonmark_html_space_end(body, cursor)
+            if cursor is None:
+                return None
+            separator_seen = cursor != separator_start
+        if cursor >= len(body):
+            return None
+        if body[cursor] == ">":
+            return cursor + 1
+        if body.startswith("/>", cursor):
+            return cursor + 2
+        if not separator_seen:
+            return None
+        if body[cursor] not in "_:" and not (
+            body[cursor].isascii() and body[cursor].isalpha()
+        ):
+            return None
+        cursor += 1
+        while cursor < len(body) and (
+            body[cursor] in "_.:-"
+            or (body[cursor].isascii() and body[cursor].isalnum())
+        ):
+            cursor += 1
+        after_name = _commonmark_html_space_end(body, cursor)
+        if after_name is None:
+            return None
+        if after_name >= len(body) or body[after_name] != "=":
+            separator_available = after_name > cursor
+            cursor = after_name
+            continue
+        cursor = _commonmark_html_space_end(body, after_name + 1)
+        if cursor is None or cursor >= len(body):
+            return None
+        quote = body[cursor] if body[cursor] in "\"'" else None
+        if quote is not None:
+            closing_quote = body.find(quote, cursor + 1)
+            if closing_quote < 0:
+                return None
+            cursor = closing_quote + 1
+            continue
+        value_start = cursor
+        while cursor < len(body) and body[cursor] not in " \t\n\"'=<>`":
+            cursor += 1
+        if cursor == value_start:
+            return None
+
+
+def _commonmark_special_html_end(body: str, start: int) -> int | None:
+    """Return the end of a complete comment, PI, declaration, or CDATA token."""
+
+    if body.startswith("<!-->", start):
+        return start + len("<!-->")
+    if body.startswith("<!--->", start):
+        return start + len("<!--->")
+    if body.startswith("<!--", start):
+        ending = body.find("-->", start + len("<!--"))
+        return ending + len("-->") if ending >= 0 else None
+    if body.startswith("<?", start):
+        ending = body.find("?>", start + len("<?"))
+        return ending + len("?>") if ending >= 0 else None
+    if body.startswith("<![CDATA[", start):
+        ending = body.find("]]>", start + len("<![CDATA["))
+        return ending + len("]]>") if ending >= 0 else None
+    if not body.startswith("<!", start):
+        return None
+    cursor = start + len("<!")
+    name_start = cursor
+    while cursor < len(body) and "A" <= body[cursor] <= "Z":
+        cursor += 1
+    if cursor == name_start or cursor >= len(body) or body[cursor] not in " \t\n":
+        return None
+    cursor = _commonmark_html_space_end(body, cursor)
+    if cursor is None:
+        return None
+    ending = body.find(">", cursor)
+    return ending + 1 if ending >= 0 else None
+
+
+def _mask_non_commonmark_html_openers(body: str) -> str:
+    """Neutralize text that Python's HTML parser could mistake for live HTML."""
 
     masked = list(body)
-    for position, character in enumerate(masked):
-        if character == "<" and _escaped_at(body, position):
+    cursor = 0
+    while True:
+        position = body.find("<", cursor)
+        if position < 0:
+            break
+        if _escaped_at(body, position):
             masked[position] = " "
+            cursor = position + 1
+            continue
+        if body.startswith(("<!", "<?"), position):
+            ending = _commonmark_special_html_end(body, position)
+            if ending is None:
+                # An incomplete declaration is literal CommonMark. Mask only
+                # its opener so a later complete URL-bearing tag remains live.
+                masked[position] = " "
+                cursor = position + 1
+            else:
+                # Complete comments/instructions/declarations/CDATA cannot
+                # carry live HTML attributes; remove the whole token so nested
+                # tag-shaped text remains literal to HTMLParser as well.
+                masked[position:ending] = " " * (ending - position)
+                cursor = ending
+            continue
+        if _commonmark_html_tag_end(body, position) is None:
+            # Incomplete open/close tags are literal CommonMark and must not
+            # hold HTMLParser in a quoted attribute across a later live tag.
+            masked[position] = " "
+        cursor = position + 1
     return "".join(masked)
 
 
 def _raw_html_destinations(fragments: tuple[str, ...]) -> tuple[str, ...]:
-    parser = _RawHTMLDestinationParser()
+    destinations: list[str] = []
     for fragment in fragments:
+        # Parser state never crosses CommonMark block boundaries. Otherwise an
+        # incomplete literal in one paragraph can conceal a tag in the next.
+        parser = _RawHTMLDestinationParser()
         parser.feed(fragment)
-        parser.feed("\n")
-    parser.close()
-    return tuple(parser.destinations)
+        parser.close()
+        destinations.extend(parser.destinations)
+    return tuple(destinations)
 
 
 def _local_markdown_destinations(body: str) -> tuple[str, ...]:
@@ -1176,7 +1322,7 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
             for match in _MARKDOWN_AUTOLINK.finditer(inline_body)
             if not _escaped_at(inline_body, match.start())
         )
-        inline_html_fragments.append(_mask_escaped_html_openers(inline_body))
+        inline_html_fragments.append(_mask_non_commonmark_html_openers(inline_body))
     raw_destinations.extend(reference_destinations)
     raw_destinations.extend(
         _raw_html_destinations(tuple(inline_html_fragments) + html_blocks)

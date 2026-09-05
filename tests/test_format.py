@@ -1387,6 +1387,10 @@ def test_markdown_links_inside_html_blocks_remain_literal(tmp_path, body):
             '<div>\n<a href="../outside.md">outside</a>\n</div>',
             "traversal",
         ),
+        (
+            'prefix <a download\nhref="../outside.md">outside</a>',
+            "traversal",
+        ),
     ),
 )
 def test_raw_html_url_attributes_cannot_bypass_containment(tmp_path, body, error):
@@ -1395,6 +1399,46 @@ def test_raw_html_url_attributes_cannot_bypass_containment(tmp_path, body, error
 
     with pytest.raises(SkillPathError, match=error):
         validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "body, error",
+    (
+        ('text <! <a href="../outside.md">outside</a>', "traversal"),
+        (
+            'text <!-- <a href="javascript:alert(1)">outside</a>',
+            "unsupported link scheme",
+        ),
+        ('text <!\n\n<a href="../outside.md">outside</a>', "traversal"),
+        ('text <a href="\n\n<a href="../outside.md">outside</a>', "traversal"),
+        (
+            'text <a title=" <img src="javascript:alert(1)">',
+            "unsupported link scheme",
+        ),
+        ("text <x foo=' <a href='../outside.md'>", "traversal"),
+    ),
+)
+def test_malformed_inline_html_cannot_hide_later_live_url(tmp_path, body, error):
+    value = SkillDocument("malformed-html-link", "Malformed HTML link", body)
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillPathError, match=error):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        '<!-- <a href="../outside.md">literal comment</a> -->',
+        '<?instruction <a href="../outside.md">literal instruction</a> ?>',
+        "<span title='<a href=\"../outside.md\">'>literal attribute</span>",
+    ),
+)
+def test_complete_raw_html_containers_keep_nested_tags_literal(tmp_path, body):
+    value = SkillDocument("complete-html-container", "Complete HTML container", body)
+    folder = write_skill(tmp_path, value)
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
 
 
 @pytest.mark.parametrize(

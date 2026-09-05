@@ -1782,6 +1782,38 @@ async def test_delete_reports_partial_after_authoritative_folder_removal(
 
 
 @pytest.mark.asyncio
+async def test_delete_reconciles_graph_cleanup_completed_by_final_refresh(
+    feature, monkeypatch
+):
+    name = "refresh-reconciled-graph-delete"
+    await feature.skill_create(name, "Refresh reconciled graph delete", "body")
+    node_id = feature._node_id(name)
+    original_delete = feature.agent.storage.compare_and_delete_node
+    attempts = 0
+
+    async def fail_once_then_delete(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise UnexpectedGraphError("graph unavailable once")
+        return await original_delete(*args, **kwargs)
+
+    monkeypatch.setattr(
+        feature.agent.storage,
+        "compare_and_delete_node",
+        fail_once_then_delete,
+    )
+
+    result = await feature.skill_delete(name)
+
+    assert attempts >= 2
+    assert node_id not in feature.agent.storage.nodes
+    assert result.status is ToolResultStatus.OK
+    assert result.data["graph_deleted"] is True
+    assert result.data["errors"] == []
+
+
+@pytest.mark.asyncio
 async def test_delete_preserves_different_label_at_skill_index_id(feature):
     name = "delete-label-collision"
     await feature.skill_create(name, "Delete graph collision", "body")
