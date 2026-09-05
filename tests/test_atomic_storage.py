@@ -426,7 +426,11 @@ def test_create_failure_cleanup_preserves_raced_replacement(tmp_path, monkeypatc
 
     def swap_then_fail(*args, **kwargs):
         nonlocal replacement, replacement_marker
-        candidates = list(store.local_root.glob(".create-cleanup-race.create.*"))
+        candidates = list(
+            store._internal_root.glob(
+                f"{store_module.SKILL_PUBLICATION_STAGING_PREFIX}create-*"
+            )
+        )
         assert len(candidates) == 1
         replacement = candidates[0]
         replacement.rename(displaced)
@@ -2396,7 +2400,11 @@ def test_install_failure_cleanup_preserves_raced_replacement(tmp_path, monkeypat
 
     def swap_then_fail(*_args, **_kwargs):
         nonlocal marker, replacement
-        candidates = list(store.local_root.glob(".install-cleanup-race.install.*"))
+        candidates = list(
+            store._internal_root.glob(
+                f"{store_module.SKILL_PUBLICATION_STAGING_PREFIX}install-*"
+            )
+        )
         assert len(candidates) == 1
         replacement = candidates[0]
         replacement.rename(displaced)
@@ -2886,6 +2894,124 @@ def test_create_keeps_target_hidden_until_complete(tmp_path, monkeypatch):
     assert observed_write
     assert created == target
     assert (target / "SKILL.md").is_file()
+
+
+@pytest.mark.parametrize("operation", ("create", "install"))
+def test_publication_staging_uses_private_recovery_domain(
+    tmp_path, monkeypatch, operation
+):
+    name = f"private-staging-{operation}"
+    store = SkillStore(tmp_path / "skills")
+    real_write = store_module._atomic_write_primary_at
+    observed_staging = False
+
+    def assert_private_staging(*args, **kwargs):
+        nonlocal observed_staging
+        observed_staging = True
+        assert not tuple(store.local_root.glob(f".{name}.{operation}.*"))
+        assert tuple(
+            store._internal_root.glob(
+                f"{store_module.SKILL_PUBLICATION_STAGING_PREFIX}{operation}-*"
+            )
+        )
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store_module,
+        "_atomic_write_primary_at",
+        assert_private_staging,
+    )
+
+    if operation == "create":
+        published = store.create(SkillDocument(name, "Private staging", "Procedure."))
+    else:
+        source = tmp_path / "source" / name
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(name, "Private staging", "Procedure.")
+            ),
+            encoding="utf-8",
+        )
+        published = store.install_folder(source, provenance=git_provenance(name))
+
+    assert observed_staging
+    assert published == store.local_root / name
+    assert not tuple(
+        store._internal_root.glob(
+            f"{store_module.SKILL_PUBLICATION_STAGING_PREFIX}{operation}-*"
+        )
+    )
+
+
+def test_store_reaps_crash_orphaned_publication_staging(tmp_path):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    orphan = (
+        store._internal_root
+        / f"{store_module.SKILL_PUBLICATION_STAGING_PREFIX}create-crashed"
+    )
+    orphan.mkdir()
+    (orphan / "partial.md").write_text("partial publication", encoding="utf-8")
+
+    SkillStore(root)
+
+    assert not orphan.exists()
+
+
+def test_store_does_not_reap_live_publication_staging(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    publication_started = threading.Event()
+    release_publication = threading.Event()
+    constructor_finished = threading.Event()
+    errors = []
+    real_write = store_module._atomic_write_primary_at
+
+    def pause_live_publication(*args, **kwargs):
+        publication_started.set()
+        assert release_publication.wait(timeout=5)
+        return real_write(*args, **kwargs)
+
+    def publish():
+        try:
+            store.create(SkillDocument("live-staging", "Live staging", "Procedure."))
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+
+    def reopen():
+        try:
+            SkillStore(root)
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+        finally:
+            constructor_finished.set()
+
+    monkeypatch.setattr(
+        store_module,
+        "_atomic_write_primary_at",
+        pause_live_publication,
+    )
+    publisher = threading.Thread(target=publish)
+    publisher.start()
+    assert publication_started.wait(timeout=5)
+    staging = tuple(
+        store._internal_root.glob(f"{store_module.SKILL_PUBLICATION_STAGING_PREFIX}*")
+    )
+    assert len(staging) == 1
+
+    constructor = threading.Thread(target=reopen)
+    constructor.start()
+    assert not constructor_finished.wait(timeout=0.1)
+    assert staging[0].is_dir(), "a live publication staging folder was reaped"
+    release_publication.set()
+    publisher.join(timeout=5)
+    constructor.join(timeout=5)
+
+    assert not publisher.is_alive()
+    assert not constructor.is_alive()
+    assert errors == []
+    assert (store.local_root / "live-staging" / "SKILL.md").is_file()
 
 
 @pytest.mark.parametrize("operation", ("create", "install"))

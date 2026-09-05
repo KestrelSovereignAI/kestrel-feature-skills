@@ -61,6 +61,7 @@ GIT_CHECKOUT_PREFIX = ".kestrel-skill-git-"
 GIT_CHECKOUT_LOCK = ".checkout-owner.lock"
 SKILL_TRASH_PREFIX = ".kestrel-skill-trash-"
 SKILL_TRASH_LOCK = ".skill-trash.lock"
+SKILL_PUBLICATION_STAGING_PREFIX = ".kestrel-skill-publication-"
 MAX_EDITOR_FILE_BYTES = 262_144
 NAME_LOCK_BUCKETS = 256
 _MUTATION_LOCKS = tuple(threading.RLock() for _ in range(NAME_LOCK_BUCKETS))
@@ -1331,6 +1332,7 @@ class SkillStore:
         self._internal_root = internal_root
         self._internal_root_identity = internal_identity
         self._reap_retired_skill_folders()
+        self._reap_publication_staging_folders()
         self._reap_git_checkout_workspaces()
 
     @staticmethod
@@ -1419,6 +1421,60 @@ class SkillStore:
                     except (OSError, SkillPathError):
                         # The private domain is best-effort retention cleanup.
                         # Preserve anything that changed and retry next startup.
+                        continue
+        finally:
+            os.close(internal_fd)
+
+    def _publication_staging_names(self) -> tuple[str, ...]:
+        internal_fd = _open_directory(
+            self._internal_root,
+            expected=self._internal_root_identity,
+        )
+        try:
+            with os.scandir(internal_fd) as entries:
+                return tuple(
+                    entry.name
+                    for entry in entries
+                    if entry.name.startswith(SKILL_PUBLICATION_STAGING_PREFIX)
+                )
+        finally:
+            os.close(internal_fd)
+
+    def _reap_publication_staging_folders(self) -> None:
+        """Remove private staging generations left by crashed publications."""
+
+        # A live create/install holds this same cross-process lock. Once the
+        # reaper acquires it, every remaining staging generation is orphaned.
+        if not self._publication_staging_names():
+            return
+        internal_fd = _open_directory(
+            self._internal_root,
+            expected=self._internal_root_identity,
+        )
+        try:
+            with _serialized_source_publication(
+                self.local_root,
+                internal_fd,
+                enabled=True,
+            ):
+                with os.scandir(internal_fd) as entries:
+                    candidates = tuple(
+                        (entry.name, entry.stat(follow_symlinks=False))
+                        for entry in entries
+                        if entry.name.startswith(SKILL_PUBLICATION_STAGING_PREFIX)
+                    )
+                for name, value in candidates:
+                    if not stat.S_ISDIR(value.st_mode):
+                        continue
+                    try:
+                        _purge_internal_directory_at(
+                            internal_fd,
+                            name,
+                            expected=(value.st_dev, value.st_ino),
+                        )
+                    except (OSError, SkillPathError):
+                        # Preserve anything raced or malformed. It remains in
+                        # the private domain and a later startup can retry.
                         continue
         finally:
             os.close(internal_fd)
@@ -1681,7 +1737,7 @@ class SkillStore:
             root_identity=self._local_root_identity,
             internal_root_identity=self._internal_root_identity,
             source_publication=True,
-        ) as (root_fd, _artifact_fd):
+        ) as (root_fd, internal_fd):
             _require_source_publication_capacity_at(root_fd)
             folder = direct_child(
                 self.local_root,
@@ -1690,24 +1746,26 @@ class SkillStore:
             )
             if _identity_at(root_fd, name) is not None:
                 raise SkillConflictError(f"skill already exists: {name}")
-            staging_name = f".{name}.create.{uuid.uuid4().hex}"
+            staging_name = (
+                f"{SKILL_PUBLICATION_STAGING_PREFIX}create-{uuid.uuid4().hex}"
+            )
             created_identity: tuple[int, int] | None = None
-            cleanup_name = staging_name
+            published_to_root = False
             publication_collision = False
             try:
                 try:
-                    os.mkdir(staging_name, mode=0o700, dir_fd=root_fd)
+                    os.mkdir(staging_name, mode=0o700, dir_fd=internal_fd)
                 except FileExistsError as exc:
                     raise SkillPathError(
                         "create staging name unexpectedly collided"
                     ) from exc
-                created_identity = _identity_at(root_fd, staging_name)
+                created_identity = _identity_at(internal_fd, staging_name)
                 if created_identity is None:
                     raise SkillPathError(
                         "created skill staging folder vanished before publication"
                     )
                 folder_fd = _open_directory_at(
-                    root_fd,
+                    internal_fd,
                     staging_name,
                     expected=created_identity,
                 )
@@ -1744,7 +1802,7 @@ class SkillStore:
                         pass
                 finally:
                     os.close(folder_fd)
-                if _identity_at(root_fd, staging_name) != created_identity:
+                if _identity_at(internal_fd, staging_name) != created_identity:
                     raise SkillPathError(
                         "created skill staging folder changed during publication"
                     )
@@ -1756,30 +1814,44 @@ class SkillStore:
                 if _identity_at(root_fd, name) is not None:
                     raise SkillConflictError(f"skill already exists: {name}")
                 try:
-                    _rename_directory_no_replace_at(root_fd, staging_name, name)
+                    _rename_directory_no_replace_at(
+                        internal_fd,
+                        staging_name,
+                        name,
+                        destination_directory_fd=root_fd,
+                    )
                 except FileExistsError as exc:
                     publication_collision = True
                     raise SkillConflictError(f"skill already exists: {name}") from exc
-                cleanup_name = name
+                published_to_root = True
                 if _identity_at(root_fd, name) != created_identity:
                     raise SkillPathError(
                         "created skill folder changed during publication"
                     )
                 try:
-                    os.fsync(root_fd)
+                    _fsync_directory_pair(internal_fd, root_fd)
                 except OSError:
                     pass
             except BaseException as publication_error:
+                cleanup_fd = root_fd if published_to_root else internal_fd
+                cleanup_name = name if published_to_root else staging_name
                 if (
                     created_identity is not None
-                    and _identity_at(root_fd, cleanup_name) is not None
+                    and _identity_at(cleanup_fd, cleanup_name) is not None
                 ):
                     try:
-                        _remove_expected_directory_at(
-                            root_fd,
-                            cleanup_name,
-                            expected=created_identity,
-                        )
+                        if published_to_root:
+                            _remove_expected_directory_at(
+                                root_fd,
+                                cleanup_name,
+                                expected=created_identity,
+                            )
+                        else:
+                            _purge_internal_directory_at(
+                                internal_fd,
+                                cleanup_name,
+                                expected=created_identity,
+                            )
                     except BaseException as cleanup_error:
                         cleanup_error.add_note(
                             f"skill creation originally failed: {publication_error}"
@@ -1789,7 +1861,7 @@ class SkillStore:
                             f"{cleanup_error}"
                         ) from cleanup_error
                 if (
-                    cleanup_name != name
+                    not published_to_root
                     and _identity_at(root_fd, name) is not None
                     and not publication_collision
                 ):
@@ -2341,7 +2413,7 @@ class SkillStore:
                 root_identity=self._local_root_identity,
                 internal_root_identity=self._internal_root_identity,
                 source_publication=True,
-            ) as (root_fd, _artifact_fd):
+            ) as (root_fd, internal_fd):
                 _require_source_publication_capacity_at(root_fd)
                 target = direct_child(
                     self.local_root,
@@ -2350,25 +2422,27 @@ class SkillStore:
                 )
                 if _identity_at(root_fd, document.name) is not None:
                     raise SkillConflictError(f"skill already exists: {document.name}")
-                staging_name = f".{document.name}.install.{uuid.uuid4().hex}"
+                staging_name = (
+                    f"{SKILL_PUBLICATION_STAGING_PREFIX}install-{uuid.uuid4().hex}"
+                )
                 created_identity: tuple[int, int] | None = None
                 publication: InstalledSkillPublication | None = None
-                cleanup_name = staging_name
+                published_to_root = False
                 publication_collision = False
                 try:
-                    os.mkdir(staging_name, mode=0o700, dir_fd=root_fd)
+                    os.mkdir(staging_name, mode=0o700, dir_fd=internal_fd)
                 except FileExistsError as exc:
                     raise SkillPathError(
                         "install staging name unexpectedly collided"
                     ) from exc
-                created_identity = _identity_at(root_fd, staging_name)
+                created_identity = _identity_at(internal_fd, staging_name)
                 try:
                     if created_identity is None:
                         raise SkillPathError(
                             "installed skill staging folder vanished before publication"
                         )
                     target_fd = _open_directory_at(
-                        root_fd,
+                        internal_fd,
                         staging_name,
                         expected=created_identity,
                     )
@@ -2427,7 +2501,7 @@ class SkillStore:
                         )
                     finally:
                         os.close(target_fd)
-                    if _identity_at(root_fd, staging_name) != created_identity:
+                    if _identity_at(internal_fd, staging_name) != created_identity:
                         raise SkillPathError(
                             "installed skill staging folder changed during publication"
                         )
@@ -2442,35 +2516,45 @@ class SkillStore:
                         )
                     try:
                         _rename_directory_no_replace_at(
-                            root_fd,
+                            internal_fd,
                             staging_name,
                             document.name,
+                            destination_directory_fd=root_fd,
                         )
                     except FileExistsError as exc:
                         publication_collision = True
                         raise SkillConflictError(
                             f"skill already exists: {document.name}"
                         ) from exc
-                    cleanup_name = document.name
+                    published_to_root = True
                     if _identity_at(root_fd, document.name) != created_identity:
                         raise SkillPathError(
                             "installed skill folder changed during publication"
                         )
                     try:
-                        os.fsync(root_fd)
+                        _fsync_directory_pair(internal_fd, root_fd)
                     except OSError:
                         pass
                 except BaseException as publication_error:
+                    cleanup_fd = root_fd if published_to_root else internal_fd
+                    cleanup_name = document.name if published_to_root else staging_name
                     if (
                         created_identity is not None
-                        and _identity_at(root_fd, cleanup_name) is not None
+                        and _identity_at(cleanup_fd, cleanup_name) is not None
                     ):
                         try:
-                            _remove_expected_directory_at(
-                                root_fd,
-                                cleanup_name,
-                                expected=created_identity,
-                            )
+                            if published_to_root:
+                                _remove_expected_directory_at(
+                                    root_fd,
+                                    cleanup_name,
+                                    expected=created_identity,
+                                )
+                            else:
+                                _purge_internal_directory_at(
+                                    internal_fd,
+                                    cleanup_name,
+                                    expected=created_identity,
+                                )
                         except BaseException as cleanup_error:
                             cleanup_error.add_note(
                                 "skill installation originally failed: "
@@ -2481,7 +2565,7 @@ class SkillStore:
                                 f"{cleanup_error}"
                             ) from cleanup_error
                     if (
-                        cleanup_name != document.name
+                        not published_to_root
                         and _identity_at(root_fd, document.name) is not None
                         and not publication_collision
                     ):

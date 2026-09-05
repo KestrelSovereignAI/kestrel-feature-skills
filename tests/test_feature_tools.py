@@ -1511,7 +1511,9 @@ async def test_failed_create_publication_keeps_raced_replacement_disabled(
 
     def swap_then_fail(*_args, **_kwargs):
         candidates = list(
-            feature.agent.procedural_skills_root.glob(f".{name}.create.*")
+            feature._store._internal_root.glob(
+                f"{store_module.SKILL_PUBLICATION_STAGING_PREFIX}create-*"
+            )
         )
         assert len(candidates) == 1
         candidates[0].rename(displaced)
@@ -3029,7 +3031,9 @@ async def test_failed_install_publication_keeps_raced_replacement_disabled(
 
     def swap_then_fail(*_args, **_kwargs):
         candidates = list(
-            feature.agent.procedural_skills_root.glob(f".{name}.install.*")
+            feature._store._internal_root.glob(
+                f"{store_module.SKILL_PUBLICATION_STAGING_PREFIX}install-*"
+            )
         )
         assert len(candidates) == 1
         candidates[0].rename(displaced)
