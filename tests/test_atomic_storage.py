@@ -1813,7 +1813,7 @@ def test_limit_crossing_primary_edit_preserves_the_original(tmp_path):
     assert validate_skill_folder(folder, source_root=store.local_root).name == "bounded"
 
 
-def test_primary_path_alias_uses_the_serialized_primary_writer(tmp_path, monkeypatch):
+def test_primary_path_alias_is_rejected_before_reaching_a_writer(tmp_path, monkeypatch):
     store = SkillStore(tmp_path / "skills")
     folder = store.create(SkillDocument("aliased", "Original", "Procedure."))
     record = SkillRecord(
@@ -1835,9 +1835,10 @@ def test_primary_path_alias_uses_the_serialized_primary_writer(tmp_path, monkeyp
 
     monkeypatch.setattr(store, "edit_primary", serialized_edit)
 
-    store.write_file(record, "./SKILL.md", replacement)
+    with pytest.raises(SkillPathError, match="canonical"):
+        store.write_file(record, "./SKILL.md", replacement)
 
-    assert calls == [(record, replacement)]
+    assert calls == []
 
 
 def test_resource_edit_supports_maximum_length_filename(tmp_path):

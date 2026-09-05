@@ -32,6 +32,15 @@ def write_skill(root, value=None):
     return folder
 
 
+@pytest.mark.parametrize(
+    "path",
+    ("docs//notes.md", "docs/./notes.md", "notes.md/", "./SKILL.md"),
+)
+def test_resource_paths_reject_noncanonical_posix_spellings(path):
+    with pytest.raises(SkillPathError, match="canonical"):
+        format_module.validate_resource_path(path)
+
+
 def test_round_trip_quotes_unicode_and_colons():
     original = document(description="Use “carefully”: don't lose {braces}.")
     encoded = serialize_skill_markdown(original)

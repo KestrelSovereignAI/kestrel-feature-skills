@@ -572,6 +572,33 @@ test.describe.serial('procedural skills contributed console', () => {
     }
   });
 
+  test('discover reload refreshes the selected resource tree', async ({ page }) => {
+    const root = process.env.KESTREL_KITE_SKILLS_ROOT;
+    test.skip(!root, 'KESTREL_KITE_SKILLS_ROOT is required for filesystem discovery');
+    const resource = path.join(root, SKILL_NAME, 'outside-reload.md');
+    await fs.rm(resource, { force: true });
+    try {
+      await openPanel(page);
+      await page.getByRole('button', { name: SKILL_NAME }).click();
+      await page.getByRole('button', { name: 'SKILL.md' }).click();
+      const editor = page.getByLabel('Skill file editor');
+      const unsaved = `${await editor.inputValue()}\nUNSAVED-RELOAD-SENTINEL\n`;
+      await editor.fill(unsaved);
+      await expect(page.getByRole('button', { name: 'outside-reload.md' })).toHaveCount(0);
+      await fs.writeFile(resource, 'Added outside the Console.\n', 'utf8');
+      await page.getByTestId('skills-reload').click();
+      await expect(page.locator('[role="status"]')).toContainText('without restarting');
+      await expect(page.getByRole('button', { name: 'outside-reload.md' })).toBeVisible();
+      await expect(editor).toHaveValue(unsaved);
+      await fs.rm(resource, { force: true });
+      await page.getByTestId('skills-reload').click();
+      await expect(page.getByRole('button', { name: 'outside-reload.md' })).toHaveCount(0);
+      await expect(editor).toHaveValue(unsaved);
+    } finally {
+      await fs.rm(resource, { force: true });
+    }
+  });
+
   test('stale delete approval cannot remove a same-named replacement', async ({ page, request }) => {
     await openPanel(page);
     await page.getByRole('button', { name: SKILL_NAME }).click();

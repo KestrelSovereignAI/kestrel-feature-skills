@@ -272,6 +272,18 @@ async function reloadCatalog() {
     if (epoch !== state.catalogEpoch || currentAgent() !== agent) return;
     state.catalog = catalog;
     renderCatalog();
+    const selected = state.selected;
+    const selectionEpoch = state.selectionEpoch;
+    if (selected) {
+      const tree = await request(`/${encodeURIComponent(selected)}/tree`);
+      if (
+        epoch !== state.catalogEpoch
+        || selectionEpoch !== state.selectionEpoch
+        || state.selected !== selected
+        || currentAgent() !== agent
+      ) return;
+      renderTree(tree.entries || []);
+    }
     setStatus('Discovered skill folders without restarting.');
   } catch (error) {
     if (epoch === state.catalogEpoch && currentAgent() === agent) {

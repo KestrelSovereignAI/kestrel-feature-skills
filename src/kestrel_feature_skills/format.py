@@ -1233,6 +1233,8 @@ def _direct_relative_parts(relative: object) -> tuple[str, ...]:
         or any(part in {"", ".", ".."} for part in pure.parts)
     ):
         raise SkillPathError("path traversal is not allowed")
+    if pure.as_posix() != relative:
+        raise SkillPathError("path must use its canonical POSIX spelling")
     return pure.parts
 
 
