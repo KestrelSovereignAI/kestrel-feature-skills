@@ -65,6 +65,7 @@ def test_publish_workflow_gates_the_exact_tag_before_trusted_upload():
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     assert "uses: ./.github/workflows/ci.yml" in publish
+    assert "tags: ['v*.*.*']" in publish
     assert publish.count("ref: ${{ needs.resolve.outputs.sha }}") == 2
     assert 'sha=$(git rev-parse --verify "refs/tags/$tag_name^{commit}")' in publish
     assert "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" in publish

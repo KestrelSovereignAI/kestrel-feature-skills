@@ -827,6 +827,26 @@ async def test_state_change_stays_locally_disabled_when_rollback_cannot_persist(
 
 
 @pytest.mark.asyncio
+async def test_refresh_reports_durable_quarantine_load_failure(feature, monkeypatch):
+    name = "unreadable-quarantine"
+    await feature.skill_create(name, "Unreadable quarantine", "Procedure.")
+    await feature.skill_enable(name, priority=29)
+
+    def fail_quarantine_load():
+        raise OSError("quarantine directory unavailable")
+
+    monkeypatch.setattr(feature._store, "load_fail_closed_states", fail_quarantine_load)
+
+    await feature.refresh()
+
+    assert feature.snapshot.by_name()[name].state == SkillState(False, 29)
+    assert (
+        "could not load durable skill quarantine state: quarantine directory unavailable"
+        in feature.catalog_payload()["enablement_error"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_disable_race_does_not_restore_enablement_to_replacement(
     feature, monkeypatch
 ):
@@ -1636,6 +1656,41 @@ async def test_create_reports_unpersisted_custom_priority_without_database(
         ).is_file()
     finally:
         await unavailable.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_database_unavailable_create_quarantines_unknown_persisted_state(
+    feature,
+):
+    name = "offline-create-stale-row"
+    await feature._enablement.set(name, enabled=True, priority=31)
+    database = feature._enablement.db
+    feature._enablement.db = None
+    try:
+        created = await feature.create_skill(
+            name=name,
+            description="Offline replacement of an unknown row",
+            body="Procedure.",
+        )
+    finally:
+        feature._enablement.db = database
+
+    assert created["enabled"] is False
+    assert "persisted skill state could not be verified" in created["state_error"]
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert guarded[name] == SkillState(False, DEFAULT_PRIORITY)
+
+    observer = ProceduralSkillsFeature(feature.agent)
+    await observer.initialize()
+    try:
+        assert observer.snapshot.by_name()[name].state == SkillState(
+            False, DEFAULT_PRIORITY
+        )
+        assert "Offline replacement of an unknown row" not in (
+            observer.context_clause_text
+        )
+    finally:
+        await observer.shutdown()
 
 
 @pytest.mark.asyncio
@@ -2650,6 +2705,7 @@ async def test_delete_reconciles_enablement_cleanup_that_committed_before_error(
 
     assert result.status is ToolResultStatus.OK
     assert result.data["config_deleted"] is True
+    assert result.data["config_retained"] is False
     assert result.data["errors"] == []
     assert name not in await feature._enablement.load()
 
@@ -2710,6 +2766,28 @@ async def test_delete_reports_enablement_cleanup_that_failed_before_commit(
     assert result.data["config_deleted"] is False
     assert "enablement row cleanup failed" in result.error
     assert name in await feature._enablement.load()
+
+
+@pytest.mark.asyncio
+async def test_database_unavailable_delete_reports_retained_configuration(feature):
+    name = "offline-delete-stale-row"
+    await feature.skill_create(name, "Offline delete", "Procedure.", enabled=True)
+    database = feature._enablement.db
+    feature._enablement.db = None
+    try:
+        await feature.refresh()
+        approved_revision = delete_revision(feature, name)
+        result = await feature.skill_delete(name, approved_revision)
+    finally:
+        feature._enablement.db = database
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["config_deleted"] is False
+    assert result.data["config_retained"] is True
+    assert "agent database unavailable" in result.error
+    assert name in await feature._enablement.load()
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert guarded[name] == SkillState(False, DEFAULT_PRIORITY)
 
 
 @pytest.mark.asyncio
@@ -3801,6 +3879,63 @@ async def test_database_unavailable_install_preserves_existing_durable_quarantin
     try:
         assert observer.snapshot.by_name()[name].state == SkillState(False, 19)
         assert "Offline remote replacement" not in observer.context_clause_text
+    finally:
+        await observer.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_database_unavailable_install_quarantines_unknown_persisted_state(
+    feature, tmp_path, monkeypatch
+):
+    name = "offline-install-stale-row"
+    await feature._enablement.set(name, enabled=True, priority=37)
+    checkout_root = tmp_path / "offline-install-stale-checkout"
+    source = checkout_root / "skills" / name
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(
+                name, "Offline install replacing an unknown row", "Procedure."
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    async def fake_checkout(*, source_url, ref, skill_name, target):
+        return GitCheckout(
+            root=checkout_root,
+            skill_folder=source,
+            revision="f" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    monkeypatch.setattr(feature, "_checkout_git_until_stopped", fake_checkout)
+    database = feature._enablement.db
+    feature._enablement.db = None
+    try:
+        installed = await feature.install_skill(
+            source_url="https://example.com/repo.git",
+            skill_name=name,
+            ref="main",
+        )
+    finally:
+        feature._enablement.db = database
+
+    assert installed["enabled"] is False
+    assert "persisted skill state could not be verified" in installed["state_error"]
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert guarded[name] == SkillState(False, DEFAULT_PRIORITY)
+
+    observer = ProceduralSkillsFeature(feature.agent)
+    await observer.initialize()
+    try:
+        assert observer.snapshot.by_name()[name].state == SkillState(
+            False, DEFAULT_PRIORITY
+        )
+        assert "Offline install replacing an unknown row" not in (
+            observer.context_clause_text
+        )
     finally:
         await observer.shutdown()
 

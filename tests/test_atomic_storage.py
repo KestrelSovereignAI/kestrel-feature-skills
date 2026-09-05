@@ -3417,3 +3417,21 @@ def test_delete_restores_same_inode_change_made_at_quarantine(tmp_path, monkeypa
 
     assert injected
     assert (folder / "SKILL.md").read_text(encoding="utf-8") == external
+
+
+def test_recursive_fail_closed_json_is_treated_as_malformed(tmp_path, monkeypatch):
+    store = SkillStore(tmp_path / "skills")
+    name = "recursive-quarantine"
+    marker = store._internal_root / store_module._fail_closed_state_name(name)
+    marker.write_text("{}", encoding="ascii")
+
+    def recursive_decoder_failure(_payload):
+        raise RecursionError("maximum recursion depth exceeded while decoding JSON")
+
+    monkeypatch.setattr(store_module.json, "loads", recursive_decoder_failure)
+
+    states, errors = store.load_fail_closed_states()
+
+    assert states[name].enabled is False
+    assert states[name].priority == 100
+    assert "metadata is malformed" in errors[name]

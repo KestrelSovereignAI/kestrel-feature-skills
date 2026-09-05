@@ -1802,7 +1802,7 @@ class SkillStore:
                         raise ValueError("invalid fail-closed marker fields")
                     priority = value["priority"]
                     message = value["error"]
-                except (OSError, UnicodeError, ValueError, SkillError):
+                except (OSError, UnicodeError, ValueError, RecursionError, SkillError):
                     # The marker name alone is authoritative. Corruption must
                     # never turn a durable quarantine into implicit enablement.
                     pass

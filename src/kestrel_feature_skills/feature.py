@@ -211,6 +211,7 @@ class ProceduralSkillsFeature(Feature):
         )
         self._states: dict[str, SkillState] = {}
         self._enablement_error: str | None = None
+        self._durable_fail_closed_load_error: str | None = None
         self._fail_closed_states: dict[str, SkillState] = {}
         self._fail_closed_errors: dict[str, str] = {}
         self._durable_fail_closed_names: set[str] = set()
@@ -419,9 +420,11 @@ class ProceduralSkillsFeature(Feature):
         )
 
     def _combined_enablement_error(self, primary: str | None = None) -> str | None:
-        messages = ([primary] if primary else []) + list(
-            self._fail_closed_errors.values()
-        )
+        messages = [
+            message
+            for message in (primary, self._durable_fail_closed_load_error)
+            if message
+        ] + list(self._fail_closed_errors.values())
         return "; ".join(messages) or None
 
     def _with_fail_closed_states(
@@ -447,9 +450,11 @@ class ProceduralSkillsFeature(Feature):
             states, errors = self._store.load_fail_closed_states()
         except (OSError, SkillError) as exc:
             message = f"could not load durable skill quarantine state: {exc}"
-            self._enablement_error = self._combined_enablement_error(message)
+            self._durable_fail_closed_load_error = message
+            self._enablement_error = self._combined_enablement_error()
             logger.error(message)
             return False
+        self._durable_fail_closed_load_error = None
         for name in self._durable_fail_closed_names - states.keys():
             self._fail_closed_states.pop(name, None)
             self._fail_closed_errors.pop(name, None)
@@ -628,6 +633,7 @@ class ProceduralSkillsFeature(Feature):
             self._context_render = replacement
             self._context_publication_uncertain = True
         self._states = {}
+        self._durable_fail_closed_load_error = None
         self._enablement_error = (
             "persistent procedural skills are unavailable in the current privacy mode"
         )
@@ -840,6 +846,18 @@ class ProceduralSkillsFeature(Feature):
         disabled_state: SkillState | None = None
         state_was_persisted = False
         prior_local_identity = store.local_entry_identity(name)
+        if not enablement.available:
+            if not preserve_fail_closed:
+                self._retain_fail_closed_state(
+                    name,
+                    priority=DEFAULT_PRIORITY,
+                    error=(
+                        "agent database unavailable; persisted skill state could not "
+                        "be verified, so the new skill remains disabled until an "
+                        "explicit state update succeeds"
+                    ),
+                )
+            preserve_fail_closed = True
         if enablement.available:
             previous_state, disabled_state = await self._prepare_disabled_state(
                 enablement,
@@ -939,6 +957,12 @@ class ProceduralSkillsFeature(Feature):
                 "agent database unavailable; requested priority "
                 f"{resolved_priority} could not be persisted; the new skill uses "
                 f"default priority {DEFAULT_PRIORITY}"
+            )
+        elif not enablement.available:
+            state_error = (
+                "agent database unavailable; persisted skill state could not be "
+                "verified; the new skill remains disabled until an explicit state "
+                "update succeeds"
             )
         retain_existing_fail_closed = preserve_fail_closed and not state_was_persisted
         try:
@@ -1490,6 +1514,7 @@ class ProceduralSkillsFeature(Feature):
                     remaining.source_kind if remaining is not None else None
                 ),
             }
+        guard_retained = False
         if enablement.available:
             _previous_state, disabled_state = await self._prepare_disabled_state(
                 enablement,
@@ -1498,13 +1523,26 @@ class ProceduralSkillsFeature(Feature):
                 operation="skill delete disabled-state preparation",
             )
             self._states[name] = disabled_state
+            guard_retained = True
+        else:
+            if name not in self._fail_closed_states:
+                self._retain_fail_closed_state(
+                    name,
+                    priority=record.state.priority,
+                    error=(
+                        "agent database unavailable during skill deletion; "
+                        "enablement configuration was retained and the name remains "
+                        "disabled until an explicit state update succeeds"
+                    ),
+                )
+            guard_retained = True
         try:
             store.delete(record)
         except BaseException as deletion_error:
             # A failed recursive removal can leave the original only under a
             # quarantine name. Retaining the disabled tombstone is the only
             # fail-safe result when folder cleanup cannot be confirmed.
-            if enablement.available:
+            if guard_retained:
                 caveat = "the skill was disabled before deletion and remains disabled"
                 deletion_error.add_note(caveat)
                 if isinstance(deletion_error, Exception):
@@ -1512,7 +1550,7 @@ class ProceduralSkillsFeature(Feature):
                         f"skill folder deletion failed ({deletion_error}); {caveat}"
                     ) from deletion_error
             raise
-        config_deleted = True
+        config_deleted = False
         graph_deleted = True
         errors: list[str] = []
         enablement_cleanup_error: str | None = None
@@ -1521,6 +1559,7 @@ class ProceduralSkillsFeature(Feature):
             try:
                 await enablement.delete(name)
                 self._states.pop(name, None)
+                config_deleted = True
             except DatabaseError as exc:
                 try:
                     observed_states = await enablement.load()
@@ -1537,7 +1576,12 @@ class ProceduralSkillsFeature(Feature):
                         )
                     else:
                         enablement_cleanup_observed_absent = True
-                        self._enablement_error = None
+                        config_deleted = True
+                        self._enablement_error = self._combined_enablement_error()
+        else:
+            enablement_cleanup_error = (
+                "agent database unavailable; enablement configuration was retained"
+            )
         if getattr(self.agent, "storage", None) is not None:
             graph_deleted = await self._delete_index_node(name)
         await self._refresh_locked()
@@ -1561,17 +1605,20 @@ class ProceduralSkillsFeature(Feature):
             # Re-read the raw row while the same-name claim is still held and
             # release the marker only when absence is directly observed.
             final_refresh_observed_absent = False
-            try:
-                final_observed_states = await enablement.load()
-            except DatabaseError:
-                pass
-            else:
-                final_refresh_observed_absent = name not in final_observed_states
+            if enablement.available:
+                try:
+                    final_observed_states = await enablement.load()
+                except DatabaseError:
+                    pass
+                else:
+                    final_refresh_observed_absent = name not in final_observed_states
             if not (
                 enablement_cleanup_observed_absent or final_refresh_observed_absent
             ):
                 config_deleted = False
                 errors.insert(0, enablement_cleanup_error)
+            else:
+                config_deleted = True
         if config_deleted:
             self._clear_fail_closed_state(name)
             self._states.pop(name, None)
@@ -1579,6 +1626,7 @@ class ProceduralSkillsFeature(Feature):
             "name": name,
             "removed_file": True,
             "config_deleted": config_deleted,
+            "config_retained": not config_deleted,
             "graph_deleted": graph_deleted,
             "graph_retained": graph_retained,
             "errors": errors,
@@ -1691,7 +1739,15 @@ class ProceduralSkillsFeature(Feature):
             "remote_url": checkout.remote_url,
             "enabled": record.state.enabled,
             "indexed": skill_name in self._indexed_names,
-            "state_error": None,
+            "state_error": (
+                None
+                if operation.state_was_persisted
+                else (
+                    "agent database unavailable; persisted skill state could not be "
+                    "verified; the installed skill remains disabled until an explicit "
+                    "state update succeeds"
+                )
+            ),
         }
 
     async def _publish_installed_skill_with_state_claim(
@@ -1709,6 +1765,18 @@ class ProceduralSkillsFeature(Feature):
         disabled_state: SkillState | None = None
         state_was_persisted = False
         prior_local_identity = store.local_entry_identity(skill_name)
+        if not enablement.available:
+            if not preserve_fail_closed:
+                self._retain_fail_closed_state(
+                    skill_name,
+                    priority=DEFAULT_PRIORITY,
+                    error=(
+                        "agent database unavailable; persisted skill state could not "
+                        "be verified, so the installed skill remains disabled until "
+                        "an explicit state update succeeds"
+                    ),
+                )
+            preserve_fail_closed = True
         if enablement.available:
             previous_state, disabled_state = await self._prepare_disabled_state(
                 enablement,
