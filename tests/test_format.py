@@ -1433,6 +1433,31 @@ def test_raw_html_url_attributes_cannot_bypass_containment(tmp_path, body, error
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+def test_raw_html_url_attribute_character_references_are_decoded_once(tmp_path):
+    value = SkillDocument(
+        "raw-html-entity",
+        "Raw HTML entity link",
+        '<a href="notes&amp;amp;v1.md">notes</a>',
+    )
+    folder = write_skill(tmp_path, value)
+    (folder / "notes&amp;v1.md").write_text("notes", encoding="utf-8")
+
+    assert validate_skill_folder(folder, source_root=tmp_path) == value
+
+
+def test_raw_html_url_attribute_cannot_resolve_against_double_decoded_decoy(tmp_path):
+    value = SkillDocument(
+        "raw-html-entity-decoy",
+        "Raw HTML entity decoy",
+        '<a href="notes&amp;amp;v1.md">notes</a>',
+    )
+    folder = write_skill(tmp_path, value)
+    (folder / "notes&v1.md").write_text("decoy", encoding="utf-8")
+
+    with pytest.raises(SkillPathError, match="does not exist"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 @pytest.mark.parametrize(
     "body, error",
     (

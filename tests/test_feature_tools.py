@@ -2053,6 +2053,42 @@ async def test_duplicate_create_preserves_an_existing_durable_fail_closed_guard(
 
 
 @pytest.mark.asyncio
+async def test_offline_duplicate_create_does_not_quarantine_existing_skill(feature):
+    name = "duplicate-create-offline"
+    await feature.skill_create(
+        name,
+        "Existing skill must remain enabled",
+        "Existing procedure.",
+        enabled=True,
+        priority=17,
+    )
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert name not in guarded
+
+    database = feature._enablement.db
+    feature._enablement.db = None
+    try:
+        with pytest.raises(SkillConflictError, match="already exists"):
+            await feature.create_skill(
+                name=name,
+                description="Duplicate must not quarantine the existing skill",
+                body="Duplicate procedure.",
+            )
+    finally:
+        feature._enablement.db = database
+
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert name not in guarded
+    observer = ProceduralSkillsFeature(feature.agent)
+    await observer.initialize()
+    try:
+        assert observer.snapshot.by_name()[name].state == SkillState(True, 17)
+        assert "Existing skill must remain enabled" in observer.context_clause_text
+    finally:
+        await observer.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_create_rollback_preserves_replacement_swapped_after_publication(
     feature, tmp_path, monkeypatch
 ):
@@ -3938,6 +3974,54 @@ async def test_database_unavailable_install_quarantines_unknown_persisted_state(
         )
     finally:
         await observer.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_offline_install_conflict_does_not_quarantine_existing_local_entry(
+    feature, tmp_path, monkeypatch
+):
+    name = "offline-install-local-conflict"
+    folder = feature.agent.procedural_skills_root / name
+    folder.mkdir()
+    (folder / "SKILL.md").write_text("invalid", encoding="utf-8")
+    await feature.refresh()
+    assert name not in feature.snapshot.by_name()
+
+    checkout_root = tmp_path / "offline-install-local-conflict-checkout"
+    source = checkout_root / "skills" / name
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Remote must not replace local entry", "Procedure.")
+        ),
+        encoding="utf-8",
+    )
+
+    async def fake_checkout(*, source_url, ref, skill_name, target):
+        return GitCheckout(
+            root=checkout_root,
+            skill_folder=source,
+            revision="a" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    monkeypatch.setattr(feature, "_checkout_git_until_stopped", fake_checkout)
+    database = feature._enablement.db
+    feature._enablement.db = None
+    try:
+        with pytest.raises(SkillConflictError, match="already exists"):
+            await feature.install_skill(
+                source_url="https://example.com/repo.git",
+                skill_name=name,
+                ref="main",
+            )
+    finally:
+        feature._enablement.db = database
+
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert name not in guarded
+    assert (folder / "SKILL.md").read_text(encoding="utf-8") == "invalid"
 
 
 @pytest.mark.asyncio

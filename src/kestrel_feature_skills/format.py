@@ -1377,22 +1377,30 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
     visible_body, reference_destinations, inline_blocks, html_blocks = (
         _analyze_markdown(body)
     )
-    raw_destinations: list[str] = []
+    raw_destinations: list[tuple[str, bool]] = []
     inline_html_fragments: list[str] = []
     for block_start, block_end in inline_blocks:
         inline_body = visible_body[block_start:block_end]
-        raw_destinations.extend(_inline_markdown_destinations(inline_body))
         raw_destinations.extend(
-            match.group(1)
+            (destination, False)
+            for destination in _inline_markdown_destinations(inline_body)
+        )
+        raw_destinations.extend(
+            (match.group(1), False)
             for match in _MARKDOWN_AUTOLINK.finditer(inline_body)
             if not _escaped_at(inline_body, match.start())
         )
         inline_html_fragments.append(_mask_non_commonmark_html_openers(inline_body))
-    raw_destinations.extend(reference_destinations)
     raw_destinations.extend(
-        _raw_html_destinations(tuple(inline_html_fragments) + html_blocks)
+        (destination, False) for destination in reference_destinations
     )
-    for candidate in raw_destinations:
+    raw_destinations.extend(
+        (destination, True)
+        for destination in _raw_html_destinations(
+            tuple(inline_html_fragments) + html_blocks
+        )
+    )
+    for candidate, character_references_decoded in raw_destinations:
         raw = candidate.strip()
         angle_destination = _angle_destination(raw)
         if angle_destination is not None:
@@ -1402,11 +1410,11 @@ def _local_markdown_destinations(body: str) -> tuple[str, ...]:
         raw = _MARKDOWN_BACKSLASH_ESCAPE.sub(r"\1", raw)
         if not raw or raw.startswith("#"):
             continue
-        # CommonMark resolves HTML character references before URL parsing, but
-        # URL schemes are classified before percent-decoding. Keep those stages
-        # separate so ``https%3A/...`` remains a local path subject to the same
-        # containment checks as every other bundled reference.
-        rendered = html.unescape(raw)
+        # HTMLParser has already resolved character references in raw HTML
+        # attributes. Markdown destinations still need exactly one decode before
+        # URL parsing. URL schemes are classified before percent-decoding so
+        # ``https%3A/...`` remains a local path subject to containment checks.
+        rendered = raw if character_references_decoded else html.unescape(raw)
         try:
             split = urlsplit(rendered)
         except ValueError as exc:

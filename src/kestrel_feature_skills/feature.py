@@ -846,6 +846,8 @@ class ProceduralSkillsFeature(Feature):
         disabled_state: SkillState | None = None
         state_was_persisted = False
         prior_local_identity = store.local_entry_identity(name)
+        if prior_local_identity is not None:
+            raise SkillConflictError(f"skill already exists: {name}")
         if not enablement.available:
             if not preserve_fail_closed:
                 self._retain_fail_closed_state(
@@ -1765,6 +1767,8 @@ class ProceduralSkillsFeature(Feature):
         disabled_state: SkillState | None = None
         state_was_persisted = False
         prior_local_identity = store.local_entry_identity(skill_name)
+        if prior_local_identity is not None:
+            raise SkillConflictError(f"skill already exists: {skill_name}")
         if not enablement.available:
             if not preserve_fail_closed:
                 self._retain_fail_closed_state(
