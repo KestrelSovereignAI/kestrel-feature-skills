@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
@@ -496,9 +497,11 @@ def _reference_definition_from_lines(
     lines: list[str],
     quote_depth: int,
     list_levels: list[tuple[int, int]],
+    claim_scan_work: Callable[[int], None],
 ) -> tuple[re.Match[str] | None, tuple[int, ...]]:
     """Resolve a bounded CommonMark reference definition across source lines."""
 
+    claim_scan_work(max(1, len(content)) * 2)
     match = _MARKDOWN_REFERENCE_DEFINITION.match(content)
     if match is not None:
         return match, ()
@@ -507,6 +510,9 @@ def _reference_definition_from_lines(
 
     candidate = content
     continuation_lines: list[int] = []
+    definition_started = (
+        _MARKDOWN_REFERENCE_DEFINITION_START.match(candidate) is not None
+    )
     # CommonMark caps labels at 999 characters. The extra allowance covers the
     # opening indentation, brackets, colon, and one bounded destination line.
     limit = 999 + MAX_RESOURCE_PATH_BYTES
@@ -519,17 +525,28 @@ def _reference_definition_from_lines(
         if continuation is None or not continuation.strip():
             break
         continuation_lines.append(continuation_index)
-        if _MARKDOWN_REFERENCE_DEFINITION_START.match(candidate) is not None:
+        if definition_started:
             # CommonMark accepts arbitrary additional indentation when the
             # destination starts on the line after a complete ``[label]:``.
             continuation = continuation.lstrip(" \t")
+        claim_scan_work(len(continuation) + 1)
         candidate = f"{candidate}\n{continuation}"
-        match = _MARKDOWN_REFERENCE_DEFINITION.match(candidate)
-        if match is not None:
-            return match, tuple(continuation_lines)
+        # A definition cannot become complete before a literal closing ``]:``
+        # appears. Avoid rerunning the bounded-but-nonconstant regex against a
+        # growing candidate for every line of an incomplete label.
+        if definition_started or "]:" in continuation:
+            claim_scan_work(len(candidate))
+            match = _MARKDOWN_REFERENCE_DEFINITION.match(candidate)
+            if match is not None:
+                return match, tuple(continuation_lines)
         if len(candidate) > limit:
             break
-        if _MARKDOWN_REFERENCE_DEFINITION_START.match(candidate) is not None:
+        if not definition_started and "]:" in continuation:
+            claim_scan_work(len(candidate))
+            definition_started = (
+                _MARKDOWN_REFERENCE_DEFINITION_START.match(candidate) is not None
+            )
+        if definition_started:
             # Once the label and colon are complete, only one destination line
             # can remain in a CommonMark reference definition.
             continue
@@ -573,6 +590,17 @@ def _analyze_markdown(
     reference_continuation_lines: set[int] = set()
     html_blocks: list[list[str]] = []
     lines = body.splitlines(keepends=True)
+    reference_scan_work = 0
+    max_reference_scan_work = max(8192, len(body) * 8)
+
+    def claim_reference_scan_work(amount: int) -> None:
+        nonlocal reference_scan_work
+        reference_scan_work += amount
+        if reference_scan_work > max_reference_scan_work:
+            raise SkillFormatError(
+                "reference definition structure exceeds validation complexity limit"
+            )
+
     for line_index, line in enumerate(lines):
         raw_content = line.rstrip("\r\n")
         ending = line[len(raw_content) :]
@@ -808,6 +836,7 @@ def _analyze_markdown(
                             lines=lines,
                             quote_depth=quote_depth,
                             list_levels=retained_levels,
+                            claim_scan_work=claim_reference_scan_work,
                         )
                     )
                     reference_continuation_lines.update(continuation_indexes)

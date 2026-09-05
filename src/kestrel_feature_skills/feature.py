@@ -958,7 +958,9 @@ class ProceduralSkillsFeature(Feature):
     ) -> dict[str, object]:
         store, _ = self._require_services()
         name = validate_skill_name(name)
-        cached = SkillStore.get(self._snapshot, name)
+        cached = (
+            SkillStore.get(self._snapshot, name) if expected_revision is None else None
+        )
         async with self._publication_state_claim(store, name):
             await self._refresh_locked()
             record = self._snapshot.by_name().get(name)
@@ -967,7 +969,7 @@ class ProceduralSkillsFeature(Feature):
                     f"skill {name!r} changed or became invalid before editing; "
                     "reload and repair its folder"
                 )
-            if (
+            if cached is not None and (
                 not _same_resolved_folder(cached, record)
                 or cached.revision != record.revision
             ):

@@ -758,6 +758,18 @@ def test_reference_definition_after_blank_list_item_is_validated(tmp_path, blank
         validate_skill_folder(folder, source_root=tmp_path)
 
 
+def test_incomplete_multiline_reference_prefixes_have_bounded_work(tmp_path):
+    value = SkillDocument(
+        "bounded-reference-prefixes",
+        "Bounded reference prefixes",
+        ("[\n---\n" * 200)[:1000],
+    )
+    folder = write_skill(tmp_path, value)
+
+    with pytest.raises(SkillFormatError, match="validation complexity limit"):
+        validate_skill_folder(folder, source_root=tmp_path)
+
+
 def test_link_example_inside_indented_code_block_is_literal(tmp_path):
     value = SkillDocument(
         "indented-code",

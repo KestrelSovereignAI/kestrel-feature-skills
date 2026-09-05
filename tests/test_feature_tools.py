@@ -2098,6 +2098,88 @@ async def test_edit_rejects_stale_git_local_record_when_host_source_wins(
 
 
 @pytest.mark.asyncio
+async def test_revision_guarded_edit_accepts_skill_published_by_another_instance(
+    feature,
+):
+    editor = ProceduralSkillsFeature(feature.agent)
+    await editor.initialize()
+    try:
+        created = await feature.create_skill(
+            name="cross-instance-new",
+            description="Published after the other instance initialized",
+            body="Original body.",
+        )
+
+        edited = await editor.edit_skill(
+            name="cross-instance-new",
+            relative_path="SKILL.md",
+            content=serialize_skill_markdown(
+                SkillDocument(
+                    "cross-instance-new",
+                    "Edited through the refreshed revision",
+                    "Edited body.",
+                )
+            ),
+            expected_revision=created["revision"],
+        )
+
+        assert edited["revision"] != created["revision"]
+        assert (
+            editor.snapshot.by_name()["cross-instance-new"].document.description
+            == "Edited through the refreshed revision"
+        )
+    finally:
+        await editor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_revision_guarded_edit_accepts_new_revision_from_another_instance(
+    feature,
+):
+    created = await feature.create_skill(
+        name="cross-instance-update",
+        description="Original description",
+        body="Original body.",
+    )
+    editor = ProceduralSkillsFeature(feature.agent)
+    await editor.initialize()
+    try:
+        updated = await feature.edit_skill(
+            name="cross-instance-update",
+            relative_path="SKILL.md",
+            content=serialize_skill_markdown(
+                SkillDocument(
+                    "cross-instance-update",
+                    "Updated by the first instance",
+                    "First update.",
+                )
+            ),
+            expected_revision=created["revision"],
+        )
+
+        edited = await editor.edit_skill(
+            name="cross-instance-update",
+            relative_path="SKILL.md",
+            content=serialize_skill_markdown(
+                SkillDocument(
+                    "cross-instance-update",
+                    "Edited by the stale instance",
+                    "Second update.",
+                )
+            ),
+            expected_revision=updated["revision"],
+        )
+
+        assert edited["revision"] != updated["revision"]
+        assert (
+            editor.snapshot.by_name()["cross-instance-update"].document.description
+            == "Edited by the stale instance"
+        )
+    finally:
+        await editor.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_edit_reports_cached_skill_that_became_invalid(feature):
     name = "invalid-before-edit"
     await feature.create_skill(

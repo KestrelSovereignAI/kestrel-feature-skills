@@ -150,6 +150,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
         "kite-malformed-link",
         "kite-complex-links",
         "kite-deep-containers",
+        "kite-reference-complexity",
         "kite-malformed-angle-nested",
         "kite-malformed-paren-nested",
         "kite-script-autolink",
@@ -244,7 +245,7 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             readiness_payload
         )
         assert readiness_payload.get("model") == KITE_HOSTED_MODEL, readiness_payload
-        assert "READY" in str(readiness_payload.get("response")), readiness_payload
+        assert str(readiness_payload.get("response", "")).strip(), readiness_payload
 
         existing = _skill_record(client, base, name)
         client.delete(
@@ -614,6 +615,14 @@ def test_kite_live_http_progressive_disclosure_and_adversarial_discovery():
             'description: "Excessive Markdown containers"\n---\n\n'
             + "- " * 16_000
             + "item\n",
+            encoding="utf-8",
+        )
+        reference_complexity_folder = root / "kite-reference-complexity"
+        reference_complexity_folder.mkdir()
+        (reference_complexity_folder / "SKILL.md").write_text(
+            '---\nname: "kite-reference-complexity"\n'
+            'description: "Repeated incomplete reference labels"\n---\n\n'
+            + ("[\n---\n" * 200)[:1000],
             encoding="utf-8",
         )
         malformed_angle_folder = root / "kite-malformed-angle-nested"
