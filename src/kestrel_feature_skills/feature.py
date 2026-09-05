@@ -1709,16 +1709,19 @@ class ProceduralSkillsFeature(Feature):
         payloads: dict[str, str] = {}
         for node in nodes:
             properties = getattr(node, "properties", None)
-            if not self._valid_index_created_at(properties):
-                # Force one CAS repair for legacy nodes written before the
-                # scoped privacy purge's timestamp contract was enforced.
-                continue
             name = properties.get("name") if isinstance(properties, dict) else None
             try:
                 name = validate_skill_name(name)
             except SkillError:
                 continue
             if getattr(node, "node_id", None) == self._node_id(name):
+                if not self._valid_index_created_at(properties):
+                    # Retain the validated ownership key while forcing a
+                    # mismatch. A live legacy row is repaired below; a stale
+                    # row whose folder disappeared is routed through guarded
+                    # deletion instead of surviving every restart.
+                    payloads[name] = ""
+                    continue
                 try:
                     payloads[name] = self._index_payload(node)
                 except (AttributeError, TypeError, ValueError):

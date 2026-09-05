@@ -824,6 +824,26 @@ async def test_graph_index_preserves_created_at_and_repairs_legacy_untimed_node(
 
 
 @pytest.mark.asyncio
+async def test_initialize_removes_legacy_untimed_stale_index(feature):
+    name = "untimed-restart-stale"
+    await feature.skill_create(name, "Untimed stale graph index", "body")
+    node_id = feature._node_id(name)
+    feature.agent.storage.nodes[node_id].properties.pop("created_at")
+    folder = feature.agent.procedural_skills_root / name
+    for path in folder.iterdir():
+        path.unlink()
+    folder.rmdir()
+
+    replacement = ProceduralSkillsFeature(feature.agent)
+    await replacement.initialize()
+    try:
+        assert node_id not in feature.agent.storage.nodes
+        assert node_id in feature.agent.storage.deleted
+    finally:
+        await replacement.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_indexing_preserves_non_skill_node_at_deterministic_id(feature):
     name = "graph-id-collision"
     node_id = feature._node_id(name)

@@ -370,7 +370,14 @@ function renderSkillControls(skill) {
   priority.value = String(skill.priority);
   priority.setAttribute('aria-label', 'Skill priority');
   priority.dataset.stateControl = 'true';
-  const savePriority = button('Set priority', () => setEnabled(skill, skill.enabled, Number(priority.value)));
+  const savePriority = button('Set priority', () => {
+    const value = priority.value.trim();
+    if (!value) {
+      setStatus('Priority is required.', true);
+      return;
+    }
+    void setEnabled(skill, skill.enabled, Number(value));
+  });
   savePriority.dataset.stateControl = 'true';
   const remove = button('Delete', () => confirmDelete(skill), 'skills-button skills-danger');
   remove.disabled = !skill.deletable;

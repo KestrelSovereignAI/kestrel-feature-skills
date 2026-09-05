@@ -538,6 +538,17 @@ test.describe.serial('procedural skills contributed console', () => {
     expect(payload.context.included).not.toContain(SKILL_NAME);
   });
 
+  test('blank priority is rejected without changing persisted state', async ({ page, request }) => {
+    await patchState(request, SKILL_NAME, { enabled: false, priority: 29 });
+    await openPanel(page);
+    await page.getByRole('button', { name: SKILL_NAME }).click();
+    await page.getByLabel('Skill priority').fill('');
+    await page.getByRole('button', { name: 'Set priority' }).click();
+    await expect(page.locator('[role="status"]')).toContainText('Priority is required');
+    const skill = await catalogSkill(request, SKILL_NAME);
+    expect(skill.priority).toBe(29);
+  });
+
   test('discover reload finds a new folder without restarting', async ({ page }) => {
     const root = process.env.KESTREL_KITE_SKILLS_ROOT;
     test.skip(!root, 'KESTREL_KITE_SKILLS_ROOT is required for filesystem discovery');

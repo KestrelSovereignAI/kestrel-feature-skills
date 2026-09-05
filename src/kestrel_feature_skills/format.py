@@ -1294,6 +1294,14 @@ def _read_regular_file_at(directory_fd: int, name: str, *, max_bytes: int) -> by
             before.st_ino,
         ):
             raise SkillPathError(f"skill resources must be regular files: {name}")
+        opened_snapshot = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
         payload = bytearray()
         while len(payload) <= max_bytes:
             chunk = os.read(descriptor, min(65_536, max_bytes + 1 - len(payload)))
@@ -1303,7 +1311,14 @@ def _read_regular_file_at(directory_fd: int, name: str, *, max_bytes: int) -> by
         if len(payload) > max_bytes:
             raise SkillFormatError(f"{name} exceeds {max_bytes} bytes")
         after = os.fstat(descriptor)
-        if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) != opened_snapshot:
             raise SkillPathError(f"skill resource changed during validation: {name}")
         return bytes(payload)
     finally:

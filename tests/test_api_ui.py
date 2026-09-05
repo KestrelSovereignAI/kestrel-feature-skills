@@ -112,6 +112,36 @@ async def test_edit_api_maps_concurrent_writer_conflict_to_409(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path, method_name, params",
+    (
+        ("/api/procedural-skills/conflicted/tree", "tree", None),
+        (
+            "/api/procedural-skills/conflicted/file",
+            "read_file",
+            {"path": "SKILL.md"},
+        ),
+    ),
+)
+async def test_read_api_maps_catalog_snapshot_conflict_to_409(
+    app, feature, monkeypatch, path, method_name, params
+):
+    def conflict(**_kwargs):
+        raise SkillConflictError("skill changed while its snapshot was captured")
+
+    monkeypatch.setattr(feature, method_name, conflict)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as isolated_client:
+        response = await isolated_client.get(path, params=params)
+
+    assert response.status_code == 409
+    assert "changed while its snapshot" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("priority", (True, 1.5, "1"))
 async def test_create_api_rejects_non_integer_priority_before_writing(
     priority, client, feature

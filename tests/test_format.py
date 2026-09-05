@@ -1084,6 +1084,44 @@ def test_regular_file_reader_uses_nonblocking_open_across_fifo_swap(
     assert "regular file" in str(errors[0])
 
 
+def test_regular_file_reader_rejects_in_place_rewrite_during_capture(
+    tmp_path, monkeypatch
+):
+    resource = tmp_path / "resource"
+    original = b"A" * 70_000
+    replacement = b"B" * len(original)
+    resource.write_bytes(original)
+    directory_fd = os.open(
+        tmp_path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    real_read = format_module.os.read
+    rewrote = False
+
+    def rewrite_after_first_chunk(descriptor, size):
+        nonlocal rewrote
+        chunk = real_read(descriptor, size)
+        if chunk and not rewrote:
+            with resource.open("r+b", buffering=0) as stream:
+                stream.write(replacement)
+                os.fsync(stream.fileno())
+            rewrote = True
+        return chunk
+
+    monkeypatch.setattr(format_module.os, "read", rewrite_after_first_chunk)
+    try:
+        with pytest.raises(SkillPathError, match="changed during validation"):
+            format_module._read_regular_file_at(
+                directory_fd,
+                resource.name,
+                max_bytes=len(original),
+            )
+    finally:
+        os.close(directory_fd)
+
+    assert rewrote
+
+
 def test_escaped_angle_destination_terminator_is_part_of_path(tmp_path):
     value = SkillDocument(
         "escaped-angle", "Escaped angle destination", r"[notes](<foo\>bar.md>)"
