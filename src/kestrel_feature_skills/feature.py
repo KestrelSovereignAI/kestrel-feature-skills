@@ -1081,28 +1081,35 @@ class ProceduralSkillsFeature(Feature):
         try:
             store.assert_current(record)
         except BaseException as consistency_error:
-            try:
-                if previous_state_present:
-                    await enablement.set(
-                        name,
-                        enabled=previous_state.enabled,
-                        priority=previous_state.priority,
-                    )
-                    self._states[name] = previous_state
-                else:
-                    await enablement.delete(name)
-                    self._states.pop(name, None)
-            except DatabaseError as rollback_error:
-                consistency_error.add_note(
-                    "state rollback after a concurrent skill-folder change failed: "
-                    f"{rollback_error}"
-                )
-                self._enablement_error = str(rollback_error)
-            await self._refresh_locked()
+            await self._rollback_state_after_consistency_error(
+                enablement=enablement,
+                name=name,
+                previous_state=(previous_state if previous_state_present else None),
+                consistency_error=consistency_error,
+            )
             raise
         self._states[name] = state
         await self._refresh_locked()
-        refreshed = SkillStore.get(self._snapshot, name)
+        try:
+            refreshed = SkillStore.get(self._snapshot, name)
+            if not _same_resolved_folder(record, refreshed):
+                raise SkillConflictError(
+                    f"resolved source changed after changing state for {name}; "
+                    "reload and retry"
+                )
+            # The final refresh awaits database and catalog work. Revalidate
+            # the original filesystem snapshot after that await so an edit or
+            # removal during the refresh cannot leave the requested state on a
+            # different or future same-named generation.
+            store.assert_current(record)
+        except BaseException as consistency_error:
+            await self._rollback_state_after_consistency_error(
+                enablement=enablement,
+                name=name,
+                previous_state=(previous_state if previous_state_present else None),
+                consistency_error=consistency_error,
+            )
+            raise
         return {
             "name": name,
             "enabled": refreshed.state.enabled,
@@ -1111,6 +1118,31 @@ class ProceduralSkillsFeature(Feature):
             "context_bytes": len(self._context_render.text.encode("utf-8")),
             "revision": refreshed.revision,
         }
+
+    async def _rollback_state_after_consistency_error(
+        self,
+        *,
+        enablement: SkillEnablementStore,
+        name: str,
+        previous_state: SkillState | None,
+        consistency_error: BaseException,
+    ) -> None:
+        """Restore the prior row and refresh after a generation race."""
+
+        try:
+            await self._restore_enablement_after_publication_failure(
+                enablement,
+                name,
+                previous_state,
+                consistency_error,
+                operation="skill state update",
+            )
+        except DatabaseError as rollback_error:
+            consistency_error.add_note(
+                "state rollback after a concurrent skill-folder change failed: "
+                f"{rollback_error}"
+            )
+        await self._refresh_locked()
 
     async def delete_skill(
         self,
@@ -1908,13 +1940,25 @@ class ProceduralSkillsFeature(Feature):
 
     @tool(
         "skill_delete",
-        "Permanently delete a local procedural skill and its secondary index",
+        "Permanently delete the exact local skill generation identified by a "
+        "delete_revision from skill_list or skill_search",
         category=ToolCategory.UTILITY,
         command_prefix="!skill delete",
     )
-    async def skill_delete(self, name: str) -> ToolResult:
+    async def skill_delete(self, name: str, delete_revision: str) -> ToolResult:
+        """Delete one approved skill generation.
+
+        Args:
+            name: Name of the local skill to delete.
+            delete_revision: Exact deletion token returned by skill_list or
+                skill_search before approval was requested.
+        """
+
         try:
-            payload = await self.delete_skill(name=name)
+            payload = await self.delete_skill(
+                name=name,
+                expected_revision=delete_revision,
+            )
         except (SkillError, OSError, DatabaseError, RuntimeError) as exc:
             return ToolResult.failed(str(exc))
         errors = payload["errors"]

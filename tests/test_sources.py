@@ -775,6 +775,81 @@ def test_git_source_rejects_ambiguous_branch_and_annotated_tag(monkeypatch):
         )
 
 
+def test_git_checkout_rejects_ambiguous_shorthand_before_clone(tmp_path, monkeypatch):
+    branch_commit = "a" * 40
+    tag_object = "b" * 40
+    tag_commit = "c" * 40
+    commands = []
+
+    def fake_git(argv, **_kwargs):
+        commands.append(argv)
+        if argv[0] == "ls-remote":
+            return (
+                f"{branch_commit}\trefs/heads/main\n"
+                f"{tag_object}\trefs/tags/main\n"
+                f"{tag_commit}\trefs/tags/main^{{}}"
+            )
+        pytest.fail("checkout cloned before resolving the ambiguous ref")
+
+    monkeypatch.setattr(git_source_module, "_run_git", fake_git)
+
+    with pytest.raises(GitSourceError, match="one reference"):
+        GitSkillSource().checkout(
+            url="https://example.com/skills.git",
+            ref="main",
+            skill_name="remote",
+            target=tmp_path / "checkout",
+        )
+
+    assert commands == [
+        [
+            "ls-remote",
+            "--exit-code",
+            "--",
+            "https://example.com/skills.git",
+            "main",
+            "main^{}",
+        ]
+    ]
+
+
+def test_git_checkout_rejects_a_named_ref_that_moves_after_resolution(
+    tmp_path, monkeypatch
+):
+    resolved_revision = "a" * 40
+    moved_revision = "b" * 40
+    target = tmp_path / "checkout"
+    commands = []
+
+    def fake_git(argv, **_kwargs):
+        commands.append(argv)
+        if argv[0] == "ls-remote":
+            return f"{resolved_revision}\trefs/heads/main"
+        if argv[0] == "clone":
+            make_skill(target / "skills", "remote", "Moved remote")
+            return ""
+        if "ls-tree" in argv:
+            return f"100644 blob {'c' * 40} 128\tskills/remote/SKILL.md\x00"
+        if "rev-parse" in argv:
+            return moved_revision
+        return ""
+
+    monkeypatch.setattr(git_source_module, "_run_git", fake_git)
+
+    with pytest.raises(GitSourceError, match="requested commit"):
+        GitSkillSource().checkout(
+            url="https://example.com/skills.git",
+            ref="main",
+            skill_name="remote",
+            target=target,
+        )
+
+    clone = next(command for command in commands if command[0] == "clone")
+    fetch = next(command for command in commands if "fetch" in command)
+    assert "--branch" not in clone
+    assert fetch[-1] == "refs/heads/main"
+
+
 def test_git_source_treats_full_object_ref_as_immutable(monkeypatch):
     revision = "a" * 40
 
@@ -969,6 +1044,8 @@ def test_git_checkout_rejects_oversized_sparse_blob_before_materialization(
 
     def fake_git(argv, **_kwargs):
         commands.append(argv)
+        if argv[0] == "ls-remote":
+            return f"{'b' * 40}\trefs/heads/main"
         if "ls-tree" in argv:
             return (
                 "100644 blob "
@@ -999,6 +1076,8 @@ def test_git_checkout_rejects_submodule_before_materialization(tmp_path, monkeyp
 
     def fake_git(argv, **_kwargs):
         commands.append(argv)
+        if argv[0] == "ls-remote":
+            return f"{'b' * 40}\trefs/heads/main"
         if "ls-tree" in argv:
             return f"160000 commit {'a' * 40} -\tremote/nested\x00"
         return ""
@@ -1282,6 +1361,59 @@ def test_git_checkout_materializes_only_the_requested_folder(
     assert len(checkout.revision) == (40 if object_format == "sha1" else 64)
     assert (checkout.skill_folder / "SKILL.md").is_file()
     assert not (target / "unrelated").exists()
+
+
+def test_git_checkout_materializes_a_fully_qualified_branch_ref(tmp_path, monkeypatch):
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git_source_module._run_git(["init", "--initial-branch=main", str(origin)])
+    git_source_module._run_git(
+        ["-C", str(origin), "config", "uploadpack.allowFilter", "true"]
+    )
+    make_skill(origin / "skills", "remote", "Qualified branch")
+    git_source_module._run_git(["-C", str(origin), "add", "."])
+    git_source_module._run_git(
+        [
+            "-C",
+            str(origin),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "fixture",
+        ]
+    )
+    source_url = origin.as_uri()
+    monkeypatch.setattr(
+        git_source_module, "validate_remote_url", lambda _url: source_url
+    )
+    monkeypatch.setattr(
+        git_source_module,
+        "_GIT_CONFIG_PREFIX",
+        (
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.https.allow=never",
+            "-c",
+            "protocol.file.allow=always",
+        ),
+    )
+
+    checkout = GitSkillSource().checkout(
+        url=source_url,
+        ref="refs/heads/main",
+        skill_name="remote",
+        target=tmp_path / "checkout-qualified",
+    )
+
+    assert checkout.ref == "refs/heads/main"
+    assert checkout.skill_folder.name == "remote"
+    assert "Qualified branch" in (checkout.skill_folder / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
 
 
 @pytest.mark.parametrize("object_format", ("sha1", "sha256"))

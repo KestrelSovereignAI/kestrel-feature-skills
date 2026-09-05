@@ -78,7 +78,10 @@ The package declares permission defaults through the SDK contribution contract:
 | `skill_delete`, `skill_install` | `ALWAYS_ASK` |
 
 The feature default is `ASK`. The Console also requires a distinct destructive
-confirmation before its authenticated operator delete route is called.
+confirmation before its authenticated operator delete route is called. Agent
+tool deletion requires the target's `delete_revision` from `skill_list` or
+`skill_search`, binding an `ALWAYS_ASK` approval to the exact observed skill
+generation.
 
 ## Storage authority
 

@@ -371,6 +371,13 @@ class GitSkillSource:
         if target.exists():
             raise GitSourceError("git checkout target already exists")
         object_id_ref = is_full_object_id(ref)
+        resolved_reference: str | None = None
+        resolved_revision: str | None = ref if object_id_ref else None
+        if ref != "HEAD" and not object_id_ref:
+            resolved_reference, resolved_revision = self._resolve_remote_ref(
+                url=url,
+                ref=ref,
+            )
         clone = [
             "clone",
             "--depth",
@@ -379,8 +386,6 @@ class GitSkillSource:
             "--sparse",
             "--no-checkout",
         ]
-        if ref != "HEAD" and not object_id_ref:
-            clone.extend(["--branch", ref, "--single-branch"])
         clone.extend(["--", url, str(target)])
         _run_git(
             clone,
@@ -390,7 +395,7 @@ class GitSkillSource:
             cancel_event=cancel_event,
         )
         checkout_revision = "HEAD"
-        if object_id_ref:
+        if object_id_ref or resolved_reference is not None:
             _run_git(
                 [
                     "-C",
@@ -401,7 +406,7 @@ class GitSkillSource:
                     "--no-tags",
                     "--",
                     "origin",
-                    ref,
+                    ref if object_id_ref else resolved_reference,
                 ],
                 size_limit_root=target,
                 max_bytes=MAX_GIT_TRANSFER_BYTES,
@@ -461,7 +466,7 @@ class GitSkillSource:
             and len(revision) != listing_object_id_length
         ):
             raise GitSourceError("git checkout returned an invalid commit identity")
-        if object_id_ref and revision != ref:
+        if resolved_revision is not None and revision != resolved_revision:
             raise GitSourceError("git checkout did not resolve the requested commit")
         candidates = (target / "skills" / skill_name, target / skill_name)
         folder = next(
@@ -480,11 +485,9 @@ class GitSkillSource:
             ref=ref,
         )
 
-    def remote_revision(self, *, url: str, ref: str) -> str:
-        url = validate_remote_url(url)
-        ref = validate_ref(ref)
-        if is_full_object_id(ref):
-            return ref
+    def _resolve_remote_ref(self, *, url: str, ref: str) -> tuple[str, str]:
+        """Resolve one validated ref to its canonical remote name and commit."""
+
         output = _run_git(
             ["ls-remote", "--exit-code", "--", url, ref, f"{ref}^{{}}"],
             timeout=60,
@@ -519,7 +522,15 @@ class GitSkillSource:
         if len(set(direct)) != 1 or len(set(peeled)) > 1:
             raise GitSourceError(f"remote ref {ref!r} did not resolve to one commit")
         revisions = peeled or direct
-        return revisions[0]
+        return base_reference, revisions[0]
+
+    def remote_revision(self, *, url: str, ref: str) -> str:
+        url = validate_remote_url(url)
+        ref = validate_ref(ref)
+        if is_full_object_id(ref):
+            return ref
+        _resolved_reference, revision = self._resolve_remote_ref(url=url, ref=ref)
+        return revision
 
     def has_changed(self, *, url: str, ref: str, installed_revision: str) -> bool:
         if not is_full_object_id(installed_revision):

@@ -22,6 +22,7 @@ from kestrel_feature_skills.errors import (
     SkillConflictError,
     SkillFormatError,
     SkillNotFoundError,
+    SkillPathError,
 )
 from kestrel_feature_skills.feature import PROCEDURAL_SKILL_NODE_TYPE
 from kestrel_feature_skills.format import serialize_skill_markdown
@@ -47,6 +48,17 @@ EXPECTED_TOOLS = {
     "skill_delete",
     "skill_install",
 }
+
+
+def delete_revision(feature, name: str) -> str:
+    """Return the revision token exposed for a deletable local generation."""
+
+    record = next(
+        item for item in feature.catalog_payload()["skills"] if item["name"] == name
+    )
+    revision = record["delete_revision"]
+    assert isinstance(revision, str)
+    return revision
 
 
 @pytest.mark.asyncio
@@ -453,7 +465,7 @@ async def test_transition_to_volatile_mode_blocks_every_persistent_mutation(
             ),
         ),
         feature.skill_disable("private-guard"),
-        feature.skill_delete("private-guard"),
+        feature.skill_delete("private-guard", "0" * 64),
         feature.skill_create("new-private", "New private", "body"),
         feature.skill_install(
             "https://example.com/skills.git", "remote-private", "main"
@@ -588,8 +600,16 @@ async def test_privacy_transition_waits_for_in_flight_persistent_mutation(
 
 
 def test_feature_exposes_exact_tool_and_permission_contract(feature):
-    tools = {tool.name for tool in feature.get_tools()}
-    assert tools == EXPECTED_TOOLS
+    tools = {tool.name: tool for tool in feature.get_tools()}
+    assert set(tools) == EXPECTED_TOOLS
+    delete_parameters = {
+        parameter.name: parameter
+        for parameter in tools["skill_delete"].schema.parameters
+    }
+    assert delete_parameters["delete_revision"].required is True
+    assert (
+        "skill_list or skill_search" in delete_parameters["delete_revision"].description
+    )
     permissions = feature.get_feature_permission_defaults()
     assert permissions.feature_default is PermissionLevel.ASK
     assert set(permissions.tool_overrides) == EXPECTED_TOOLS
@@ -742,6 +762,123 @@ async def test_state_change_rolls_back_when_folder_changes_during_persistence(
     assert (await feature._enablement.load())[name] == SkillState(False, 100)
     assert feature.snapshot.by_name()[name].state == SkillState(False, 100)
     assert (folder / "SKILL.md").read_text(encoding="utf-8") == external
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ("replace", "remove"))
+async def test_state_change_rolls_back_when_folder_changes_during_final_refresh(
+    feature, monkeypatch, mutation
+):
+    name = f"state-final-refresh-{mutation}"
+    await feature.skill_create(name, "Original", "Original procedure.")
+    record = feature.snapshot.by_name()[name]
+    folder = feature.agent.procedural_skills_root / name
+    replacement = serialize_skill_markdown(
+        SkillDocument(name, "Replacement", "Replacement procedure.")
+    )
+    real_refresh = feature._refresh_locked
+    refresh_count = 0
+
+    async def refresh_then_mutate():
+        nonlocal refresh_count
+        await real_refresh()
+        refresh_count += 1
+        if refresh_count != 3:
+            return
+        if mutation == "replace":
+            (folder / "SKILL.md").write_text(replacement, encoding="utf-8")
+        else:
+            (folder / "SKILL.md").unlink()
+            folder.rmdir()
+
+    monkeypatch.setattr(feature, "_refresh_locked", refresh_then_mutate)
+
+    with pytest.raises((SkillConflictError, SkillPathError), match="changed"):
+        await feature.set_skill_state(
+            name=name,
+            enabled=True,
+            priority=19,
+            expected_revision=record.revision,
+        )
+
+    assert refresh_count >= 4
+    assert (await feature._enablement.load())[name] == SkillState(False, 100)
+    if mutation == "replace":
+        assert feature.snapshot.by_name()[name].document.description == "Replacement"
+        assert feature.snapshot.by_name()[name].state == SkillState(False, 100)
+    else:
+        assert name not in feature.snapshot.by_name()
+        folder.mkdir()
+        (folder / "SKILL.md").write_text(replacement, encoding="utf-8")
+        await feature.refresh()
+        assert feature.snapshot.by_name()[name].state == SkillState(False, 100)
+
+
+@pytest.mark.asyncio
+async def test_state_change_rolls_back_when_final_refresh_resolves_a_new_override(
+    feature, tmp_path, monkeypatch
+):
+    name = "state-final-refresh-override"
+    shared_root = tmp_path / "shared"
+    shared_folder = shared_root / name
+    shared_folder.mkdir(parents=True)
+    (shared_folder / "SKILL.md").write_text(
+        serialize_skill_markdown(
+            SkillDocument(name, "Shared generation", "Shared procedure.")
+        ),
+        encoding="utf-8",
+    )
+    feature._catalog = SkillCatalog(
+        (
+            DirectorySkillSource(
+                root=feature.agent.procedural_skills_root,
+                source_id="agent-local",
+                kind="agent-local",
+                precedence=AGENT_LOCAL_PRECEDENCE,
+            ),
+            DirectorySkillSource(
+                root=shared_root,
+                source_id="host-shared",
+                kind="host-shared",
+                precedence=HOST_SHARED_PRECEDENCE,
+            ),
+        )
+    )
+    await feature.refresh()
+    record = feature.snapshot.by_name()[name]
+    local_folder = feature.agent.procedural_skills_root / name
+    real_refresh = feature._refresh_locked
+    refresh_count = 0
+
+    async def publish_override_then_refresh():
+        nonlocal refresh_count
+        refresh_count += 1
+        if refresh_count == 3:
+            local_folder.mkdir()
+            (local_folder / "SKILL.md").write_text(
+                serialize_skill_markdown(
+                    SkillDocument(name, "Local replacement", "Local procedure.")
+                ),
+                encoding="utf-8",
+            )
+        await real_refresh()
+
+    monkeypatch.setattr(feature, "_refresh_locked", publish_override_then_refresh)
+
+    with pytest.raises(SkillConflictError, match="resolved source changed"):
+        await feature.set_skill_state(
+            name=name,
+            enabled=True,
+            priority=19,
+            expected_revision=record.revision,
+        )
+
+    assert refresh_count >= 4
+    assert name not in await feature._enablement.load()
+    replacement = feature.snapshot.by_name()[name]
+    assert replacement.source_kind == "agent-local"
+    assert replacement.document.description == "Local replacement"
+    assert replacement.state == SkillState(False, 100)
 
 
 @pytest.mark.asyncio
@@ -1767,12 +1904,13 @@ async def test_delete_reports_partial_after_authoritative_folder_removal(
 ):
     await feature.skill_create("partial-delete", "Partial delete", "body")
     folder = feature.agent.procedural_skills_root / "partial-delete"
+    approved_revision = delete_revision(feature, "partial-delete")
 
     async def fail(_node_id, **_kwargs):
         raise UnexpectedGraphError("graph unavailable")
 
     monkeypatch.setattr(feature.agent.storage, "compare_and_delete_node", fail)
-    result = await feature.skill_delete("partial-delete")
+    result = await feature.skill_delete("partial-delete", approved_revision)
 
     assert result.status is ToolResultStatus.PARTIAL
     assert not folder.exists()
@@ -1782,11 +1920,32 @@ async def test_delete_reports_partial_after_authoritative_folder_removal(
 
 
 @pytest.mark.asyncio
+async def test_delete_tool_rejects_a_replacement_created_after_approval(feature):
+    name = "tool-stale-delete"
+    await feature.skill_create(name, "Approved generation", "Approved procedure.")
+    approved_revision = delete_revision(feature, name)
+    await feature.delete_skill(name=name, expected_revision=approved_revision)
+    await feature.skill_create(name, "Replacement generation", "Keep this procedure.")
+
+    result = await feature.skill_delete(
+        name,
+        delete_revision=approved_revision,
+    )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "changed before deletion" in result.error
+    assert feature.snapshot.by_name()[name].document.description == (
+        "Replacement generation"
+    )
+
+
+@pytest.mark.asyncio
 async def test_delete_reconciles_graph_cleanup_completed_by_final_refresh(
     feature, monkeypatch
 ):
     name = "refresh-reconciled-graph-delete"
     await feature.skill_create(name, "Refresh reconciled graph delete", "body")
+    approved_revision = delete_revision(feature, name)
     node_id = feature._node_id(name)
     original_delete = feature.agent.storage.compare_and_delete_node
     attempts = 0
@@ -1804,7 +1963,7 @@ async def test_delete_reconciles_graph_cleanup_completed_by_final_refresh(
         fail_once_then_delete,
     )
 
-    result = await feature.skill_delete(name)
+    result = await feature.skill_delete(name, approved_revision)
 
     assert attempts >= 2
     assert node_id not in feature.agent.storage.nodes
@@ -1845,6 +2004,7 @@ async def test_delete_preserves_fallback_graph_index_repaired_by_final_refresh(
         )
     )
     await feature.refresh()
+    approved_revision = delete_revision(feature, name)
     original_delete = feature.agent.storage.compare_and_delete_node
     attempts = 0
 
@@ -1861,7 +2021,7 @@ async def test_delete_preserves_fallback_graph_index_repaired_by_final_refresh(
         fail_once_then_delete,
     )
 
-    result = await feature.skill_delete(name)
+    result = await feature.skill_delete(name, approved_revision)
 
     fallback = feature.snapshot.by_name()[name]
     node = feature.agent.storage.nodes[feature._node_id(name)]
@@ -1886,8 +2046,9 @@ async def test_delete_preserves_different_label_at_skill_index_id(feature):
         properties={"name": name, "sentinel": "must survive"},
     )
     feature.agent.storage.nodes[node_id] = collision
+    approved_revision = delete_revision(feature, name)
 
-    result = await feature.skill_delete(name)
+    result = await feature.skill_delete(name, approved_revision)
 
     assert result.status is ToolResultStatus.OK
     assert result.data["graph_deleted"] is True
@@ -1927,8 +2088,9 @@ async def test_delete_does_not_remove_racing_identity_replacement(feature, monke
         "compare_and_delete_node",
         race_conditional_delete,
     )
+    approved_revision = delete_revision(feature, name)
 
-    result = await feature.skill_delete(name)
+    result = await feature.skill_delete(name, approved_revision)
 
     assert result.status is ToolResultStatus.OK
     assert result.data["graph_deleted"] is True
@@ -1950,8 +2112,9 @@ async def test_delete_reconciles_enablement_cleanup_that_committed_before_error(
         raise DatabaseError("connection lost after delete commit")
 
     monkeypatch.setattr(feature._enablement, "delete", commit_then_disconnect)
+    approved_revision = delete_revision(feature, name)
 
-    result = await feature.skill_delete(name)
+    result = await feature.skill_delete(name, approved_revision)
 
     assert result.status is ToolResultStatus.OK
     assert result.data["config_deleted"] is True
@@ -1985,8 +2148,9 @@ async def test_delete_uses_final_refresh_to_reconcile_ambiguous_cleanup(
 
     monkeypatch.setattr(feature._enablement, "delete", commit_then_disconnect)
     monkeypatch.setattr(feature._enablement, "load", fail_first_post_commit_load)
+    approved_revision = delete_revision(feature, name)
 
-    result = await feature.skill_delete(name)
+    result = await feature.skill_delete(name, approved_revision)
 
     assert refused_reconciliation is True
     assert result.status is ToolResultStatus.OK
@@ -2006,8 +2170,9 @@ async def test_delete_reports_enablement_cleanup_that_failed_before_commit(
         raise DatabaseError("connection lost before delete commit")
 
     monkeypatch.setattr(feature._enablement, "delete", disconnect_before_commit)
+    approved_revision = delete_revision(feature, name)
 
-    result = await feature.skill_delete(name)
+    result = await feature.skill_delete(name, approved_revision)
 
     assert result.status is ToolResultStatus.PARTIAL
     assert result.data["config_deleted"] is False
@@ -2052,7 +2217,8 @@ async def test_delete_failure_cannot_enable_a_same_named_shared_fallback(
         raise DatabaseError("database cleanup offline")
 
     monkeypatch.setattr(feature._enablement, "delete", fail_delete)
-    result = await feature.skill_delete(name)
+    approved_revision = delete_revision(feature, name)
+    result = await feature.skill_delete(name, approved_revision)
 
     assert result.status is ToolResultStatus.PARTIAL
     fallback = feature.snapshot.by_name()[name]
@@ -2071,7 +2237,8 @@ async def test_failed_folder_removal_retains_disabled_tombstone(feature, monkeyp
         raise OSError("recursive removal failed")
 
     monkeypatch.setattr(feature._store, "delete", fail_removal)
-    result = await feature.skill_delete(name)
+    approved_revision = delete_revision(feature, name)
+    result = await feature.skill_delete(name, approved_revision)
 
     assert result.status is ToolResultStatus.ERROR
     assert (await feature._enablement.load())[name] == SkillState(False, 23)
@@ -2388,7 +2555,7 @@ async def test_delete_refuses_host_shared_skill(feature, tmp_path, monkeypatch):
     other = ProceduralSkillsFeature(feature.agent)
     await other.initialize()
     try:
-        result = await other.skill_delete("shared-only")
+        result = await other.skill_delete("shared-only", "0" * 64)
         assert result.status is ToolResultStatus.ERROR
         assert "local override" in result.error
         assert folder.is_dir()
@@ -2443,8 +2610,9 @@ async def test_delete_removes_shadowed_local_git_installation(
         assert enabled.status is ToolResultStatus.OK
         other.agent.storage.added.clear()
         other.agent.storage.deleted.clear()
+        approved_revision = delete_revision(other, name)
 
-        result = await other.skill_delete(name)
+        result = await other.skill_delete(name, approved_revision)
 
         assert result.status is ToolResultStatus.OK
         assert "host-shared source remains resolved" in result.confirmation
@@ -2504,7 +2672,8 @@ async def test_shadowed_delete_succeeds_when_host_winner_disappears(
 
     monkeypatch.setattr(other._store, "delete", delete_local_as_host_disappears)
     try:
-        result = await other.skill_delete(name)
+        approved_revision = delete_revision(other, name)
+        result = await other.skill_delete(name, approved_revision)
 
         assert result.status is ToolResultStatus.OK
         assert result.data["removed_file"] is True
