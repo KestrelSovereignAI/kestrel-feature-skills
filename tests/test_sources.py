@@ -752,6 +752,29 @@ def test_git_source_compares_annotated_tag_peeled_commit(monkeypatch):
     )
 
 
+def test_git_source_rejects_ambiguous_branch_and_annotated_tag(monkeypatch):
+    branch_commit = "a" * 40
+    tag_object = "b" * 40
+    tag_commit = "c" * 40
+
+    def fake_git(argv, *, timeout=120):
+        assert argv[:2] == ["ls-remote", "--exit-code"]
+        assert timeout == 60
+        return (
+            f"{branch_commit}\trefs/heads/main\n"
+            f"{tag_object}\trefs/tags/main\n"
+            f"{tag_commit}\trefs/tags/main^{{}}"
+        )
+
+    monkeypatch.setattr(git_source_module, "_run_git", fake_git)
+
+    with pytest.raises(GitSourceError, match="one reference"):
+        GitSkillSource().remote_revision(
+            url="https://example.com/skills.git",
+            ref="main",
+        )
+
+
 def test_git_source_treats_full_object_ref_as_immutable(monkeypatch):
     revision = "a" * 40
 

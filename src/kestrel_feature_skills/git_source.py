@@ -489,8 +489,8 @@ class GitSkillSource:
             ["ls-remote", "--exit-code", "--", url, ref, f"{ref}^{{}}"],
             timeout=60,
         )
-        direct: list[str] = []
-        peeled: list[str] = []
+        direct_by_reference: dict[str, list[str]] = {}
+        peeled_by_reference: dict[str, list[str]] = {}
         object_id_length: int | None = None
         for line in output.splitlines():
             fields = line.split()
@@ -504,10 +504,21 @@ class GitSkillSource:
                 raise GitSourceError(
                     f"remote ref {ref!r} returned mixed object formats"
                 )
-            (peeled if fields[1].endswith("^{}") else direct).append(fields[0])
-        revisions = peeled or direct
-        if len(set(revisions)) != 1:
+            is_peeled = fields[1].endswith("^{}")
+            base_reference = fields[1][:-3] if is_peeled else fields[1]
+            revisions_by_reference = (
+                peeled_by_reference if is_peeled else direct_by_reference
+            )
+            revisions_by_reference.setdefault(base_reference, []).append(fields[0])
+        base_references = direct_by_reference.keys() | peeled_by_reference.keys()
+        if len(base_references) != 1:
+            raise GitSourceError(f"remote ref {ref!r} did not resolve to one reference")
+        base_reference = next(iter(base_references))
+        direct = direct_by_reference.get(base_reference, [])
+        peeled = peeled_by_reference.get(base_reference, [])
+        if len(set(direct)) != 1 or len(set(peeled)) > 1:
             raise GitSourceError(f"remote ref {ref!r} did not resolve to one commit")
+        revisions = peeled or direct
         return revisions[0]
 
     def has_changed(self, *, url: str, ref: str, installed_revision: str) -> bool:
