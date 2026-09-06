@@ -447,7 +447,7 @@ async def test_state_endpoint_maps_fail_closed_marker_oserror(
     def fail_clear(_name):
         raise OSError("simulated fail-closed marker fsync failure")
 
-    monkeypatch.setattr(feature, "_clear_fail_closed_state", fail_clear)
+    monkeypatch.setattr(feature._store, "clear_fail_closed_state", fail_clear)
 
     response = await client.patch(
         "/api/procedural-skills/state-oserror/state",

@@ -636,10 +636,45 @@ class ProceduralSkillsFeature(Feature):
     def _clear_fail_closed_state(self, name: str) -> None:
         if self._store is not None:
             self._store.clear_fail_closed_state(name)
+        self._forget_fail_closed_state(name)
+
+    def _forget_fail_closed_state(self, name: str) -> None:
+        """Drop one already-cleared durable guard from the local cache."""
+
         self._durable_fail_closed_names.discard(name)
         self._fail_closed_states.pop(name, None)
         self._fail_closed_errors.pop(name, None)
         self._enablement_error = self._combined_enablement_error()
+
+    async def _approve_current_and_clear_fail_closed_state(
+        self,
+        store: SkillStore,
+        record: SkillRecord,
+    ) -> None:
+        """Linearize final validation with release of a durable state fence."""
+
+        def validate_and_clear() -> None:
+            store.assert_current(record)
+            store.clear_fail_closed_state(record.name)
+
+        await self._run_blocking_until_stopped(validate_and_clear)
+        self._forget_fail_closed_state(record.name)
+
+    async def _approve_created_and_clear_fail_closed_state(
+        self,
+        store: SkillStore,
+        folder: Path,
+        *,
+        identity: CreatedSkillPublication,
+    ) -> None:
+        """Release a create fence only with its publication still current."""
+
+        def validate_and_clear() -> None:
+            store.assert_created_current(folder, identity=identity)
+            store.clear_fail_closed_state(folder.name)
+
+        await self._run_blocking_until_stopped(validate_and_clear)
+        self._forget_fail_closed_state(folder.name)
 
     @staticmethod
     async def _scan_catalog_until_stopped(
@@ -917,7 +952,33 @@ class ProceduralSkillsFeature(Feature):
         """Enter and retire a crash-recoverable checkout without loop I/O."""
 
         manager = store.git_checkout_workspace()
-        workspace = await self._run_blocking_until_stopped(manager.__enter__)
+        enter_worker = asyncio.create_task(asyncio.to_thread(manager.__enter__))
+        try:
+            workspace = await asyncio.shield(enter_worker)
+        except asyncio.CancelledError as cancellation:
+            try:
+                workspace = await self._drain_shielded_task(enter_worker)
+            except BaseException as enter_error:
+                cancellation.add_note(
+                    f"cancelled Git checkout entry also reported: {enter_error}"
+                )
+                raise cancellation from enter_error
+            cleanup = asyncio.create_task(
+                asyncio.to_thread(
+                    manager.__exit__,
+                    type(cancellation),
+                    cancellation,
+                    cancellation.__traceback__,
+                )
+            )
+            try:
+                await self._drain_shielded_task(cleanup)
+            except BaseException as cleanup_error:
+                cancellation.add_note(
+                    f"cancelled Git checkout cleanup also reported: {cleanup_error}"
+                )
+                raise cancellation from cleanup_error
+            raise
         try:
             yield workspace
         except BaseException as body_error:
@@ -1215,7 +1276,11 @@ class ProceduralSkillsFeature(Feature):
             )
             await self._publish_snapshot_locked(candidate)
             if not retain_existing_fail_closed:
-                self._clear_fail_closed_state(name)
+                await self._approve_created_and_clear_fail_closed_state(
+                    store,
+                    folder,
+                    identity=created_identity,
+                )
         except BaseException as consistency_error:
             await self._rollback_created_publication(
                 store,
@@ -1706,9 +1771,9 @@ class ProceduralSkillsFeature(Feature):
             # its source and inode have both been approved.
             await self._publish_snapshot_locked(candidate)
             # The database row, refreshed catalog, and original folder are now
-            # mutually consistent. This synchronous unlink is the commit point
-            # that lets sibling processes observe the approved enabled state.
-            self._clear_fail_closed_state(name)
+            # mutually consistent. Revalidate after awaited graph reconciliation
+            # and clear the durable fence in the same off-loop commit step.
+            await self._approve_current_and_clear_fail_closed_state(store, record)
         except BaseException as consistency_error:
             await self._rollback_state_after_consistency_error(
                 enablement=enablement,

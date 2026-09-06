@@ -899,7 +899,7 @@ async def test_state_generation_validation_does_not_block_the_event_loop(
         release.set()
 
     assert updated["enabled"] is True
-    assert calls == 3
+    assert calls == 4
     assert observed == [True], "generation validation blocked the event loop"
 
 
@@ -1329,6 +1329,66 @@ async def test_state_change_rolls_back_when_final_refresh_resolves_a_new_overrid
     assert all("Local replacement" not in value for value in published_context), (
         "a raced generation reached Core before final state validation"
     )
+
+
+@pytest.mark.asyncio
+async def test_state_change_revalidates_after_awaited_context_publication(
+    feature, monkeypatch
+):
+    name = "state-late-publication-race"
+    await feature.create_skill(
+        name=name,
+        description="Approved state generation",
+        body="Approved procedure.",
+    )
+    record = feature.snapshot.by_name()[name]
+    folder = feature.agent.procedural_skills_root / name
+    replacement = serialize_skill_markdown(
+        SkillDocument(
+            name,
+            "Unapproved replacement after context publication",
+            "Unapproved procedure.",
+        )
+    )
+    original_publish = feature._publish_snapshot_locked
+    replacement_written = False
+
+    async def publish_then_replace(snapshot, **kwargs):
+        nonlocal replacement_written
+        result = await original_publish(snapshot, **kwargs)
+        candidate = snapshot.by_name().get(name)
+        if (
+            candidate is not None
+            and candidate.state.enabled
+            and not replacement_written
+        ):
+            (folder / "SKILL.md").write_text(replacement, encoding="utf-8")
+            replacement_written = True
+        return result
+
+    monkeypatch.setattr(feature, "_publish_snapshot_locked", publish_then_replace)
+
+    with pytest.raises((SkillConflictError, SkillPathError), match="changed"):
+        await feature.set_skill_state(
+            name=name,
+            enabled=True,
+            priority=19,
+            expected_revision=record.revision,
+        )
+
+    assert replacement_written is True
+    assert (await feature._enablement.load())[name].enabled is False
+    observer = ProceduralSkillsFeature(feature.agent)
+    try:
+        await observer.initialize()
+        observed = observer.snapshot.by_name()[name]
+        assert observed.document.description == (
+            "Unapproved replacement after context publication"
+        )
+        assert observed.state.enabled is False
+        assert observed.name not in observer.context_clause_text
+    finally:
+        await observer.shutdown()
 
 
 @pytest.mark.asyncio
@@ -2043,6 +2103,61 @@ async def test_create_enable_rejects_a_generation_changed_during_state_write(
         "Unapproved replacement during create enable" not in value
         for value in published_context
     ), "a raced create generation reached Core before final validation"
+
+
+@pytest.mark.asyncio
+async def test_create_enable_revalidates_after_awaited_context_publication(
+    feature, monkeypatch
+):
+    name = "create-enable-late-publication-race"
+    folder = feature.agent.procedural_skills_root / name
+    replacement = serialize_skill_markdown(
+        SkillDocument(
+            name,
+            "Unapproved create replacement after context publication",
+            "Unapproved replacement procedure.",
+        )
+    )
+    original_publish = feature._publish_snapshot_locked
+    replacement_written = False
+
+    async def publish_then_replace(snapshot, **kwargs):
+        nonlocal replacement_written
+        result = await original_publish(snapshot, **kwargs)
+        candidate = snapshot.by_name().get(name)
+        if (
+            candidate is not None
+            and candidate.state.enabled
+            and not replacement_written
+        ):
+            (folder / "SKILL.md").write_text(replacement, encoding="utf-8")
+            replacement_written = True
+        return result
+
+    monkeypatch.setattr(feature, "_publish_snapshot_locked", publish_then_replace)
+
+    with pytest.raises(SkillPathError, match="changed"):
+        await feature.create_skill(
+            name=name,
+            description="Approved create generation",
+            body="Approved procedure.",
+            enabled=True,
+            priority=23,
+        )
+
+    assert replacement_written is True
+    assert (await feature._enablement.load())[name].enabled is False
+    observer = ProceduralSkillsFeature(feature.agent)
+    try:
+        await observer.initialize()
+        observed = observer.snapshot.by_name()[name]
+        assert observed.document.description == (
+            "Unapproved create replacement after context publication"
+        )
+        assert observed.state.enabled is False
+        assert observed.name not in observer.context_clause_text
+    finally:
+        await observer.shutdown()
 
 
 @pytest.mark.asyncio
@@ -4332,6 +4447,48 @@ async def test_git_install_workspace_cleanup_does_not_block_the_event_loop(
 
     assert installed["name"] == name
     assert observed == [True], "Git workspace cleanup blocked the event loop"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_git_workspace_enter_drains_and_exits(
+    feature, tmp_path, monkeypatch
+):
+    started = threading.Event()
+    release_enter = threading.Event()
+    exited = threading.Event()
+
+    class PausedWorkspace:
+        def __enter__(self):
+            started.set()
+            assert release_enter.wait(timeout=5)
+            return tmp_path
+
+        def __exit__(self, exc_type, exc, traceback):
+            exited.set()
+            return False
+
+    monkeypatch.setattr(
+        feature._store,
+        "git_checkout_workspace",
+        lambda: PausedWorkspace(),
+    )
+
+    async def use_workspace():
+        async with feature._git_checkout_workspace_until_stopped(feature._store):
+            pytest.fail("cancelled workspace enter reached the body")
+
+    task = asyncio.create_task(use_workspace())
+    assert await asyncio.to_thread(started.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    try:
+        assert not task.done(), "workspace enter cancellation abandoned its worker"
+    finally:
+        release_enter.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert exited.is_set(), "a successfully entered workspace was not retired"
 
 
 @pytest.mark.asyncio
