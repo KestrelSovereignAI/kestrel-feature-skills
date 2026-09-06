@@ -1986,23 +1986,40 @@ class SkillStore:
         """Durably disable one name when its database rollback is uncertain."""
 
         name = validate_skill_name(name)
-        normalized_error = (
-            str(error).encode("utf-8", errors="backslashreplace").decode("utf-8")[:2048]
-        )
-        payload = (
-            json.dumps(
-                {
-                    "version": FAIL_CLOSED_STATE_VERSION,
-                    "name": name,
-                    "priority": priority,
-                    "error": normalized_error,
-                },
-                sort_keys=True,
-                ensure_ascii=True,
-                separators=(",", ":"),
+        raw_error = str(error)[:2048]
+
+        def serialize_error(prefix: str) -> bytes:
+            normalized = prefix.encode("utf-8", errors="backslashreplace").decode(
+                "utf-8"
             )
-            + "\n"
-        ).encode("ascii")
+            return (
+                json.dumps(
+                    {
+                        "version": FAIL_CLOSED_STATE_VERSION,
+                        "name": name,
+                        "priority": priority,
+                        "error": normalized,
+                    },
+                    sort_keys=True,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("ascii")
+
+        payload = serialize_error(raw_error)
+        if len(payload) > MAX_FAIL_CLOSED_ERROR_BYTES:
+            lower = 0
+            upper = len(raw_error)
+            payload = serialize_error("")
+            while lower <= upper:
+                middle = (lower + upper) // 2
+                candidate = serialize_error(raw_error[:middle])
+                if len(candidate) <= MAX_FAIL_CLOSED_ERROR_BYTES:
+                    payload = candidate
+                    lower = middle + 1
+                else:
+                    upper = middle - 1
         if len(payload) > MAX_FAIL_CLOSED_ERROR_BYTES:
             raise SkillPathError("skill fail-closed metadata exceeds its size limit")
         internal_fd = _open_directory(

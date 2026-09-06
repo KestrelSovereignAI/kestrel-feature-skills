@@ -567,6 +567,116 @@ def test_generation_marker_publication_compensates_move_after_anchor_check(
     )
 
 
+def test_generation_marker_publication_compensates_post_link_fsync_error(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    outside = tmp_path / "outside"
+    local.mkdir()
+    outside.mkdir()
+    folder = make_skill(local, "marker-fsync-race", "Marker fsync race")
+    moved = outside / folder.name
+    real_fsync = sources_module.os.fsync
+    moved_after_publication = False
+
+    def move_folder_then_fail(descriptor):
+        nonlocal moved_after_publication
+        if not moved_after_publication and (folder / GENERATION_FILENAME).exists():
+            folder.rename(moved)
+            moved_after_publication = True
+            raise OSError("folder fsync failed after marker publication")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(sources_module.os, "fsync", move_folder_then_fail)
+
+    records, errors = DirectorySkillSource(
+        root=local,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=AGENT_LOCAL_PRECEDENCE,
+    ).discover()
+
+    assert moved_after_publication
+    assert records == ()
+    assert len(errors) == 1
+    assert not (moved / GENERATION_FILENAME).exists(), (
+        "a post-link verification error left this call's marker outside the source"
+    )
+
+
+def test_generation_marker_compensation_preserves_raced_marker(tmp_path, monkeypatch):
+    local = tmp_path / "local"
+    outside = tmp_path / "outside"
+    local.mkdir()
+    outside.mkdir()
+    folder = make_skill(local, "marker-cleanup-race", "Marker cleanup race")
+    moved = outside / folder.name
+    replacement_payload = sources_module._new_generation_payload()
+    real_fsync = sources_module.os.fsync
+    replaced_after_publication = False
+
+    def replace_marker_then_fail(descriptor):
+        nonlocal replaced_after_publication
+        marker = folder / GENERATION_FILENAME
+        if not replaced_after_publication and marker.exists():
+            folder.rename(moved)
+            moved_marker = moved / GENERATION_FILENAME
+            moved_marker.unlink()
+            moved_marker.write_bytes(replacement_payload)
+            replaced_after_publication = True
+            raise OSError("folder fsync failed after raced marker replacement")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(sources_module.os, "fsync", replace_marker_then_fail)
+
+    records, errors = DirectorySkillSource(
+        root=local,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=AGENT_LOCAL_PRECEDENCE,
+    ).discover()
+
+    assert replaced_after_publication
+    assert records == ()
+    assert len(errors) == 1
+    assert (moved / GENERATION_FILENAME).read_bytes() == replacement_payload
+
+
+def test_agent_local_snapshot_must_retain_ensured_generation_marker(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    local.mkdir()
+    folder = make_skill(local, "missing-snapshot-marker", "Missing snapshot marker")
+    real_inspect = sources_module.inspect_skill_folder_descriptor
+    marker_removed = False
+
+    def remove_marker_before_snapshot(*args, **kwargs):
+        nonlocal marker_removed
+        if not marker_removed:
+            os.unlink(GENERATION_FILENAME, dir_fd=args[0])
+            marker_removed = True
+        return real_inspect(*args, **kwargs)
+
+    monkeypatch.setattr(
+        sources_module,
+        "inspect_skill_folder_descriptor",
+        remove_marker_before_snapshot,
+    )
+
+    records, errors = DirectorySkillSource(
+        root=local,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=AGENT_LOCAL_PRECEDENCE,
+    ).discover()
+
+    assert marker_removed
+    assert records == ()
+    assert len(errors) == 1
+    assert not (folder / GENERATION_FILENAME).exists()
+
+
 def test_source_root_disappearing_during_resolution_is_a_visible_error(
     tmp_path, monkeypatch
 ):
@@ -793,12 +903,21 @@ def test_git_source_rejects_non_https_or_credential_bearing_urls(url):
     (
         "https://example.com/skills.git\x00",
         "https://example.com/skills.git\n--upload-pack=evil",
+        " https://example.com/skills.git",
+        "https://example.com/skills.git ",
+        "https://example.com/skill set.git",
         "https://example.com/skills-\ud800.git",
     ),
 )
 def test_git_source_rejects_control_or_unencodable_url_text(url):
     with pytest.raises(GitSourceError, match="URL"):
         validate_remote_url(url)
+
+
+def test_git_source_normalizes_accepted_https_scheme_for_git_allowlist():
+    assert validate_remote_url("HTTPS://Example.com/skills.git") == (
+        "https://Example.com/skills.git"
+    )
 
 
 @pytest.mark.parametrize(

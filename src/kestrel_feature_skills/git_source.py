@@ -43,9 +43,13 @@ def validate_remote_url(url: object) -> str:
         encoded = url.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise GitInputError("git source URL must be valid UTF-8 text") from exc
-    if len(encoded) > 2048 or _URL_CONTROL_RE.search(url):
+    if (
+        len(encoded) > 2048
+        or _URL_CONTROL_RE.search(url)
+        or any(character.isspace() for character in url)
+    ):
         raise GitInputError(
-            "git source URL must be bounded text without control characters"
+            "git source URL must be bounded text without whitespace or control characters"
         )
     try:
         parsed = urlsplit(url)
@@ -66,7 +70,7 @@ def validate_remote_url(url: object) -> str:
         raise GitInputError(
             "git source must use HTTPS without credentials, query parameters, or fragments"
         )
-    return url
+    return parsed._replace(scheme="https").geturl()
 
 
 def validate_ref(ref: object) -> str:

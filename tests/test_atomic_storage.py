@@ -3793,6 +3793,22 @@ def test_clearing_absent_fail_closed_marker_fsyncs_retry_proof(tmp_path, monkeyp
     assert synced == [internal_inode]
 
 
+def test_fail_closed_error_is_bounded_after_ascii_json_escaping(tmp_path):
+    store = SkillStore(tmp_path / "skills")
+    name = "bounded-fail-closed-error"
+    error = "uncertain rollback: " + ("\U0001fab6" * 2_048)
+
+    store.retain_fail_closed_state(name, priority=17, error=error)
+
+    marker = store._internal_root / store_module._fail_closed_state_name(name)
+    assert len(marker.read_bytes()) <= store_module.MAX_FAIL_CLOSED_ERROR_BYTES
+    states, errors = store.load_fail_closed_states()
+    assert states[name].enabled is False
+    assert states[name].priority == 17
+    assert errors[name].startswith("uncertain rollback: ")
+    assert len(errors[name]) < len(error)
+
+
 def test_recursive_cleanup_handles_more_than_python_recursion_limit(tmp_path):
     store = SkillStore(tmp_path / "skills")
     folder = store.create(SkillDocument("deep-cleanup", "Deep cleanup", "Procedure."))

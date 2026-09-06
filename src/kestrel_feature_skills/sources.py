@@ -203,12 +203,11 @@ def _ensure_local_generation_marker(
     *,
     folder_name: str,
     expected_folder_identity: tuple[int, int],
-) -> None:
+) -> bytes:
     """Create missing local generation metadata without replacing an owner value."""
 
     try:
-        _read_generation_marker(folder_fd)
-        return
+        return _read_generation_marker(folder_fd)
     except FileNotFoundError:
         pass
 
@@ -226,8 +225,7 @@ def _ensure_local_generation_marker(
                 "skill folder moved outside its source before generation metadata"
             )
         try:
-            _read_generation_marker(folder_fd)
-            return
+            return _read_generation_marker(folder_fd)
         except FileNotFoundError:
             pass
         temporary = f"{_GENERATION_TEMP_PREFIX}{secrets.token_hex(16)}"
@@ -263,7 +261,48 @@ def _ensure_local_generation_marker(
                 else:
                     if (current.st_dev, current.st_ino) == created_identity:
                         os.unlink(temporary, dir_fd=artifact_fd)
+        marker_payload: bytes
+        published_by_call = False
         try:
+            try:
+                if not _anchored_folder_matches(
+                    root_fd,
+                    folder_fd,
+                    folder_name=folder_name,
+                    expected_folder_identity=expected_folder_identity,
+                ):
+                    raise SkillPathError(
+                        "skill folder moved outside its source before generation metadata"
+                    )
+                try:
+                    os.link(
+                        temporary,
+                        GENERATION_FILENAME,
+                        src_dir_fd=artifact_fd,
+                        dst_dir_fd=folder_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    # Another feature instance won publication. Its completed
+                    # hardlink is the sole generation owner for this folder.
+                    marker_payload = _read_generation_marker(folder_fd)
+                else:
+                    published_by_call = True
+                    os.fsync(folder_fd)
+                    marker_payload = _read_generation_marker(folder_fd)
+            finally:
+                try:
+                    current = os.stat(
+                        temporary,
+                        dir_fd=artifact_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    if (current.st_dev, current.st_ino) == created_identity:
+                        os.unlink(temporary, dir_fd=artifact_fd)
+                os.fsync(artifact_fd)
             if not _anchored_folder_matches(
                 root_fd,
                 folder_fd,
@@ -271,50 +310,21 @@ def _ensure_local_generation_marker(
                 expected_folder_identity=expected_folder_identity,
             ):
                 raise SkillPathError(
-                    "skill folder moved outside its source before generation metadata"
+                    "skill folder moved outside its source during generation metadata"
                 )
-            try:
-                os.link(
-                    temporary,
-                    GENERATION_FILENAME,
-                    src_dir_fd=artifact_fd,
-                    dst_dir_fd=folder_fd,
-                    follow_symlinks=False,
-                )
-            except FileExistsError:
-                # Another feature instance won publication. Its completed
-                # hardlink is the sole generation owner for this folder.
-                _read_generation_marker(folder_fd)
-            else:
-                os.fsync(folder_fd)
-                _read_generation_marker(folder_fd)
-                if not _anchored_folder_matches(
-                    root_fd,
+        except BaseException:
+            if published_by_call and not _anchored_folder_matches(
+                root_fd,
+                folder_fd,
+                folder_name=folder_name,
+                expected_folder_identity=expected_folder_identity,
+            ):
+                _unlink_owned_generation_marker(
                     folder_fd,
-                    folder_name=folder_name,
-                    expected_folder_identity=expected_folder_identity,
-                ):
-                    _unlink_owned_generation_marker(
-                        folder_fd,
-                        expected_identity=created_identity,
-                    )
-                    raise SkillPathError(
-                        "skill folder moved outside its source during generation metadata"
-                    )
-        finally:
-            try:
-                current = os.stat(
-                    temporary,
-                    dir_fd=artifact_fd,
-                    follow_symlinks=False,
+                    expected_identity=created_identity,
                 )
-            except FileNotFoundError:
-                pass
-            else:
-                if (current.st_dev, current.st_ino) == created_identity:
-                    os.unlink(temporary, dir_fd=artifact_fd)
-            os.fsync(artifact_fd)
-        os.fsync(folder_fd)
+            raise
+        return marker_payload
 
 
 def _folder_revision(
@@ -621,8 +631,9 @@ class DirectorySkillSource(SkillSource):
                         raise SkillPathError(
                             "skill folder changed identity during discovery"
                         )
+                    expected_generation: bytes | None = None
                     if self.kind == "agent-local":
-                        _ensure_local_generation_marker(
+                        expected_generation = _ensure_local_generation_marker(
                             root_fd,
                             folder_fd,
                             folder_name=folder_name,
@@ -632,6 +643,19 @@ class DirectorySkillSource(SkillSource):
                         folder_fd,
                         folder_name=folder_name,
                     )
+                    if expected_generation is not None:
+                        captured_generation = next(
+                            (
+                                entry.payload
+                                for entry in snapshot.entries
+                                if entry.path == GENERATION_FILENAME
+                            ),
+                            None,
+                        )
+                        if captured_generation != expected_generation:
+                            raise SkillPathError(
+                                "skill generation metadata changed before snapshot capture"
+                            )
                     document = snapshot.document
                     provenance_entry = next(
                         (
