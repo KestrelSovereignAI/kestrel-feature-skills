@@ -490,6 +490,83 @@ def test_record_revision_generation_marker_is_replaced_with_the_folder(tmp_path)
     assert recreated_generation != first_generation
 
 
+def test_generation_marker_is_removed_when_open_folder_moves_outside_source(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    outside = tmp_path / "outside"
+    local.mkdir()
+    outside.mkdir()
+    folder = make_skill(local, "moved-marker", "Moved marker")
+    moved = outside / folder.name
+    real_payload = sources_module._new_generation_payload
+    moved_before_publication = False
+
+    def move_open_folder_before_marker_publication():
+        nonlocal moved_before_publication
+        if not moved_before_publication:
+            folder.rename(moved)
+            moved_before_publication = True
+        return real_payload()
+
+    monkeypatch.setattr(
+        sources_module,
+        "_new_generation_payload",
+        move_open_folder_before_marker_publication,
+    )
+
+    records, errors = DirectorySkillSource(
+        root=local,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=AGENT_LOCAL_PRECEDENCE,
+    ).discover()
+
+    assert moved_before_publication
+    assert records == ()
+    assert len(errors) == 1
+    assert not (moved / GENERATION_FILENAME).exists(), (
+        "discovery wrote generation metadata through a folder descriptor after "
+        "that folder moved outside its configured source root"
+    )
+
+
+def test_generation_marker_publication_compensates_move_after_anchor_check(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    outside = tmp_path / "outside"
+    local.mkdir()
+    outside.mkdir()
+    folder = make_skill(local, "marker-link-race", "Marker link race")
+    moved = outside / folder.name
+    real_link = sources_module.os.link
+    moved_during_publication = False
+
+    def move_folder_during_link(source, destination, *args, **kwargs):
+        nonlocal moved_during_publication
+        if destination == GENERATION_FILENAME and not moved_during_publication:
+            folder.rename(moved)
+            moved_during_publication = True
+        return real_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(sources_module.os, "link", move_folder_during_link)
+
+    records, errors = DirectorySkillSource(
+        root=local,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=AGENT_LOCAL_PRECEDENCE,
+    ).discover()
+
+    assert moved_during_publication
+    assert records == ()
+    assert len(errors) == 1
+    assert not (moved / GENERATION_FILENAME).exists(), (
+        "the marker linked through the newly detached descriptor was not removed"
+    )
+
+
 def test_source_root_disappearing_during_resolution_is_a_visible_error(
     tmp_path, monkeypatch
 ):

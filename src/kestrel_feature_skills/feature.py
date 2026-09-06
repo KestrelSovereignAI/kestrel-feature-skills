@@ -1345,7 +1345,12 @@ class ProceduralSkillsFeature(Feature):
                 expected_revision,
                 operation="editing",
             )
-            store.write_file(record, relative_path, content)
+            await self._write_skill_file_until_stopped(
+                store,
+                record,
+                relative_path,
+                content,
+            )
             refresh_error = await self._refresh_committed_mutation()
             resolved = self._snapshot.by_name().get(name)
             if resolved is None:
@@ -1365,6 +1370,37 @@ class ProceduralSkillsFeature(Feature):
             "revision": resolved.revision,
             "refresh_error": refresh_error,
         }
+
+    async def _write_skill_file_until_stopped(
+        self,
+        store: SkillStore,
+        record: SkillRecord,
+        relative_path: str,
+        content: str,
+    ) -> None:
+        """Keep claims and the privacy lock until blocking storage work stops."""
+
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                store.write_file,
+                record,
+                relative_path,
+                content,
+            )
+        )
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            while True:
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:  # noqa: BLE001 - preserve caller cancellation
+                    break
+                else:
+                    break
+            raise
 
     async def set_skill_state(
         self,

@@ -163,7 +163,7 @@ function buildCreateDialog() {
     const agent = currentAgent();
     try {
       const createdName = name.value;
-      await request('', {
+      const result = await request('', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: name.value, description: description.value, body: body.value, enabled: false }),
@@ -173,7 +173,14 @@ function buildCreateDialog() {
       form.reset();
       await loadCatalog();
       if (currentAgent() === agent) {
-        setStatus(`Created ${createdName}; it remains disabled.`);
+        if (result.state_error) {
+          setStatus(
+            `Created ${createdName} on disk, but disabled state persistence failed: ${result.state_error}`,
+            true,
+          );
+        } else {
+          setStatus(`Created ${createdName}; it remains disabled.`);
+        }
       }
     } catch (error) {
       if (currentAgent() === agent) setStatus(detail(error), true);
@@ -562,6 +569,7 @@ async function setEnabled(skill, enabled, priority = null) {
       && editorOwner?.agent === agent
       && editorOwner.name === skill.name
       && editorOwner.revision === editorRevision
+      && editorRevision === skill.revision
       && typeof result.revision === 'string'
     ) editorOwner.revision = result.revision;
     await loadCatalog();

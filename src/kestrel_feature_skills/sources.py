@@ -155,7 +155,55 @@ def _read_generation_marker(folder_fd: int) -> bytes:
         os.close(descriptor)
 
 
-def _ensure_local_generation_marker(root_fd: int, folder_fd: int) -> None:
+def _anchored_folder_matches(
+    root_fd: int,
+    folder_fd: int,
+    *,
+    folder_name: str,
+    expected_folder_identity: tuple[int, int],
+) -> bool:
+    """Return whether the pinned folder is still the source-root child."""
+
+    try:
+        lexical = os.stat(folder_name, dir_fd=root_fd, follow_symlinks=False)
+        opened = os.fstat(folder_fd)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(lexical.st_mode)
+        and not stat.S_ISLNK(lexical.st_mode)
+        and (lexical.st_dev, lexical.st_ino) == expected_folder_identity
+        and (opened.st_dev, opened.st_ino) == expected_folder_identity
+    )
+
+
+def _unlink_owned_generation_marker(
+    folder_fd: int,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Compensate only the marker inode published by this discovery call."""
+
+    try:
+        current = os.stat(
+            GENERATION_FILENAME,
+            dir_fd=folder_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    if (current.st_dev, current.st_ino) == expected_identity:
+        os.unlink(GENERATION_FILENAME, dir_fd=folder_fd)
+        os.fsync(folder_fd)
+
+
+def _ensure_local_generation_marker(
+    root_fd: int,
+    folder_fd: int,
+    *,
+    folder_name: str,
+    expected_folder_identity: tuple[int, int],
+) -> None:
     """Create missing local generation metadata without replacing an owner value."""
 
     try:
@@ -168,6 +216,15 @@ def _ensure_local_generation_marker(root_fd: int, folder_fd: int) -> None:
     # The shared lock also lets startup distinguish orphaned temporaries from a
     # marker publication that is still live in another process.
     with _generation_marker_workspace(root_fd) as artifact_fd:
+        if not _anchored_folder_matches(
+            root_fd,
+            folder_fd,
+            folder_name=folder_name,
+            expected_folder_identity=expected_folder_identity,
+        ):
+            raise SkillPathError(
+                "skill folder moved outside its source before generation metadata"
+            )
         try:
             _read_generation_marker(folder_fd)
             return
@@ -207,6 +264,15 @@ def _ensure_local_generation_marker(root_fd: int, folder_fd: int) -> None:
                     if (current.st_dev, current.st_ino) == created_identity:
                         os.unlink(temporary, dir_fd=artifact_fd)
         try:
+            if not _anchored_folder_matches(
+                root_fd,
+                folder_fd,
+                folder_name=folder_name,
+                expected_folder_identity=expected_folder_identity,
+            ):
+                raise SkillPathError(
+                    "skill folder moved outside its source before generation metadata"
+                )
             try:
                 os.link(
                     temporary,
@@ -222,6 +288,19 @@ def _ensure_local_generation_marker(root_fd: int, folder_fd: int) -> None:
             else:
                 os.fsync(folder_fd)
                 _read_generation_marker(folder_fd)
+                if not _anchored_folder_matches(
+                    root_fd,
+                    folder_fd,
+                    folder_name=folder_name,
+                    expected_folder_identity=expected_folder_identity,
+                ):
+                    _unlink_owned_generation_marker(
+                        folder_fd,
+                        expected_identity=created_identity,
+                    )
+                    raise SkillPathError(
+                        "skill folder moved outside its source during generation metadata"
+                    )
         finally:
             try:
                 current = os.stat(
@@ -543,7 +622,12 @@ class DirectorySkillSource(SkillSource):
                             "skill folder changed identity during discovery"
                         )
                     if self.kind == "agent-local":
-                        _ensure_local_generation_marker(root_fd, folder_fd)
+                        _ensure_local_generation_marker(
+                            root_fd,
+                            folder_fd,
+                            folder_name=folder_name,
+                            expected_folder_identity=folder_identity,
+                        )
                     snapshot = inspect_skill_folder_descriptor(
                         folder_fd,
                         folder_name=folder_name,

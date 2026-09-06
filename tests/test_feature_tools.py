@@ -3439,6 +3439,119 @@ async def test_edit_reports_cached_skill_that_became_invalid(feature):
 
 
 @pytest.mark.asyncio
+async def test_edit_storage_work_does_not_block_event_loop(feature, monkeypatch):
+    name = "nonblocking-edit-storage"
+    created = await feature.create_skill(
+        name=name,
+        description="Original description",
+        body="Original body.",
+    )
+    replacement = serialize_skill_markdown(
+        SkillDocument(name, "Replacement description", "Replacement body.")
+    )
+    real_write = feature._store.write_file
+    release = threading.Event()
+    safety_timer = threading.Timer(0.5, release.set)
+    loop_progressed = asyncio.Event()
+    loop_callback_ran = threading.Event()
+    observed_loop_progress = []
+
+    def slow_write(*args, **kwargs):
+        assert release.wait(timeout=5)
+        observed_loop_progress.append(loop_callback_ran.is_set())
+        return real_write(*args, **kwargs)
+
+    def release_from_event_loop():
+        loop_callback_ran.set()
+        release.set()
+        loop_progressed.set()
+
+    monkeypatch.setattr(feature._store, "write_file", slow_write)
+    loop = asyncio.get_running_loop()
+    safety_timer.start()
+    loop.call_later(0.01, release_from_event_loop)
+    edit = asyncio.create_task(
+        feature.edit_skill(
+            name=name,
+            relative_path="SKILL.md",
+            content=replacement,
+            expected_revision=created["revision"],
+        )
+    )
+    try:
+        await asyncio.wait_for(loop_progressed.wait(), timeout=1)
+    finally:
+        release.set()
+        safety_timer.cancel()
+    edited = await edit
+
+    assert observed_loop_progress == [True], (
+        "bounded skill-folder validation and fsync work ran before the scheduled "
+        "event-loop callback"
+    )
+    assert edited["revision"] != created["revision"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_edit_drains_storage_worker_before_releasing_lock(
+    feature, monkeypatch
+):
+    name = "cancelled-edit-storage"
+    created = await feature.create_skill(
+        name=name,
+        description="Original description",
+        body="Original body.",
+    )
+    replacement = serialize_skill_markdown(
+        SkillDocument(name, "Replacement description", "Replacement body.")
+    )
+    real_write = feature._store.write_file
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    timer = threading.Timer(0.5, release.set)
+
+    def blocked_write(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        try:
+            return real_write(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(feature._store, "write_file", blocked_write)
+    feature.agent._privacy_transition_lock = asyncio.Lock()
+    timer.start()
+    edit = asyncio.create_task(
+        feature.edit_skill(
+            name=name,
+            relative_path="SKILL.md",
+            content=replacement,
+            expected_revision=created["revision"],
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 1)
+    edit.cancel()
+    await asyncio.sleep(0.05)
+    escaped_while_active = edit.done()
+    lock_held_while_active = feature.agent._privacy_transition_lock.locked()
+    release.set()
+    timer.cancel()
+    outcome = (await asyncio.gather(edit, return_exceptions=True))[0]
+    finished_before_return = finished.is_set()
+    if not finished_before_return:
+        assert await asyncio.to_thread(finished.wait, 1)
+
+    assert not escaped_while_active, (
+        "edit cancellation escaped while storage work was active"
+    )
+    assert lock_held_while_active
+    assert isinstance(outcome, asyncio.CancelledError)
+    assert finished_before_return, "edit returned before its storage worker stopped"
+    assert not feature.agent._privacy_transition_lock.locked()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_post_publication_refresh_reconciles_catalog(
     feature, monkeypatch
 ):

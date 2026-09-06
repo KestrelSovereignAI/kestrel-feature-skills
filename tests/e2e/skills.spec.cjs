@@ -152,6 +152,35 @@ test.describe.serial('procedural skills contributed console', () => {
     }
   });
 
+  test('admin add surfaces a committed create with incomplete state persistence', async ({ page }) => {
+    const name = 'e2e-partial-create';
+    await openPanel(page);
+    await page.route(new RegExp(`${API_ROOT}$`), async (route) => {
+      if (route.request().method() !== 'POST') return route.continue();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          name,
+          enabled: false,
+          state_error: 'agent database unavailable',
+        }),
+      });
+    });
+    try {
+      await page.getByTestId('skills-add').click();
+      const dialog = page.getByTestId('skills-create-dialog');
+      await dialog.getByLabel('New skill name').fill(name);
+      await dialog.getByLabel('New skill description').fill('Partial create sentinel');
+      await dialog.getByLabel('New skill procedure').fill('# Procedure\n\n1. Surface partial state.');
+      await dialog.getByRole('button', { name: 'Create disabled skill' }).click();
+      await expect(page.locator('[role="status"]')).toContainText('agent database unavailable');
+      await expect(page.locator('[role="status"]')).not.toContainText(`Created ${name}; it remains disabled.`);
+    } finally {
+      await page.unrouteAll({ behavior: 'ignoreErrors' });
+    }
+  });
+
   test('admin add rejects a trailing skill-name separator before HTTP', async ({ page, request }) => {
     const name = 'e2e-invalid-';
     await openPanel(page);
@@ -478,6 +507,49 @@ test.describe.serial('procedural skills contributed console', () => {
       });
       expect(reopened.ok(), await reopened.text()).toBeTruthy();
       expect((await reopened.json()).content).toContain('STATE-THEN-SAVE-SENTINEL');
+    } finally {
+      await resetFixture(request);
+    }
+  });
+
+  test('state changes cannot bless editor content stale before the mutation', async ({ page, request }) => {
+    await patchState(request, SKILL_NAME, { enabled: false, priority: 100 });
+    await openPanel(page);
+    await page.getByRole('button', { name: SKILL_NAME }).click();
+    await page.getByRole('button', { name: 'SKILL.md' }).click();
+    const editor = page.getByLabel('Skill file editor');
+    await expect(editor).toHaveValue(new RegExp(DESCRIPTION));
+    const staleEditor = `${await editor.inputValue()}\nSTALE-EDITOR-MUST-NOT-WIN\n`;
+    await editor.fill(staleEditor);
+    const beforeExternalEdit = await catalogSkill(request, SKILL_NAME);
+    const externalContent = (await editor.inputValue())
+      .replace('Keep the editor round trip stable.', 'EXTERNAL-EDIT-MUST-SURVIVE.')
+      .replace('\nSTALE-EDITOR-MUST-NOT-WIN\n', '\n');
+    const externalEdit = await request.put(`${API_ROOT}/${SKILL_NAME}/file`, {
+      headers: headers({ 'If-Match': beforeExternalEdit.revision }),
+      data: { path: 'SKILL.md', content: externalContent },
+    });
+    expect(externalEdit.ok(), await externalEdit.text()).toBeTruthy();
+    try {
+      const catalogRefreshed = page.waitForResponse((response) => (
+        response.request().method() === 'GET'
+        && response.url().endsWith(API_ROOT)
+      ));
+      await page.evaluate(() => {
+        globalThis.dispatchEvent(new CustomEvent('capabilities:changed'));
+      });
+      expect((await catalogRefreshed).ok()).toBeTruthy();
+      await expect(editor).toHaveValue(staleEditor);
+      await page.getByRole('button', { name: 'Enable', exact: true }).click();
+      await expect(page.locator('[role="status"]')).toContainText(`Enabled ${SKILL_NAME}`);
+      await page.getByTestId('skills-save').click();
+      await expect(page.locator('[role="status"]')).toContainText('Save rejected');
+      const preserved = await request.get(`${API_ROOT}/${SKILL_NAME}/file`, {
+        headers: headers(),
+        params: { path: 'SKILL.md' },
+      });
+      expect(preserved.ok(), await preserved.text()).toBeTruthy();
+      expect((await preserved.json()).content).toContain('EXTERNAL-EDIT-MUST-SURVIVE.');
     } finally {
       await resetFixture(request);
     }
