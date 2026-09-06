@@ -82,6 +82,85 @@ async def test_catalog_refresh_scans_without_blocking_the_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_create_storage_work_does_not_block_the_event_loop(feature, monkeypatch):
+    release = threading.Event()
+    loop_callback_ran = threading.Event()
+    observed = []
+    original_create = feature._store.create_pinned
+
+    def blocked_create(*args, **kwargs):
+        assert release.wait(timeout=2)
+        observed.append(loop_callback_ran.is_set())
+        return original_create(*args, **kwargs)
+
+    def release_from_loop():
+        loop_callback_ran.set()
+        release.set()
+
+    monkeypatch.setattr(feature._store, "create_pinned", blocked_create)
+    safety_release = threading.Timer(0.5, release.set)
+    safety_release.start()
+    asyncio.get_running_loop().call_later(0.01, release_from_loop)
+    try:
+        created = await feature.create_skill(
+            name="nonblocking-create",
+            description="Create off loop",
+            body="Procedure.",
+        )
+    finally:
+        safety_release.cancel()
+        release.set()
+
+    assert created["name"] == "nonblocking-create"
+    assert observed == [True], "skill creation blocked the event loop"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_create_drains_and_compensates_storage_worker(
+    feature, monkeypatch
+):
+    name = "cancelled-create-storage"
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_create = feature._store.create_pinned
+
+    def blocked_create(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        try:
+            return original_create(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(feature._store, "create_pinned", blocked_create)
+    feature.agent._privacy_transition_lock = asyncio.Lock()
+    creation = asyncio.create_task(
+        feature.create_skill(
+            name=name,
+            description="Cancelled create",
+            body="Procedure.",
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 5)
+    creation.cancel()
+    await asyncio.sleep(0.05)
+    try:
+        assert not creation.done(), "create cancellation abandoned its storage worker"
+        assert feature.agent._privacy_transition_lock.locked()
+    finally:
+        release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await creation
+
+    assert finished.is_set()
+    assert not feature.agent._privacy_transition_lock.locked()
+    assert not (feature.agent.procedural_skills_root / name).exists()
+    assert name not in await feature._enablement.load()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_refresh_drains_catalog_worker_before_return(
     feature, monkeypatch
 ):
@@ -786,6 +865,45 @@ async def test_state_update_refreshes_external_publication_before_precheck(featu
 
 
 @pytest.mark.asyncio
+async def test_state_generation_validation_does_not_block_the_event_loop(
+    feature, monkeypatch
+):
+    name = "nonblocking-state-validation"
+    await feature.skill_create(name, "Validate off loop", "Procedure.")
+    release = threading.Event()
+    loop_callback_ran = threading.Event()
+    observed = []
+    original_assert = feature._store.assert_current
+    calls = 0
+
+    def blocked_assert(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert release.wait(timeout=2)
+            observed.append(loop_callback_ran.is_set())
+        return original_assert(*args, **kwargs)
+
+    def release_from_loop():
+        loop_callback_ran.set()
+        release.set()
+
+    monkeypatch.setattr(feature._store, "assert_current", blocked_assert)
+    safety_release = threading.Timer(0.5, release.set)
+    safety_release.start()
+    asyncio.get_running_loop().call_later(0.01, release_from_loop)
+    try:
+        updated = await feature.set_skill_state(name=name, enabled=True)
+    finally:
+        safety_release.cancel()
+        release.set()
+
+    assert updated["enabled"] is True
+    assert calls == 3
+    assert observed == [True], "generation validation blocked the event loop"
+
+
+@pytest.mark.asyncio
 async def test_state_change_rolls_back_when_folder_changes_during_persistence(
     feature, monkeypatch
 ):
@@ -954,23 +1072,28 @@ async def test_state_change_rolls_back_when_folder_changes_during_final_refresh(
     replacement = serialize_skill_markdown(
         SkillDocument(name, "Replacement", "Replacement procedure.")
     )
-    real_refresh = feature._refresh_locked
+    real_scan = feature._scan_stable_snapshot_locked
     refresh_count = 0
 
-    async def refresh_then_mutate():
+    async def refresh_then_mutate(**kwargs):
         nonlocal refresh_count
-        await real_refresh()
+        candidate = await real_scan(**kwargs)
         refresh_count += 1
         if refresh_count != 3:
-            return
+            return candidate
         if mutation == "replace":
             (folder / "SKILL.md").write_text(replacement, encoding="utf-8")
         else:
             for child in folder.iterdir():
                 child.unlink()
             folder.rmdir()
+        return candidate
 
-    monkeypatch.setattr(feature, "_refresh_locked", refresh_then_mutate)
+    monkeypatch.setattr(
+        feature,
+        "_scan_stable_snapshot_locked",
+        refresh_then_mutate,
+    )
 
     with pytest.raises((SkillConflictError, SkillPathError), match="changed"):
         await feature.set_skill_state(
@@ -1004,7 +1127,7 @@ async def test_cancelled_state_refresh_rolls_back_a_replaced_generation(
     replacement = serialize_skill_markdown(
         SkillDocument(name, "Unapproved replacement", "Replacement procedure.")
     )
-    real_refresh = feature._refresh_locked
+    real_scan = feature._scan_stable_snapshot_locked
     final_refresh_started = asyncio.Event()
     release_final_refresh = asyncio.Event()
     rollback_started = asyncio.Event()
@@ -1018,15 +1141,19 @@ async def test_cancelled_state_refresh_rolls_back_a_replaced_generation(
             await release_rollback.wait()
         return await real_set(*args, **kwargs)
 
-    async def pause_final_refresh():
+    async def pause_final_refresh(**kwargs):
         nonlocal refresh_calls
         refresh_calls += 1
         if refresh_calls == 3:
             final_refresh_started.set()
             await release_final_refresh.wait()
-        return await real_refresh()
+        return await real_scan(**kwargs)
 
-    monkeypatch.setattr(feature, "_refresh_locked", pause_final_refresh)
+    monkeypatch.setattr(
+        feature,
+        "_scan_stable_snapshot_locked",
+        pause_final_refresh,
+    )
     monkeypatch.setattr(feature._enablement, "set", pause_rollback)
     update = asyncio.create_task(
         feature.set_skill_state(
@@ -1075,7 +1202,7 @@ async def test_state_finalization_guard_is_visible_to_another_feature_instance(
     record = feature.snapshot.by_name()[name]
     observer = ProceduralSkillsFeature(feature.agent)
     await observer.initialize()
-    real_refresh = feature._refresh_locked
+    real_scan = feature._scan_stable_snapshot_locked
     final_refresh_started = asyncio.Event()
     release_final_refresh = asyncio.Event()
     refresh_calls = 0
@@ -1086,9 +1213,13 @@ async def test_state_finalization_guard_is_visible_to_another_feature_instance(
         if refresh_calls == 3:
             final_refresh_started.set()
             await release_final_refresh.wait()
-        return await real_refresh(**kwargs)
+        return await real_scan(**kwargs)
 
-    monkeypatch.setattr(feature, "_refresh_locked", pause_final_refresh)
+    monkeypatch.setattr(
+        feature,
+        "_scan_stable_snapshot_locked",
+        pause_final_refresh,
+    )
     update = asyncio.create_task(
         feature.set_skill_state(
             name=name,
@@ -1148,12 +1279,21 @@ async def test_state_change_rolls_back_when_final_refresh_resolves_a_new_overrid
         )
     )
     await feature.refresh()
+    published_context = []
+    feature.agent.feature_contribution_runtime = type(
+        "ActiveRuntime",
+        (),
+        {"is_active": staticmethod(lambda _feature: True)},
+    )()
+    feature.agent.refresh_feature_context_clauses = lambda candidate: (
+        published_context.append(candidate.context_clause_text)
+    )
     record = feature.snapshot.by_name()[name]
     local_folder = feature.agent.procedural_skills_root / name
-    real_refresh = feature._refresh_locked
+    real_scan = feature._scan_stable_snapshot_locked
     refresh_count = 0
 
-    async def publish_override_then_refresh():
+    async def publish_override_then_refresh(**kwargs):
         nonlocal refresh_count
         refresh_count += 1
         if refresh_count == 3:
@@ -1164,9 +1304,13 @@ async def test_state_change_rolls_back_when_final_refresh_resolves_a_new_overrid
                 ),
                 encoding="utf-8",
             )
-        await real_refresh()
+        return await real_scan(**kwargs)
 
-    monkeypatch.setattr(feature, "_refresh_locked", publish_override_then_refresh)
+    monkeypatch.setattr(
+        feature,
+        "_scan_stable_snapshot_locked",
+        publish_override_then_refresh,
+    )
 
     with pytest.raises(SkillConflictError, match="resolved source changed"):
         await feature.set_skill_state(
@@ -1182,6 +1326,9 @@ async def test_state_change_rolls_back_when_final_refresh_resolves_a_new_overrid
     assert replacement.source_kind == "agent-local"
     assert replacement.document.description == "Local replacement"
     assert replacement.state == SkillState(False, 100)
+    assert all("Local replacement" not in value for value in published_context), (
+        "a raced generation reached Core before final state validation"
+    )
 
 
 @pytest.mark.asyncio
@@ -1866,6 +2013,15 @@ async def test_create_enable_rejects_a_generation_changed_during_state_write(
         return state
 
     monkeypatch.setattr(feature._enablement, "set", persist_then_replace)
+    published_context = []
+    feature.agent.feature_contribution_runtime = type(
+        "ActiveRuntime",
+        (),
+        {"is_active": staticmethod(lambda _feature: True)},
+    )()
+    feature.agent.refresh_feature_context_clauses = lambda candidate: (
+        published_context.append(candidate.context_clause_text)
+    )
 
     with pytest.raises((SkillConflictError, SkillPathError), match="changed"):
         await feature.create_skill(
@@ -1883,6 +2039,10 @@ async def test_create_enable_rejects_a_generation_changed_during_state_write(
     assert "Unapproved replacement during create enable" not in (
         feature.context_clause_text
     )
+    assert all(
+        "Unapproved replacement during create enable" not in value
+        for value in published_context
+    ), "a raced create generation reached Core before final validation"
 
 
 @pytest.mark.asyncio
@@ -1927,7 +2087,7 @@ async def test_create_enable_guard_is_visible_to_another_feature_instance(
     name = "create-enable-cross-instance-guard"
     final_refresh_started = asyncio.Event()
     release_final_refresh = asyncio.Event()
-    original_refresh = feature._refresh_locked
+    original_scan = feature._scan_stable_snapshot_locked
     paused = False
 
     async def pause_final_refresh(**kwargs):
@@ -1936,9 +2096,13 @@ async def test_create_enable_guard_is_visible_to_another_feature_instance(
             paused = True
             final_refresh_started.set()
             await release_final_refresh.wait()
-        return await original_refresh(**kwargs)
+        return await original_scan(**kwargs)
 
-    monkeypatch.setattr(feature, "_refresh_locked", pause_final_refresh)
+    monkeypatch.setattr(
+        feature,
+        "_scan_stable_snapshot_locked",
+        pause_final_refresh,
+    )
     creation = asyncio.create_task(
         feature.create_skill(
             name=name,
@@ -3665,6 +3829,86 @@ async def test_cancelled_post_publication_refresh_reconciles_catalog(
 
 
 @pytest.mark.asyncio
+async def test_delete_storage_work_does_not_block_the_event_loop(feature, monkeypatch):
+    name = "nonblocking-delete-storage"
+    await feature.skill_create(name, "Delete off loop", "Procedure.")
+    revision = delete_revision(feature, name)
+    release = threading.Event()
+    loop_callback_ran = threading.Event()
+    observed = []
+    original_delete = feature._store.delete
+
+    def blocked_delete(*args, **kwargs):
+        assert release.wait(timeout=2)
+        observed.append(loop_callback_ran.is_set())
+        return original_delete(*args, **kwargs)
+
+    def release_from_loop():
+        loop_callback_ran.set()
+        release.set()
+
+    monkeypatch.setattr(feature._store, "delete", blocked_delete)
+    safety_release = threading.Timer(0.5, release.set)
+    safety_release.start()
+    asyncio.get_running_loop().call_later(0.01, release_from_loop)
+    try:
+        deleted = await feature.delete_skill(
+            name=name,
+            expected_revision=revision,
+        )
+    finally:
+        safety_release.cancel()
+        release.set()
+
+    assert deleted["removed_file"] is True
+    assert observed == [True], "skill deletion blocked the event loop"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_delete_drains_worker_and_reconciles_context(
+    feature, monkeypatch
+):
+    name = "cancelled-delete-storage"
+    await feature.skill_create(name, "Cancelled delete context", "Procedure.")
+    await feature.skill_enable(name)
+    revision = delete_revision(feature, name)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_delete = feature._store.delete
+
+    def blocked_delete(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        try:
+            return original_delete(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(feature._store, "delete", blocked_delete)
+    feature.agent._privacy_transition_lock = asyncio.Lock()
+    deletion = asyncio.create_task(
+        feature.delete_skill(name=name, expected_revision=revision)
+    )
+    assert await asyncio.to_thread(started.wait, 5)
+    deletion.cancel()
+    await asyncio.sleep(0.05)
+    try:
+        assert not deletion.done(), "delete cancellation abandoned its storage worker"
+        assert feature.agent._privacy_transition_lock.locked()
+    finally:
+        release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await deletion
+
+    assert finished.is_set()
+    assert not feature.agent._privacy_transition_lock.locked()
+    assert not (feature.agent.procedural_skills_root / name).exists()
+    assert "Cancelled delete context" not in feature.context_clause_text
+
+
+@pytest.mark.asyncio
 async def test_delete_refuses_host_shared_skill(feature, tmp_path, monkeypatch):
     shared = tmp_path / "shared"
     shared.mkdir()
@@ -4030,6 +4274,128 @@ async def test_git_install_publication_does_not_block_the_event_loop(
 
     assert installed["name"] == name
     assert observed == [True], "install publication blocked the event loop"
+
+
+@pytest.mark.asyncio
+async def test_git_install_workspace_cleanup_does_not_block_the_event_loop(
+    feature, tmp_path, monkeypatch
+):
+    name = "nonblocking-install-workspace-cleanup"
+    checkout_root = tmp_path / "checkout-nonblocking-workspace-cleanup"
+    source = checkout_root / "skills" / name
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(SkillDocument(name, "Remote", "Procedure.")),
+        encoding="utf-8",
+    )
+    release_cleanup = threading.Event()
+    loop_callback_ran = threading.Event()
+    observed = []
+    original_cleanup = feature._store._remove_git_checkout_workspace
+
+    async def fake_checkout(*, source_url, ref, skill_name, target):
+        return GitCheckout(
+            root=checkout_root,
+            skill_folder=source,
+            revision="e" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    def blocked_cleanup(*args, **kwargs):
+        assert release_cleanup.wait(timeout=2)
+        observed.append(loop_callback_ran.is_set())
+        return original_cleanup(*args, **kwargs)
+
+    def release_from_loop():
+        loop_callback_ran.set()
+        release_cleanup.set()
+
+    monkeypatch.setattr(feature, "_checkout_git_until_stopped", fake_checkout)
+    monkeypatch.setattr(
+        feature._store,
+        "_remove_git_checkout_workspace",
+        blocked_cleanup,
+    )
+    safety_release = threading.Timer(0.5, release_cleanup.set)
+    safety_release.start()
+    asyncio.get_running_loop().call_later(0.01, release_from_loop)
+    try:
+        installed = await feature.install_skill(
+            source_url="https://example.com/repo.git",
+            skill_name=name,
+            ref="main",
+        )
+    finally:
+        safety_release.cancel()
+        release_cleanup.set()
+
+    assert installed["name"] == name
+    assert observed == [True], "Git workspace cleanup blocked the event loop"
+
+
+@pytest.mark.asyncio
+async def test_git_install_rollback_does_not_block_the_event_loop(
+    feature, tmp_path, monkeypatch
+):
+    name = "nonblocking-install-rollback"
+    checkout_root = tmp_path / "checkout-nonblocking-rollback"
+    source = checkout_root / "skills" / name
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(SkillDocument(name, "Remote", "Procedure.")),
+        encoding="utf-8",
+    )
+    release_rollback = threading.Event()
+    loop_callback_ran = threading.Event()
+    observed = []
+    original_rollback = feature._store.rollback_installed
+
+    async def fake_checkout(*, source_url, ref, skill_name, target):
+        return GitCheckout(
+            root=checkout_root,
+            skill_folder=source,
+            revision="d" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    def cleanup_fails_after_publication(_name, *, expected):
+        assert expected
+        raise OSError("simulated checkout workspace cleanup failure")
+
+    def blocked_rollback(*args, **kwargs):
+        assert release_rollback.wait(timeout=2)
+        observed.append(loop_callback_ran.is_set())
+        return original_rollback(*args, **kwargs)
+
+    def release_from_loop():
+        loop_callback_ran.set()
+        release_rollback.set()
+
+    monkeypatch.setattr(feature, "_checkout_git_until_stopped", fake_checkout)
+    monkeypatch.setattr(
+        feature._store,
+        "_remove_git_checkout_workspace",
+        cleanup_fails_after_publication,
+    )
+    monkeypatch.setattr(feature._store, "rollback_installed", blocked_rollback)
+    safety_release = threading.Timer(0.5, release_rollback.set)
+    safety_release.start()
+    asyncio.get_running_loop().call_later(0.01, release_from_loop)
+    try:
+        with pytest.raises(OSError, match="checkout workspace cleanup failure"):
+            await feature.install_skill(
+                source_url="https://example.com/repo.git",
+                skill_name=name,
+                ref="main",
+            )
+    finally:
+        safety_release.cancel()
+        release_rollback.set()
+
+    assert observed == [True], "install rollback blocked the event loop"
+    assert not (feature.agent.procedural_skills_root / name).exists()
 
 
 @pytest.mark.asyncio
@@ -4883,9 +5249,62 @@ async def test_python_editor_has_no_execution_effect(feature, tmp_path):
     result = await feature.skill_edit("scripted", source, "scripts/tool.py")
     assert result.status is ToolResultStatus.OK
     assert not marker.exists()
-    tree = feature.tree(name="scripted")
+    tree = await feature.tree(name="scripted")
     python = next(item for item in tree if item["path"] == "scripts/tool.py")
     assert python["execution_risk"] is True
+
+
+@pytest.mark.asyncio
+async def test_tree_and_file_reads_do_not_block_the_event_loop(feature, monkeypatch):
+    name = "nonblocking-skill-read"
+    await feature.skill_create(name, "Read off loop", "Procedure.")
+    record = feature.snapshot.by_name()[name]
+    (record.folder / "notes.md").write_text("Notes.\n", encoding="utf-8")
+    await feature.refresh()
+
+    for method_name, read in (
+        ("tree", lambda: feature.tree(name=name)),
+        (
+            "read_file",
+            lambda: feature.read_file(name=name, relative_path="notes.md"),
+        ),
+    ):
+        release = threading.Event()
+        loop_callback_ran = threading.Event()
+        observed = []
+        original = getattr(feature._store, method_name)
+
+        def blocked(
+            *args,
+            _original=original,
+            _release=release,
+            _observed=observed,
+            _loop_callback_ran=loop_callback_ran,
+            **kwargs,
+        ):
+            assert _release.wait(timeout=2)
+            _observed.append(_loop_callback_ran.is_set())
+            return _original(*args, **kwargs)
+
+        def release_from_loop(
+            _loop_callback_ran=loop_callback_ran,
+            _release=release,
+        ):
+            _loop_callback_ran.set()
+            _release.set()
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(feature._store, method_name, blocked)
+            safety_release = threading.Timer(0.5, release.set)
+            safety_release.start()
+            asyncio.get_running_loop().call_later(0.01, release_from_loop)
+            try:
+                await read()
+            finally:
+                safety_release.cancel()
+                release.set()
+
+        assert observed == [True], f"{method_name} blocked the event loop"
 
 
 @pytest.mark.asyncio
@@ -4896,9 +5315,9 @@ async def test_mixed_case_python_suffix_keeps_execution_risk_warning(feature):
     (folder / "check.PY").write_text("print('still executable')\n", encoding="utf-8")
     await feature.refresh()
 
-    tree = feature.tree(name="mixed-python")
+    tree = await feature.tree(name="mixed-python")
     python = next(item for item in tree if item["path"] == "scripts/check.PY")
-    response = feature.read_file(
+    response = await feature.read_file(
         name="mixed-python",
         relative_path="scripts/check.PY",
     )
@@ -4918,10 +5337,13 @@ async def test_read_file_editability_matches_write_policy(feature, relative_path
 
     tree_entry = next(
         entry
-        for entry in feature.tree(name="read-policy")
+        for entry in await feature.tree(name="read-policy")
         if entry["path"] == relative_path
     )
-    response = feature.read_file(name="read-policy", relative_path=relative_path)
+    response = await feature.read_file(
+        name="read-policy",
+        relative_path=relative_path,
+    )
 
     assert tree_entry["editable"] is False
     assert response["editable"] is False
@@ -4942,7 +5364,7 @@ async def test_nested_metadata_like_resources_remain_in_inventory(feature):
         (folder / relative_path).write_text(content, encoding="utf-8")
     await feature.refresh()
 
-    tree_paths = {entry["path"] for entry in feature.tree(name=name)}
+    tree_paths = {entry["path"] for entry in await feature.tree(name=name)}
     assert expected.keys() <= tree_paths
     for relative_path, content in expected.items():
         result = await feature.skill_read(name, relative_path)

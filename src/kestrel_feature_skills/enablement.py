@@ -25,6 +25,16 @@ def validate_priority(value: object) -> int:
     return priority
 
 
+def _decode_enabled(value: object) -> bool:
+    """Accept only database-native boolean values or SQLite's exact 0/1."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return value == 1
+    raise ValueError("persisted enabled value must be boolean or integer 0/1")
+
+
 class SkillEnablementStore:
     """Read and write isolated rows without creating a feature-owned table.
 
@@ -75,15 +85,18 @@ class SkillEnablementStore:
             name = file_name[len(CONFIG_PREFIX) :]
             try:
                 validate_skill_name(name)
+                normalized_enabled = _decode_enabled(enabled)
                 normalized_priority = validate_priority(priority)
             except ValueError:
                 continue
-            states[name] = SkillState(bool(enabled), normalized_priority)
+            states[name] = SkillState(normalized_enabled, normalized_priority)
         return states
 
     async def set(self, name: str, *, enabled: bool, priority: int) -> SkillState:
         db = self._require()
         name = validate_skill_name(name)
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean")  # noqa: TRY004
         priority = validate_priority(priority)
         file_name = f"{CONFIG_PREFIX}{name}"
         row_id = str(
@@ -108,12 +121,12 @@ class SkillEnablementStore:
                 self.storage_agent_id,
                 file_name,
                 f"skill://{name}",
-                int(bool(enabled)),
+                int(enabled),
                 priority,
                 262_144,
             ),
         )
-        return SkillState(bool(enabled), priority)
+        return SkillState(enabled, priority)
 
     async def delete(self, name: str) -> None:
         db = self._require()

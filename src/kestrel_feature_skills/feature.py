@@ -399,6 +399,23 @@ class ProceduralSkillsFeature(Feature):
         initial_states: dict[str, SkillState] | None = None,
         primary_enablement_error: str | None = None,
     ) -> CatalogSnapshot:
+        snapshot = await self._scan_stable_snapshot_locked(
+            initial_states=initial_states,
+            primary_enablement_error=primary_enablement_error,
+        )
+        return await self._publish_snapshot_locked(
+            snapshot,
+            publish_context=publish_context,
+        )
+
+    async def _scan_stable_snapshot_locked(
+        self,
+        *,
+        initial_states: dict[str, SkillState] | None = None,
+        primary_enablement_error: str | None = None,
+    ) -> CatalogSnapshot:
+        """Scan a state-stable candidate without exposing it to context or graph."""
+
         if self._catalog is None or self._enablement is None:
             raise RuntimeError("ProceduralSkillsFeature is not initialized")
         states = (
@@ -425,10 +442,7 @@ class ProceduralSkillsFeature(Feature):
             # newly observed state. Continuous churn can delay a refresh, but
             # it can never publish an unapproved folder generation as enabled.
             states = verified_states
-        return await self._publish_snapshot_locked(
-            snapshot,
-            publish_context=publish_context,
-        )
+        return snapshot
 
     async def _load_refresh_states(
         self,
@@ -440,7 +454,7 @@ class ProceduralSkillsFeature(Feature):
 
         if self._enablement is None:
             raise RuntimeError("ProceduralSkillsFeature is not initialized")
-        durable_state_available = self._load_durable_fail_closed_states()
+        durable_state_available = await self._load_durable_fail_closed_states()
         try:
             states = await self._enablement.load()
         except DatabaseError as exc:
@@ -565,13 +579,15 @@ class ProceduralSkillsFeature(Feature):
         )
         return guarded
 
-    def _load_durable_fail_closed_states(self) -> bool:
+    async def _load_durable_fail_closed_states(self) -> bool:
         """Merge crash-safe quarantine state before interpreting database rows."""
 
         if self._store is None:
             return False
         try:
-            states, errors = self._store.load_fail_closed_states()
+            states, errors = await self._run_blocking_until_stopped(
+                self._store.load_fail_closed_states
+            )
         except (OSError, SkillError) as exc:
             message = f"could not load durable skill quarantine state: {exc}"
             self._durable_fail_closed_load_error = message
@@ -880,6 +896,56 @@ class ProceduralSkillsFeature(Feature):
                 continue
         return worker.result()
 
+    async def _run_blocking_until_stopped(self, function, /, *args, **kwargs):
+        """Run bounded filesystem work off-loop without abandoning its worker."""
+
+        worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError as cancellation:
+            try:
+                await self._drain_shielded_task(worker)
+            except BaseException as worker_error:
+                cancellation.add_note(
+                    "the cancelled blocking operation also failed while being drained"
+                )
+                raise cancellation from worker_error
+            raise
+
+    @asynccontextmanager
+    async def _git_checkout_workspace_until_stopped(self, store: SkillStore):
+        """Enter and retire a crash-recoverable checkout without loop I/O."""
+
+        manager = store.git_checkout_workspace()
+        workspace = await self._run_blocking_until_stopped(manager.__enter__)
+        try:
+            yield workspace
+        except BaseException as body_error:
+            cleanup = asyncio.create_task(
+                asyncio.to_thread(
+                    manager.__exit__,
+                    type(body_error),
+                    body_error,
+                    body_error.__traceback__,
+                )
+            )
+            try:
+                suppressed = await self._drain_shielded_task(cleanup)
+            except BaseException as cleanup_error:
+                cleanup_error.add_note(
+                    f"Git checkout body originally failed: {body_error}"
+                )
+                raise
+            if not suppressed:
+                raise
+        else:
+            await self._run_blocking_until_stopped(
+                manager.__exit__,
+                None,
+                None,
+                None,
+            )
+
     def _record_payload(
         self, record: SkillRecord, included: set[str]
     ) -> dict[str, object]:
@@ -959,7 +1025,7 @@ class ProceduralSkillsFeature(Feature):
         resolved_priority: int,
     ) -> dict[str, object]:
         name = document.name
-        self._load_durable_fail_closed_states()
+        await self._load_durable_fail_closed_states()
         preserve_fail_closed = name in self._fail_closed_states
         previous_state: SkillState | None = None
         disabled_state: SkillState | None = None
@@ -988,9 +1054,26 @@ class ProceduralSkillsFeature(Feature):
             )
             self._states[document.name] = disabled_state
             state_was_persisted = True
+        cancellation: asyncio.CancelledError | None = None
+        publication_worker = asyncio.create_task(
+            asyncio.to_thread(store.create_pinned, document)
+        )
         try:
-            folder, created_identity = store.create_pinned(document)
-        except Exception as publication_error:
+            try:
+                folder, created_identity = await asyncio.shield(publication_worker)
+            except asyncio.CancelledError as interrupted:
+                cancellation = interrupted
+                try:
+                    folder, created_identity = await self._drain_shielded_task(
+                        publication_worker
+                    )
+                except BaseException as worker_error:
+                    interrupted.add_note(
+                        "cancelled skill creation publication also reported: "
+                        f"{worker_error}"
+                    )
+                    raise interrupted from worker_error
+        except BaseException as publication_error:
             if state_was_persisted:
                 restore_state = (
                     disabled_state
@@ -1011,6 +1094,35 @@ class ProceduralSkillsFeature(Feature):
                     preserve_fail_closed=preserve_fail_closed,
                 )
             raise
+        if cancellation is not None:
+            try:
+                if state_was_persisted:
+                    assert disabled_state is not None
+                    await self._rollback_created_publication(
+                        store,
+                        enablement,
+                        folder,
+                        identity=created_identity,
+                        previous_state=previous_state,
+                        disabled_state=disabled_state,
+                        publication_error=cancellation,
+                        preserve_fail_closed=preserve_fail_closed,
+                    )
+                else:
+                    rollback_worker = asyncio.create_task(
+                        asyncio.to_thread(
+                            store.rollback_created,
+                            folder,
+                            identity=created_identity,
+                        )
+                    )
+                    await self._drain_shielded_task(rollback_worker)
+            except BaseException as rollback_error:  # noqa: BLE001
+                cancellation.add_note(
+                    "cancelled skill creation compensation also reported: "
+                    f"{rollback_error}"
+                )
+            raise cancellation
         state_error: str | None = None
         if enablement.available and enabled:
             if not preserve_fail_closed:
@@ -1092,11 +1204,16 @@ class ProceduralSkillsFeature(Feature):
             )
             release_token = self._releasing_fail_closed_names.set(releasing_names)
             try:
-                await self._refresh_locked()
+                candidate = await self._scan_stable_snapshot_locked()
             finally:
                 self._releasing_fail_closed_names.reset(release_token)
-            record = SkillStore.get(self._snapshot, name)
-            store.assert_created_current(folder, identity=created_identity)
+            record = SkillStore.get(candidate, name)
+            await self._run_blocking_until_stopped(
+                store.assert_created_current,
+                folder,
+                identity=created_identity,
+            )
+            await self._publish_snapshot_locked(candidate)
             if not retain_existing_fail_closed:
                 self._clear_fail_closed_state(name)
         except BaseException as consistency_error:
@@ -1159,8 +1276,11 @@ class ProceduralSkillsFeature(Feature):
         """Restore prior state only after inode-pinned filesystem rollback succeeds."""
 
         rollback_error: BaseException | None = None
+        rollback_worker = asyncio.create_task(
+            asyncio.to_thread(store.rollback_created, folder, identity=identity)
+        )
         try:
-            store.rollback_created(folder, identity=identity)
+            await self._drain_shielded_task(rollback_worker)
         except BaseException as exc:  # noqa: BLE001 - both cleanup rails must run
             rollback_error = exc
             exc.add_note(
@@ -1482,7 +1602,7 @@ class ProceduralSkillsFeature(Feature):
         resolved_priority = (
             record.state.priority if priority is None else validate_priority(priority)
         )
-        store.assert_current(record)
+        await self._run_blocking_until_stopped(store.assert_current, record)
         previous_state_present = name in self._states
         previous_state = self._states.get(name, record.state)
         self._retain_fail_closed_state(
@@ -1511,7 +1631,7 @@ class ProceduralSkillsFeature(Feature):
             )
             raise
         try:
-            store.assert_current(record)
+            await self._run_blocking_until_stopped(store.assert_current, record)
         except BaseException as consistency_error:
             await self._rollback_state_after_consistency_error(
                 enablement=enablement,
@@ -1567,10 +1687,10 @@ class ProceduralSkillsFeature(Feature):
         try:
             release_token = self._releasing_fail_closed_names.set(frozenset((name,)))
             try:
-                await self._refresh_locked()
+                candidate = await self._scan_stable_snapshot_locked()
             finally:
                 self._releasing_fail_closed_names.reset(release_token)
-            refreshed = SkillStore.get(self._snapshot, name)
+            refreshed = SkillStore.get(candidate, name)
             if not _same_resolved_folder(record, refreshed):
                 raise SkillConflictError(
                     f"resolved source changed after changing state for {name}; "
@@ -1580,7 +1700,11 @@ class ProceduralSkillsFeature(Feature):
             # the original filesystem snapshot after that await so an edit or
             # removal during the refresh cannot leave the requested state on a
             # different or future same-named generation.
-            store.assert_current(record)
+            await self._run_blocking_until_stopped(store.assert_current, record)
+            # No await separates this final generation proof from local context
+            # replacement. A raced candidate therefore cannot reach Core before
+            # its source and inode have both been approved.
+            await self._publish_snapshot_locked(candidate)
             # The database row, refreshed catalog, and original folder are now
             # mutually consistent. This synchronous unlink is the commit point
             # that lets sibling processes observe the approved enabled state.
@@ -1667,14 +1791,14 @@ class ProceduralSkillsFeature(Feature):
         resolved_record = SkillStore.get(self._snapshot, name)
         record = _deletion_record(self._snapshot, resolved_record)
         deleting_shadowed_local = record is not resolved_record
-        store.require_local_record(record)
+        await self._run_blocking_until_stopped(store.require_local_record, record)
         _require_expected_revision(
             record,
             expected_revision,
             operation="deletion",
         )
         if deleting_shadowed_local:
-            store.delete(record)
+            await self._run_blocking_until_stopped(store.delete, record)
             refresh_error = await self._refresh_committed_mutation()
             remaining = self._snapshot.by_name().get(name)
             graph_storage = getattr(self.agent, "storage", None)
@@ -1731,7 +1855,7 @@ class ProceduralSkillsFeature(Feature):
                 )
             guard_retained = True
         try:
-            store.delete(record)
+            await self._run_blocking_until_stopped(store.delete, record)
         except BaseException as deletion_error:
             # A failed recursive removal can leave the original only under a
             # quarantine name. Retaining the disabled tombstone is the only
@@ -1880,7 +2004,9 @@ class ProceduralSkillsFeature(Feature):
         operation: _InstalledSkillOperation | None = None
         async with self._publication_state_claim(store, skill_name):
             try:
-                with store.git_checkout_workspace() as temporary:
+                async with self._git_checkout_workspace_until_stopped(
+                    store
+                ) as temporary:
                     target = Path(temporary) / "checkout"
                     checkout = await self._checkout_git_until_stopped(
                         source_url=source_url,
@@ -1970,7 +2096,7 @@ class ProceduralSkillsFeature(Feature):
         provenance: SkillProvenance,
         skill_name: str,
     ) -> _InstalledSkillOperation:
-        self._load_durable_fail_closed_states()
+        await self._load_durable_fail_closed_states()
         preserve_fail_closed = skill_name in self._fail_closed_states
         previous_state: SkillState | None = None
         disabled_state: SkillState | None = None
@@ -2078,11 +2204,15 @@ class ProceduralSkillsFeature(Feature):
         """Remove an unchanged shadowed install and restore its prior state."""
 
         rollback_error: BaseException | None = None
-        try:
-            store.rollback_installed(
+        rollback_worker = asyncio.create_task(
+            asyncio.to_thread(
+                store.rollback_installed,
                 operation.folder,
                 identity=operation.publication,
             )
+        )
+        try:
+            await self._drain_shielded_task(rollback_worker)
         except BaseException as exc:  # noqa: BLE001 - state must remain disabled
             rollback_error = exc
             exc.add_note(
@@ -2152,10 +2282,10 @@ class ProceduralSkillsFeature(Feature):
                     break
             raise
 
-    def read_skill(self, *, name: str) -> dict[str, object]:
+    async def read_skill(self, *, name: str) -> dict[str, object]:
         store, _ = self._require_services()
         record = SkillStore.get(self._snapshot, name)
-        tree = store.tree(record)
+        tree = await self._run_blocking_until_stopped(store.tree, record)
         resources = [entry for entry in tree if entry["path"] != SKILL_FILENAME]
         return {
             "name": name,
@@ -2166,10 +2296,14 @@ class ProceduralSkillsFeature(Feature):
             "revision": record.revision,
         }
 
-    def read_file(self, *, name: str, relative_path: str) -> dict[str, object]:
+    async def read_file(self, *, name: str, relative_path: str) -> dict[str, object]:
         store, _ = self._require_services()
         record = SkillStore.get(self._snapshot, name)
-        content = store.read_file(record, relative_path)
+        content = await self._run_blocking_until_stopped(
+            store.read_file,
+            record,
+            relative_path,
+        )
         execution_risk = has_python_execution_risk(relative_path)
         return {
             "name": name,
@@ -2181,9 +2315,12 @@ class ProceduralSkillsFeature(Feature):
             "revision": record.revision,
         }
 
-    def tree(self, *, name: str) -> tuple[dict[str, object], ...]:
+    async def tree(self, *, name: str) -> tuple[dict[str, object], ...]:
         store, _ = self._require_services()
-        return store.tree(SkillStore.get(self._snapshot, name))
+        return await self._run_blocking_until_stopped(
+            store.tree,
+            SkillStore.get(self._snapshot, name),
+        )
 
     async def _index_record(self, record: SkillRecord) -> bool:
         storage = getattr(self.agent, "storage", None)
@@ -2435,7 +2572,7 @@ class ProceduralSkillsFeature(Feature):
     async def skill_read(self, name: str, path: str = SKILL_FILENAME) -> ToolResult:
         try:
             async with self.persistent_read(refresh=True):
-                inventory = self.read_skill(name=name)
+                inventory = await self.read_skill(name=name)
                 if path == SKILL_FILENAME:
                     payload = inventory
                     confirmation = f"Read procedural skill {name}:\n{payload['body']}"
@@ -2449,7 +2586,7 @@ class ProceduralSkillsFeature(Feature):
                         raise SkillPathError(
                             f"resource is not in the skill inventory: {path}"
                         )
-                    payload = self.read_file(name=name, relative_path=path)
+                    payload = await self.read_file(name=name, relative_path=path)
                     confirmation = (
                         f"Read procedural skill resource {name}/{path} as text; "
                         f"no code was executed:\n{payload['content']}"

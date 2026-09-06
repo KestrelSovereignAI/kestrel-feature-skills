@@ -161,7 +161,7 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
     async def tree(name: str) -> dict[str, object]:
         try:
             async with feature.persistent_read(refresh=True):
-                return {"name": name, "entries": list(feature.tree(name=name))}
+                return {"name": name, "entries": list(await feature.tree(name=name))}
         except (
             SkillNotFoundError,
             SkillFormatError,
@@ -181,7 +181,7 @@ def build_router(feature: ProceduralSkillsFeature) -> APIRouter:
     ) -> dict[str, object]:
         try:
             async with feature.persistent_read(refresh=True):
-                return feature.read_file(name=name, relative_path=path)
+                return await feature.read_file(name=name, relative_path=path)
         except (
             SkillNotFoundError,
             SkillFormatError,

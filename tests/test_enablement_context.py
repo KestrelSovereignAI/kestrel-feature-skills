@@ -112,6 +112,34 @@ async def test_enablement_upsert_and_delete_are_agent_scoped(tmp_path):
         await db.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", ("false", "true", -1, 2, 1.5, b"1"))
+async def test_malformed_persisted_enablement_values_fail_closed(tmp_path, malformed):
+    db = await AsyncDatabase.sqlite(str(tmp_path / "enablement-malformed.db"))
+    try:
+        store = SkillEnablementStore(db, "did:test:malformed")
+        await db.execute(
+            """
+            INSERT INTO bootstrap_config
+                (id, agent_id, file_name, file_path, enabled, priority, max_size_bytes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"malformed-{type(malformed).__name__}-{malformed!r}",
+                store.storage_agent_id,
+                "skill:unsafe",
+                "skill://unsafe",
+                malformed,
+                7,
+                262_144,
+            ),
+        )
+
+        assert await store.load() == {}
+    finally:
+        await db.close()
+
+
 def test_zero_enabled_skills_produces_exact_empty_bytes():
     snapshot = CatalogSnapshot(
         records=(record("off", "Disabled", "SECRET", enabled=False),)
