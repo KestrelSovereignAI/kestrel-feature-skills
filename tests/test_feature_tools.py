@@ -2992,6 +2992,7 @@ async def test_delete_reports_partial_when_committed_guard_cleanup_stays_unprove
         error="seeded deletion guard",
     )
     approved_revision = delete_revision(feature, name)
+    real_clear = feature._store.clear_fail_closed_state
 
     def fail_clear(_candidate):
         raise OSError("marker storage unavailable")
@@ -3006,6 +3007,64 @@ async def test_delete_reports_partial_when_committed_guard_cleanup_stays_unprove
     assert "marker cleanup remains incomplete" in result.error
     assert not (feature.agent.procedural_skills_root / name).exists()
     assert name not in await feature._enablement.load()
+
+    monkeypatch.setattr(feature._store, "clear_fail_closed_state", real_clear)
+    await feature.refresh()
+
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert name not in guarded
+    assert feature.catalog_payload()["enablement_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_orphan_guard_reaper_reverifies_database_absence(feature, monkeypatch):
+    name = "guard-row-race"
+    persisted = await feature._enablement.set(name, enabled=True, priority=23)
+    feature._retain_fail_closed_state(
+        name,
+        priority=persisted.priority,
+        error="guard must survive a concurrently restored row",
+    )
+    real_load = feature._enablement.load
+    loads = 0
+
+    async def hide_row_from_first_load():
+        nonlocal loads
+        loads += 1
+        if loads == 1:
+            return {}
+        return await real_load()
+
+    monkeypatch.setattr(feature._enablement, "load", hide_row_from_first_load)
+
+    await feature.refresh()
+
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert loads >= 3
+    assert guarded[name] == SkillState(False, 23)
+    assert "guard must survive" in feature.catalog_payload()["enablement_error"]
+
+
+@pytest.mark.asyncio
+async def test_orphan_guard_reaper_requires_an_available_database(feature):
+    name = "guard-database-unavailable"
+    await feature._enablement.set(name, enabled=True, priority=31)
+    feature._retain_fail_closed_state(
+        name,
+        priority=31,
+        error="guard must survive unavailable database",
+    )
+    database = feature._enablement.db
+    feature._enablement.db = None
+    try:
+        await feature.refresh()
+        guarded, _errors = feature._store.load_fail_closed_states()
+        assert guarded[name] == SkillState(False, 31)
+        assert "guard must survive" in feature.catalog_payload()["enablement_error"]
+    finally:
+        feature._enablement.db = database
+
+    assert (await feature._enablement.load())[name] == SkillState(True, 31)
 
 
 @pytest.mark.asyncio
@@ -3183,6 +3242,39 @@ async def test_edit_reports_committed_outcome_when_context_publication_fails(fea
     assert (feature.agent.procedural_skills_root / name / "SKILL.md").read_text(
         encoding="utf-8"
     ) == replacement
+
+
+@pytest.mark.asyncio
+async def test_edit_does_not_report_failure_after_recovery_marker_cleanup_error(
+    feature, monkeypatch
+):
+    name = "edit-marker-cleanup-failure"
+    await feature.skill_create(name, "Original description", "Original procedure.")
+    replacement = serialize_skill_markdown(
+        SkillDocument(name, "Replacement description", "Replacement procedure.")
+    )
+    real_unlink = store_module._unlink_at
+    marker_cleanup_attempted = False
+
+    def fail_recovery_marker_cleanup(directory_fd, candidate):
+        nonlocal marker_cleanup_attempted
+        if candidate == store_module.GIT_CHECKOUT_RECOVERY_MARKER:
+            marker_cleanup_attempted = True
+            raise OSError("recovery marker cleanup failed after publication")
+        real_unlink(directory_fd, candidate)
+
+    monkeypatch.setattr(store_module, "_unlink_at", fail_recovery_marker_cleanup)
+
+    result = await feature.skill_edit(name, replacement)
+
+    assert marker_cleanup_attempted
+    assert result.status is ToolResultStatus.OK
+    assert (feature.agent.procedural_skills_root / name / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == replacement
+    assert not tuple(
+        feature._store._internal_root.glob(f"{store_module.GIT_CHECKOUT_PREFIX}*")
+    )
 
 
 @pytest.mark.asyncio

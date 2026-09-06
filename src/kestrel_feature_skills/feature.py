@@ -463,6 +463,8 @@ class ProceduralSkillsFeature(Feature):
                 exc,
             )
         else:
+            if durable_state_available and self._enablement.available:
+                await self._reap_orphaned_fail_closed_states(states)
             if not durable_state_available:
                 states = {
                     name: SkillState(False, state.priority)
@@ -475,6 +477,57 @@ class ProceduralSkillsFeature(Feature):
             self._states = dict(states)
             self._enablement_error = self._combined_enablement_error(primary_error)
         return states
+
+    async def _reap_orphaned_fail_closed_states(
+        self,
+        observed_states: dict[str, SkillState],
+    ) -> None:
+        """Retire guards whose folder and database row are provably absent."""
+
+        store, enablement = self._require_services()
+        candidates = self._durable_fail_closed_names - observed_states.keys()
+        for name in sorted(candidates):
+            try:
+                if store.local_entry_identity(name) is not None:
+                    continue
+                claim = store.try_acquire_publication_state_claim(name)
+            except (OSError, SkillError) as exc:
+                logger.warning(
+                    "Could not inspect orphaned procedural skill guard %s: %s",
+                    name,
+                    exc,
+                )
+                continue
+            # A mutation holding this claim may be between its filesystem and
+            # database commit points. Defer to a later refresh instead of
+            # blocking (or trying to reacquire our own current claim).
+            if claim is None:
+                continue
+            try:
+                if store.local_entry_identity(name) is not None:
+                    continue
+                try:
+                    verified_states = await enablement.load()
+                except DatabaseError as exc:
+                    logger.warning(
+                        "Could not verify orphaned procedural skill guard %s: %s",
+                        name,
+                        exc,
+                    )
+                    continue
+                if name in verified_states:
+                    continue
+                try:
+                    self._clear_fail_closed_state(name)
+                except (OSError, SkillError) as exc:
+                    # The guard stays fail-closed and another refresh retries.
+                    logger.warning(
+                        "Could not retire orphaned procedural skill guard %s: %s",
+                        name,
+                        exc,
+                    )
+            finally:
+                claim.release()
 
     async def _refresh_committed_mutation(self) -> str | None:
         """Refresh a committed mutation, preserving a publication error as data."""

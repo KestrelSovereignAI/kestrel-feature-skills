@@ -903,14 +903,24 @@ def _remove_expected_directory_at(
     *,
     expected: tuple[int, int],
 ) -> None:
-    """Remove exactly one pinned child, preserving any raced replacement."""
+    """Remove one pinned child through the private recovery domain."""
 
-    quarantine = _quarantine_directory_at(root_fd, name, expected=expected)
-    _remove_quarantined_directory_at(
-        root_fd,
-        quarantine,
-        expected=expected,
-    )
+    internal_fd = _open_directory_at(root_fd, INTERNAL_DIRECTORY)
+    try:
+        quarantine = _quarantine_directory_at(
+            root_fd,
+            name,
+            expected=expected,
+            internal_fd=internal_fd,
+        )
+        _remove_quarantined_directory_at(
+            root_fd,
+            quarantine,
+            expected=expected,
+            source_directory_fd=internal_fd,
+        )
+    finally:
+        os.close(internal_fd)
 
 
 def _preserve_recovery_directory_at(
@@ -1800,8 +1810,20 @@ class SkillStore:
                 # workspace manager then moves the failed publication into the
                 # private recovery domain.
                 yield
-                _unlink_at(workspace_fd, GIT_CHECKOUT_RECOVERY_MARKER)
-                os.fsync(workspace_fd)
+                try:
+                    _unlink_at(workspace_fd, GIT_CHECKOUT_RECOVERY_MARKER)
+                    os.fsync(workspace_fd)
+                except OSError as cleanup_error:
+                    # Publication already committed. The outer workspace
+                    # manager removes this private checkout best-effort; if
+                    # that also fails, startup recovery conservatively retains
+                    # the marked prior generation instead of turning a
+                    # committed edit into a reported failure.
+                    logger.warning(
+                        "Could not disarm committed skill edit recovery in %s: %s",
+                        workspace.name,
+                        cleanup_error,
+                    )
             finally:
                 os.close(workspace_fd)
         finally:
@@ -2305,6 +2327,7 @@ class SkillStore:
                                 root_fd,
                                 cleanup_name,
                                 expected=created_identity,
+                                internal_fd=internal_fd,
                             )
                             try:
                                 if published is None:
@@ -2312,7 +2335,7 @@ class SkillStore:
                                         "created publication evidence is unavailable"
                                     )
                                 self._assert_created_publication_at(
-                                    root_fd,
+                                    internal_fd,
                                     quarantine,
                                     published,
                                 )
@@ -2331,6 +2354,7 @@ class SkillStore:
                                 root_fd,
                                 quarantine,
                                 expected=created_identity,
+                                source_directory_fd=internal_fd,
                             )
                         else:
                             _purge_internal_directory_at(
@@ -2478,8 +2502,10 @@ class SkillStore:
                 quarantine,
                 public_name,
                 expected=expected,
+                source_directory_fd=internal_fd,
             )
             restored_publicly = True
+            location = public_name
             os.fsync(root_fd)
         except BaseException as restoration_error:  # noqa: BLE001
             publication_error.add_note(
@@ -2487,21 +2513,7 @@ class SkillStore:
                 f"{restoration_error}"
             )
             if not restored_publicly:
-                location = quarantine
-                try:
-                    recovery = _preserve_recovery_directory_at(
-                        root_fd,
-                        quarantine,
-                        expected=expected,
-                        internal_fd=internal_fd,
-                    )
-                except BaseException as recovery_error:  # noqa: BLE001
-                    publication_error.add_note(
-                        f"modified {operation} folder remains as {quarantine}; "
-                        f"private retirement also reported: {recovery_error}"
-                    )
-                else:
-                    location = f"{INTERNAL_DIRECTORY}/{recovery}"
+                location = f"{INTERNAL_DIRECTORY}/{quarantine}"
         raise SkillPublicationCleanupError(
             f"skill {operation} publication failed after its contents changed; "
             f"the modified folder was preserved as {location}"
@@ -2752,18 +2764,19 @@ class SkillStore:
             name,
             root_identity=self._local_root_identity,
             internal_root_identity=self._internal_root_identity,
-        ) as (root_fd, _artifact_fd):
+        ) as (root_fd, internal_fd):
             if _identity_at(root_fd, name) is None:
                 return
             quarantine = _quarantine_directory_at(
                 root_fd,
                 name,
                 expected=folder_identity,
+                internal_fd=internal_fd,
             )
             if isinstance(identity, CreatedSkillPublication):
                 try:
                     descriptor = _open_directory_at(
-                        root_fd,
+                        internal_fd,
                         quarantine,
                         expected=folder_identity,
                     )
@@ -2828,6 +2841,7 @@ class SkillStore:
                             quarantine,
                             name,
                             expected=folder_identity,
+                            source_directory_fd=internal_fd,
                         )
                     except Exception as restoration_error:  # noqa: BLE001
                         inspection_error.add_note(str(restoration_error))
@@ -2836,6 +2850,7 @@ class SkillStore:
                 root_fd,
                 quarantine,
                 expected=folder_identity,
+                source_directory_fd=internal_fd,
             )
 
     def assert_created_current(
@@ -2935,17 +2950,18 @@ class SkillStore:
             name,
             root_identity=self._local_root_identity,
             internal_root_identity=self._internal_root_identity,
-        ) as (root_fd, _artifact_fd):
+        ) as (root_fd, internal_fd):
             if _identity_at(root_fd, name) is None:
                 return
             quarantine = _quarantine_directory_at(
                 root_fd,
                 name,
                 expected=identity.folder_identity,
+                internal_fd=internal_fd,
             )
             try:
                 current = _inspect_child_at(
-                    root_fd,
+                    internal_fd,
                     quarantine,
                     expected=identity.folder_identity,
                     folder_name=name,
@@ -2970,6 +2986,7 @@ class SkillStore:
                         quarantine,
                         name,
                         expected=identity.folder_identity,
+                        source_directory_fd=internal_fd,
                     )
                 except Exception as restoration_error:  # noqa: BLE001
                     inspection_error.add_note(str(restoration_error))
@@ -2978,6 +2995,7 @@ class SkillStore:
                 root_fd,
                 quarantine,
                 expected=identity.folder_identity,
+                source_directory_fd=internal_fd,
             )
 
     def read_file(self, record: SkillRecord, relative_path: str) -> str:
@@ -3312,6 +3330,7 @@ class SkillStore:
                                     root_fd,
                                     cleanup_name,
                                     expected=created_identity,
+                                    internal_fd=internal_fd,
                                 )
                                 try:
                                     if publication is None:
@@ -3319,7 +3338,7 @@ class SkillStore:
                                             "installed publication evidence is unavailable"
                                         )
                                     self._assert_installed_publication_at(
-                                        root_fd,
+                                        internal_fd,
                                         quarantine,
                                         publication,
                                     )
@@ -3338,6 +3357,7 @@ class SkillStore:
                                     root_fd,
                                     quarantine,
                                     expected=created_identity,
+                                    source_directory_fd=internal_fd,
                                 )
                             else:
                                 _purge_internal_directory_at(

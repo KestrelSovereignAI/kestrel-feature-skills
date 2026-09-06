@@ -161,6 +161,66 @@ def _crash_after_delete_detach(root):
     os._exit(87)
 
 
+def _crash_after_publication_rollback_detach(root, operation):
+    """Exit after one create/install rollback detaches its public generation."""
+
+    root = Path(root)
+    store = SkillStore(root)
+    name = f"crash-{operation.replace('_', '-')}"
+    source = root.parent / "rollback-source" / name
+    publication = None
+    folder = None
+    if operation in {"install_failure", "rollback_installed"}:
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(
+            serialize_skill_markdown(
+                SkillDocument(name, "Crash install rollback", "Unique procedure.")
+            ),
+            encoding="utf-8",
+        )
+    if operation == "rollback_created":
+        folder, publication = store.create_pinned(
+            SkillDocument(name, "Crash create rollback", "Unique procedure.")
+        )
+    elif operation == "rollback_installed":
+        folder, publication = store.install_folder_pinned(
+            source,
+            provenance=git_provenance(name),
+        )
+
+    if operation in {"create_failure", "install_failure"}:
+        real_fsync_pair = store_module._fsync_directory_pair
+
+        def fail_post_publication_sync(first_fd, second_fd):
+            if (root / name).is_dir():
+                raise OSError(errno.EIO, "post-publication sync failed")
+            return real_fsync_pair(first_fd, second_fd)
+
+        store_module._fsync_directory_pair = fail_post_publication_sync
+
+    real_quarantine = store_module._quarantine_directory_at
+
+    def detach_then_exit(*args, **kwargs):
+        real_quarantine(*args, **kwargs)
+        os._exit(86)
+
+    store_module._quarantine_directory_at = detach_then_exit
+    if operation == "create_failure":
+        store.create_pinned(
+            SkillDocument(name, "Crash create cleanup", "Unique procedure.")
+        )
+    elif operation == "install_failure":
+        store.install_folder_pinned(source, provenance=git_provenance(name))
+    elif operation == "rollback_created":
+        assert folder is not None and publication is not None
+        store.rollback_created(folder, identity=publication)
+    else:
+        assert operation == "rollback_installed"
+        assert folder is not None and publication is not None
+        store.rollback_installed(folder, identity=publication)
+    os._exit(87)
+
+
 def test_atomic_create_leaves_no_temporary_or_claim_files(tmp_path):
     root = tmp_path / "skills"
     store = SkillStore(root)
@@ -2335,7 +2395,7 @@ def test_install_rollback_preserves_changed_quarantine_and_raced_replacement(
     replacement_marker = folder / "replacement.md"
 
     def change_quarantine_and_republish(root_fd, child_name, **kwargs):
-        quarantined = store.local_root / child_name
+        quarantined = store._internal_root / child_name
         (quarantined / "notes.md").write_text(
             "changed while detached", encoding="utf-8"
         )
@@ -2359,7 +2419,9 @@ def test_install_rollback_preserves_changed_quarantine_and_raced_replacement(
         store.rollback_installed(folder, identity=publication)
 
     assert replacement_marker.read_text(encoding="utf-8") == "replacement"
-    quarantines = list(store.local_root.glob(f".{name}.delete.*"))
+    quarantines = list(
+        store._internal_root.glob(f"{store_module.SKILL_RECOVERY_PREFIX}*")
+    )
     assert len(quarantines) == 1
     assert (quarantines[0] / "notes.md").read_text(encoding="utf-8") == (
         "changed while detached"
@@ -2564,24 +2626,39 @@ def test_rollback_created_preserves_replacement_swapped_after_identity_check(
     identity = (folder.stat().st_dev, folder.stat().st_ino)
     displaced = tmp_path / "displaced-rollback"
     marker = folder / "replacement-must-survive.md"
-    real_rename = os.rename
+    real_rename_no_replace = store_module._rename_directory_no_replace_at
     swapped = False
 
-    def swap_before_removal(source_name, destination_name, **kwargs):
+    def swap_before_removal(
+        directory_fd,
+        source_name,
+        destination_name,
+        *,
+        destination_directory_fd=None,
+    ):
         nonlocal swapped
         if source_name == folder.name and not swapped:
             swapped = True
-            real_rename(folder, displaced)
+            folder.rename(displaced)
             folder.mkdir()
             marker.write_text("replacement", encoding="utf-8")
-        return real_rename(source_name, destination_name, **kwargs)
+        return real_rename_no_replace(
+            directory_fd,
+            source_name,
+            destination_name,
+            destination_directory_fd=destination_directory_fd,
+        )
 
-    monkeypatch.setattr(store_module.os, "rename", swap_before_removal)
+    monkeypatch.setattr(
+        store_module, "_rename_directory_no_replace_at", swap_before_removal
+    )
 
     with pytest.raises(SkillPathError, match="changed|preserved"):
         store.rollback_created(folder, identity=identity)
 
-    quarantines = list(store.local_root.glob(".rollback-race.delete.*"))
+    quarantines = list(
+        store._internal_root.glob(f"{store_module.SKILL_RECOVERY_PREFIX}*")
+    )
     assert len(quarantines) == 1
     assert (quarantines[0] / marker.name).read_text(encoding="utf-8") == "replacement"
     assert (displaced / "SKILL.md").is_file()
@@ -2908,6 +2985,45 @@ def test_delete_crash_does_not_strand_a_public_quarantine(tmp_path):
     assert deleter.exitcode == 86
     SkillStore(root)
     assert not tuple(root.glob(f".{name}.delete.*"))
+    recovery = tuple(
+        (root / INTERNAL_DIRECTORY).glob(f"{store_module.SKILL_RECOVERY_PREFIX}*")
+    )
+    assert len(recovery) == 1
+    assert (recovery[0] / "SKILL.md").is_file()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    (
+        "create_failure",
+        "install_failure",
+        "rollback_created",
+        "rollback_installed",
+    ),
+)
+def test_publication_rollback_crash_does_not_strand_public_quarantine(
+    tmp_path, operation
+):
+    root = tmp_path / "skills"
+    SkillStore(root)
+    name = f"crash-{operation.replace('_', '-')}"
+    context = multiprocessing.get_context("spawn")
+    worker = context.Process(
+        target=_crash_after_publication_rollback_detach,
+        args=(str(root), operation),
+    )
+
+    worker.start()
+    worker.join(timeout=10)
+    if worker.is_alive():  # pragma: no cover - prevents a leaked test process
+        worker.terminate()
+        worker.join(timeout=5)
+        pytest.fail("crashing publication rollback did not finish")
+
+    assert worker.exitcode == 86
+    assert not (root / name).exists()
+    assert not tuple(root.glob(f".{name}.delete.*"))
+    SkillStore(root)
     recovery = tuple(
         (root / INTERNAL_DIRECTORY).glob(f"{store_module.SKILL_RECOVERY_PREFIX}*")
     )
