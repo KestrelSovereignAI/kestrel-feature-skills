@@ -567,6 +567,41 @@ def test_generation_marker_publication_compensates_move_after_anchor_check(
     )
 
 
+def test_generation_marker_publication_compensates_configured_root_replacement(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    displaced_root = tmp_path / "displaced-local"
+    local.mkdir()
+    folder = make_skill(local, "root-link-race", "Root link race")
+    real_link = sources_module.os.link
+    root_replaced_during_publication = False
+
+    def replace_root_during_link(source, destination, *args, **kwargs):
+        nonlocal root_replaced_during_publication
+        if destination == GENERATION_FILENAME and not root_replaced_during_publication:
+            local.rename(displaced_root)
+            local.mkdir()
+            root_replaced_during_publication = True
+        return real_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(sources_module.os, "link", replace_root_during_link)
+
+    records, errors = DirectorySkillSource(
+        root=local,
+        source_id="agent-local",
+        kind="agent-local",
+        precedence=AGENT_LOCAL_PRECEDENCE,
+    ).discover()
+
+    assert root_replaced_during_publication
+    assert records == ()
+    assert len(errors) == 1
+    assert not (displaced_root / folder.name / GENERATION_FILENAME).exists(), (
+        "discovery left its generation marker in the displaced source root"
+    )
+
+
 def test_generation_marker_publication_compensates_post_link_fsync_error(
     tmp_path, monkeypatch
 ):

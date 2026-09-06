@@ -1225,6 +1225,22 @@ class ProceduralSkillsFeature(Feature):
                 error=message,
             )
             raise DatabaseError(message) from rollback_error
+        if previous_state is not None and previous_state.enabled:
+            # The database await above is not a filesystem publication barrier.
+            # A non-cooperating writer can publish a new same-name generation or
+            # source while the old enabled row is being restored. Keep the
+            # synchronous durable fence authoritative until a later explicit
+            # state/publication operation validates the generation it releases.
+            self._retain_fail_closed_state(
+                name,
+                priority=previous_state.priority,
+                error=(
+                    f"{operation} failed ({publication_error}); the prior enabled "
+                    "row was restored, but its filesystem generation was not "
+                    "proven and remains quarantined"
+                ),
+            )
+            preserve_fail_closed = True
         if not preserve_fail_closed:
             self._clear_fail_closed_state(name)
 
@@ -1983,12 +1999,30 @@ class ProceduralSkillsFeature(Feature):
             )
             self._states[skill_name] = disabled_state
             state_was_persisted = True
-        try:
-            folder, publication = store.install_folder_pinned(
+        cancellation: asyncio.CancelledError | None = None
+        publication_worker = asyncio.create_task(
+            asyncio.to_thread(
+                store.install_folder_pinned,
                 source_folder,
                 provenance=provenance,
             )
-        except Exception as publication_error:
+        )
+        try:
+            try:
+                folder, publication = await asyncio.shield(publication_worker)
+            except asyncio.CancelledError as interrupted:
+                cancellation = interrupted
+                try:
+                    folder, publication = await self._drain_shielded_task(
+                        publication_worker
+                    )
+                except BaseException as worker_error:
+                    interrupted.add_note(
+                        "cancelled skill install publication also reported: "
+                        f"{worker_error}"
+                    )
+                    raise interrupted from worker_error
+        except BaseException as publication_error:
             if state_was_persisted:
                 restore_state = (
                     disabled_state
@@ -2009,7 +2043,7 @@ class ProceduralSkillsFeature(Feature):
                     preserve_fail_closed=preserve_fail_closed,
                 )
             raise
-        return _InstalledSkillOperation(
+        operation = _InstalledSkillOperation(
             folder=folder,
             publication=publication,
             previous_state=previous_state,
@@ -2017,6 +2051,21 @@ class ProceduralSkillsFeature(Feature):
             state_was_persisted=state_was_persisted,
             preserve_fail_closed=preserve_fail_closed,
         )
+        if cancellation is not None:
+            try:
+                await self._rollback_installed_publication(
+                    store=store,
+                    enablement=enablement,
+                    operation=operation,
+                    publication_error=cancellation,
+                )
+            except BaseException as rollback_error:  # noqa: BLE001
+                cancellation.add_note(
+                    "cancelled skill install compensation also reported: "
+                    f"{rollback_error}"
+                )
+            raise cancellation
+        return operation
 
     async def _rollback_installed_publication(
         self,

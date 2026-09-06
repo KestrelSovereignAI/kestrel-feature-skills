@@ -2319,6 +2319,60 @@ async def test_failed_create_publication_keeps_raced_replacement_disabled(
 
 
 @pytest.mark.asyncio
+async def test_enabled_state_restore_cannot_release_generation_published_during_await(
+    feature, monkeypatch
+):
+    name = "restore-enabled-generation-race"
+    prior_state = await feature._enablement.set(name, enabled=True, priority=17)
+    feature._states[name] = prior_state
+    published = feature.agent.procedural_skills_root / name
+    original_set = feature._enablement.set
+    raced_generation_created = False
+
+    def fail_publication(_document):
+        raise OSError("simulated create publication failure")
+
+    async def restore_then_publish_replacement(*args, **kwargs):
+        nonlocal raced_generation_created
+        state = await original_set(*args, **kwargs)
+        if kwargs["enabled"] is True and not raced_generation_created:
+            published.mkdir()
+            (published / "SKILL.md").write_text(
+                serialize_skill_markdown(
+                    SkillDocument(
+                        name,
+                        "Unapproved generation during enabled-row restoration",
+                        "Unapproved procedure.",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            raced_generation_created = True
+        return state
+
+    monkeypatch.setattr(feature._store, "create_pinned", fail_publication)
+    monkeypatch.setattr(feature._enablement, "set", restore_then_publish_replacement)
+
+    result = await feature.skill_create(
+        name,
+        "Failed approved generation",
+        "Procedure.",
+    )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert raced_generation_created
+    assert (await feature._enablement.load())[name] == prior_state
+    guarded, _errors = feature._store.load_fail_closed_states()
+    assert guarded[name] == SkillState(False, prior_state.priority)
+    assert feature.snapshot.by_name()[name].state == SkillState(
+        False, prior_state.priority
+    )
+    assert "Unapproved generation during enabled-row restoration" not in (
+        feature.context_clause_text
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_conflict_keeps_raced_replacement_disabled(feature, monkeypatch):
     name = "create-conflict-raced-replacement"
     prior_state = await feature._enablement.set(name, enabled=True, priority=17)
@@ -2498,7 +2552,9 @@ async def test_ambiguous_enabled_create_failure_restores_prior_state(
         assert name not in feature._states
     else:
         assert persisted[name] == prior_state
-        assert feature._states[name] == prior_state
+        assert feature._states[name] == SkillState(False, prior_state.priority)
+        guarded, _errors = feature._store.load_fail_closed_states()
+        assert guarded[name] == SkillState(False, prior_state.priority)
 
 
 @pytest.mark.asyncio
@@ -2530,7 +2586,9 @@ async def test_failed_create_publication_restores_prior_enablement(
         assert name not in feature._states
     else:
         assert persisted[name] == prior_state
-        assert feature._states[name] == prior_state
+        assert feature._states[name] == SkillState(False, prior_state.priority)
+        guarded, _errors = feature._store.load_fail_closed_states()
+        assert guarded[name] == SkillState(False, prior_state.priority)
 
 
 @pytest.mark.asyncio
@@ -3921,6 +3979,60 @@ async def test_git_install_uses_recoverable_internal_checkout_workspace(
 
 
 @pytest.mark.asyncio
+async def test_git_install_publication_does_not_block_the_event_loop(
+    feature, tmp_path, monkeypatch
+):
+    name = "nonblocking-install-publication"
+    checkout_root = tmp_path / "checkout-nonblocking-publication"
+    source = checkout_root / "skills" / name
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(SkillDocument(name, "Remote", "Procedure.")),
+        encoding="utf-8",
+    )
+    release_publication = threading.Event()
+    loop_callback_ran = threading.Event()
+    observed = []
+    original_install = feature._store.install_folder_pinned
+
+    async def fake_checkout(*, source_url, ref, skill_name, target):
+        return GitCheckout(
+            root=checkout_root,
+            skill_folder=source,
+            revision="b" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    def blocked_install(*args, **kwargs):
+        assert release_publication.wait(timeout=2)
+        observed.append(loop_callback_ran.is_set())
+        return original_install(*args, **kwargs)
+
+    def release_from_loop():
+        loop_callback_ran.set()
+        release_publication.set()
+
+    monkeypatch.setattr(feature, "_checkout_git_until_stopped", fake_checkout)
+    monkeypatch.setattr(feature._store, "install_folder_pinned", blocked_install)
+    safety_release = threading.Timer(0.5, release_publication.set)
+    safety_release.start()
+    asyncio.get_running_loop().call_later(0.01, release_from_loop)
+    try:
+        installed = await feature.install_skill(
+            source_url="https://example.com/repo.git",
+            skill_name=name,
+            ref="main",
+        )
+    finally:
+        safety_release.cancel()
+        release_publication.set()
+
+    assert installed["name"] == name
+    assert observed == [True], "install publication blocked the event loop"
+
+
+@pytest.mark.asyncio
 async def test_git_install_compensates_when_checkout_workspace_cleanup_fails(
     feature, monkeypatch
 ):
@@ -4254,6 +4366,70 @@ async def test_cancelled_git_install_waits_for_worker_before_releasing(
         "install cancellation propagated and released the privacy lock while "
         "the Git worker was still running"
     )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_install_publication_drains_and_compensates_before_unlock(
+    feature, tmp_path, monkeypatch
+):
+    name = "cancelled-storage-publication"
+    checkout_root = tmp_path / "checkout-cancelled-storage"
+    source = checkout_root / "skills" / name
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text(
+        serialize_skill_markdown(SkillDocument(name, "Remote", "Procedure.")),
+        encoding="utf-8",
+    )
+    publication_started = threading.Event()
+    release_publication = threading.Event()
+    publication_finished = threading.Event()
+    original_install = feature._store.install_folder_pinned
+
+    async def fake_checkout(*, source_url, ref, skill_name, target):
+        return GitCheckout(
+            root=checkout_root,
+            skill_folder=source,
+            revision="c" * 40,
+            remote_url=source_url,
+            ref=ref,
+        )
+
+    def blocked_install(*args, **kwargs):
+        publication_started.set()
+        assert release_publication.wait(timeout=5)
+        try:
+            return original_install(*args, **kwargs)
+        finally:
+            publication_finished.set()
+
+    monkeypatch.setattr(feature, "_checkout_git_until_stopped", fake_checkout)
+    monkeypatch.setattr(feature._store, "install_folder_pinned", blocked_install)
+    feature.agent._privacy_transition_lock = asyncio.Lock()
+    installation = asyncio.create_task(
+        feature.install_skill(
+            source_url="https://example.com/repo.git",
+            skill_name=name,
+            ref="main",
+        )
+    )
+    assert await asyncio.to_thread(publication_started.wait, 5)
+    installation.cancel()
+    await asyncio.sleep(0.05)
+    try:
+        assert not installation.done(), (
+            "install cancellation escaped while storage publication was active"
+        )
+        assert feature.agent._privacy_transition_lock.locked()
+    finally:
+        release_publication.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await installation
+
+    assert publication_finished.is_set()
+    assert not feature.agent._privacy_transition_lock.locked()
+    assert not (feature.agent.procedural_skills_root / name).exists()
+    assert name not in await feature._enablement.load()
 
 
 @pytest.mark.asyncio

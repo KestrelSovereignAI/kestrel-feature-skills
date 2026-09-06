@@ -177,6 +177,27 @@ def _anchored_folder_matches(
     )
 
 
+def _configured_root_matches(
+    root: Path,
+    root_fd: int,
+    *,
+    expected_root_identity: tuple[int, int],
+) -> bool:
+    """Return whether ``root_fd`` is still the configured lexical source root."""
+
+    try:
+        lexical = root.lstat()
+        opened = os.fstat(root_fd)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(lexical.st_mode)
+        and not stat.S_ISLNK(lexical.st_mode)
+        and (lexical.st_dev, lexical.st_ino) == expected_root_identity
+        and (opened.st_dev, opened.st_ino) == expected_root_identity
+    )
+
+
 def _unlink_owned_generation_marker(
     folder_fd: int,
     *,
@@ -201,6 +222,8 @@ def _ensure_local_generation_marker(
     root_fd: int,
     folder_fd: int,
     *,
+    configured_root: Path,
+    expected_root_identity: tuple[int, int],
     folder_name: str,
     expected_folder_identity: tuple[int, int],
 ) -> bytes:
@@ -210,6 +233,13 @@ def _ensure_local_generation_marker(
         return _read_generation_marker(folder_fd)
     except FileNotFoundError:
         pass
+
+    if not _configured_root_matches(
+        configured_root,
+        root_fd,
+        expected_root_identity=expected_root_identity,
+    ):
+        raise SkillPathError("skill source root changed before generation metadata")
 
     # Private staging keeps a crashed writer outside the bounded public source.
     # The shared lock also lets startup distinguish orphaned temporaries from a
@@ -270,9 +300,13 @@ def _ensure_local_generation_marker(
                     folder_fd,
                     folder_name=folder_name,
                     expected_folder_identity=expected_folder_identity,
+                ) or not _configured_root_matches(
+                    configured_root,
+                    root_fd,
+                    expected_root_identity=expected_root_identity,
                 ):
                     raise SkillPathError(
-                        "skill folder moved outside its source before generation metadata"
+                        "skill source or folder changed before generation metadata"
                     )
                 try:
                     os.link(
@@ -303,21 +337,34 @@ def _ensure_local_generation_marker(
                     if (current.st_dev, current.st_ino) == created_identity:
                         os.unlink(temporary, dir_fd=artifact_fd)
                 os.fsync(artifact_fd)
-            if not _anchored_folder_matches(
+            root_still_configured = _configured_root_matches(
+                configured_root,
+                root_fd,
+                expected_root_identity=expected_root_identity,
+            )
+            folder_still_anchored = _anchored_folder_matches(
                 root_fd,
                 folder_fd,
                 folder_name=folder_name,
                 expected_folder_identity=expected_folder_identity,
-            ):
+            )
+            if not root_still_configured or not folder_still_anchored:
                 raise SkillPathError(
-                    "skill folder moved outside its source during generation metadata"
+                    "skill source or folder changed during generation metadata"
                 )
         except BaseException:
-            if published_by_call and not _anchored_folder_matches(
-                root_fd,
-                folder_fd,
-                folder_name=folder_name,
-                expected_folder_identity=expected_folder_identity,
+            if published_by_call and (
+                not _configured_root_matches(
+                    configured_root,
+                    root_fd,
+                    expected_root_identity=expected_root_identity,
+                )
+                or not _anchored_folder_matches(
+                    root_fd,
+                    folder_fd,
+                    folder_name=folder_name,
+                    expected_folder_identity=expected_folder_identity,
+                )
             ):
                 _unlink_owned_generation_marker(
                     folder_fd,
@@ -636,6 +683,8 @@ class DirectorySkillSource(SkillSource):
                         expected_generation = _ensure_local_generation_marker(
                             root_fd,
                             folder_fd,
+                            configured_root=self.root,
+                            expected_root_identity=root_identity,
                             folder_name=folder_name,
                             expected_folder_identity=folder_identity,
                         )

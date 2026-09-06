@@ -3618,6 +3618,154 @@ def test_store_reaps_only_unlocked_git_checkout_workspaces(tmp_path):
     assert not active.exists()
 
 
+def test_reaper_reads_recovery_marker_only_after_acquiring_owner_lock(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    orphan = store._internal_root / f"{store_module.GIT_CHECKOUT_PREFIX}marker-race"
+    authored = orphan / "prior" / "SKILL.md"
+    authored.parent.mkdir(parents=True)
+    authored.write_text("recover this authored generation", encoding="utf-8")
+    real_lock = SkillStore._lock_git_checkout_workspace
+    marker_inserted = False
+
+    def mark_before_lock(workspace_fd):
+        nonlocal marker_inserted
+        if not marker_inserted:
+            descriptor = os.open(
+                store_module.GIT_CHECKOUT_RECOVERY_MARKER,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=workspace_fd,
+            )
+            try:
+                os.write(descriptor, b"kestrel-edit-recovery-v1\n")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.fsync(workspace_fd)
+            marker_inserted = True
+        return real_lock(workspace_fd)
+
+    monkeypatch.setattr(
+        SkillStore,
+        "_lock_git_checkout_workspace",
+        staticmethod(mark_before_lock),
+    )
+
+    SkillStore(root)
+
+    assert marker_inserted
+    assert not orphan.exists()
+    recovery = tuple(
+        store._internal_root.glob(f"{store_module.SKILL_RECOVERY_PREFIX}*")
+    )
+    assert len(recovery) == 1
+    assert (recovery[0] / "prior" / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == "recover this authored generation"
+
+
+def test_failed_edit_recovery_move_serializes_with_startup_reaper(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    workspace_ready = threading.Event()
+    fail_edit = threading.Event()
+    edit_recovery_started = threading.Event()
+    editor_done = threading.Event()
+    reaper_holds_publication_lock = threading.Event()
+    release_reaper = threading.Event()
+    edit_errors = []
+    reaper_errors = []
+    workspace_paths = []
+    real_open = store_module._open_directory
+    real_open_at = store_module._open_directory_at
+
+    def observe_editor_recovery_open(path, **kwargs):
+        if (
+            threading.current_thread().name == "failed-editor"
+            and fail_edit.is_set()
+            and Path(path) == store._internal_root
+        ):
+            edit_recovery_started.set()
+        return real_open(path, **kwargs)
+
+    def pause_reaper_before_workspace_open(parent_fd, name, **kwargs):
+        if threading.current_thread().name == "startup-reaper" and name.startswith(
+            store_module.GIT_CHECKOUT_PREFIX
+        ):
+            reaper_holds_publication_lock.set()
+            assert release_reaper.wait(timeout=5)
+        return real_open_at(parent_fd, name, **kwargs)
+
+    monkeypatch.setattr(store_module, "_open_directory", observe_editor_recovery_open)
+    monkeypatch.setattr(
+        store_module, "_open_directory_at", pause_reaper_before_workspace_open
+    )
+
+    def fail_one_edit():
+        try:
+            with (
+                store.git_checkout_workspace(cleanup_errors_fatal=False) as workspace,
+                store.preserve_git_checkout_on_failure(workspace),
+            ):
+                workspace_paths.append(workspace)
+                authored = workspace / "prior" / "SKILL.md"
+                authored.parent.mkdir(parents=True)
+                authored.write_text("serialize this recovery", encoding="utf-8")
+                workspace_ready.set()
+                assert fail_edit.wait(timeout=5)
+                raise RuntimeError("simulated failed edit")
+        except RuntimeError as exc:
+            if str(exc) != "simulated failed edit":
+                edit_errors.append(exc)
+        except BaseException as exc:  # noqa: BLE001 - thread reports to parent
+            edit_errors.append(exc)
+        finally:
+            editor_done.set()
+
+    def reap_on_startup():
+        try:
+            store._reap_git_checkout_workspaces()
+        except BaseException as exc:  # noqa: BLE001 - thread reports to parent
+            reaper_errors.append(exc)
+
+    editor = threading.Thread(target=fail_one_edit, name="failed-editor")
+    reaper = threading.Thread(target=reap_on_startup, name="startup-reaper")
+    editor.start()
+    assert workspace_ready.wait(timeout=5)
+    reaper.start()
+    assert reaper_holds_publication_lock.wait(timeout=5)
+    fail_edit.set()
+    assert edit_recovery_started.wait(timeout=5)
+    try:
+        assert not editor_done.wait(timeout=0.5), (
+            "failed-edit recovery renamed outside the startup reaper's "
+            "source-publication lock"
+        )
+        assert workspace_paths[0].is_dir()
+    finally:
+        release_reaper.set()
+        fail_edit.set()
+        editor.join(timeout=10)
+        reaper.join(timeout=10)
+
+    assert not editor.is_alive()
+    assert not reaper.is_alive()
+    assert edit_errors == []
+    assert reaper_errors == []
+    recovery = tuple(
+        store._internal_root.glob(f"{store_module.SKILL_RECOVERY_PREFIX}*")
+    )
+    assert len(recovery) == 1
+    assert (recovery[0] / "prior" / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == "serialize this recovery"
+
+
 def test_store_reaps_git_checkout_after_owner_process_is_killed(tmp_path):
     root = tmp_path / "skills"
     SkillStore(root)

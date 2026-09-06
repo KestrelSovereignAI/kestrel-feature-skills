@@ -1696,22 +1696,35 @@ class SkillStore:
                     if not stat.S_ISDIR(value.st_mode):
                         continue
                     identity = (value.st_dev, value.st_ino)
-                    workspace_fd = _open_directory_at(
-                        internal_fd,
-                        name,
-                        expected=identity,
-                    )
+                    owner_lock: int | None = None
                     try:
-                        recovery_marked = (
-                            _identity_at(workspace_fd, GIT_CHECKOUT_RECOVERY_MARKER)
-                            is not None
-                        )
-                        owner_lock = self._lock_git_checkout_workspace(workspace_fd)
-                    finally:
-                        os.close(workspace_fd)
-                    if owner_lock is None:
-                        continue
-                    try:
+                        try:
+                            workspace_fd = _open_directory_at(
+                                internal_fd,
+                                name,
+                                expected=identity,
+                            )
+                        except (OSError, SkillPathError):
+                            # The candidate disappeared or changed after the
+                            # bounded scan. Preserve its replacement and let a
+                            # later startup reconcile the stable name.
+                            continue
+                        try:
+                            owner_lock = self._lock_git_checkout_workspace(workspace_fd)
+                            if owner_lock is None:
+                                continue
+                            # The owner may publish its recovery marker while
+                            # holding the flock. Read it only after acquiring
+                            # that same lock, never from a pre-lock snapshot.
+                            recovery_marked = (
+                                _identity_at(
+                                    workspace_fd,
+                                    GIT_CHECKOUT_RECOVERY_MARKER,
+                                )
+                                is not None
+                            )
+                        finally:
+                            os.close(workspace_fd)
                         if recovery_marked:
                             try:
                                 _preserve_recovery_directory_at(
@@ -1731,8 +1744,9 @@ class SkillStore:
                                 expected=identity,
                             )
                     finally:
-                        fcntl.flock(owner_lock, fcntl.LOCK_UN)
-                        os.close(owner_lock)
+                        if owner_lock is not None:
+                            fcntl.flock(owner_lock, fcntl.LOCK_UN)
+                            os.close(owner_lock)
         finally:
             os.close(internal_fd)
 
@@ -1901,32 +1915,37 @@ class SkillStore:
                             self._internal_root,
                             expected=self._internal_root_identity,
                         )
-                        workspace_fd = _open_directory_at(
+                        with _serialized_source_publication(
+                            self.local_root,
                             internal_fd,
-                            name,
-                            expected=identity,
-                        )
-                        try:
-                            retain_failed_workspace = (
-                                _identity_at(
-                                    workspace_fd,
-                                    GIT_CHECKOUT_RECOVERY_MARKER,
-                                )
-                                is not None
-                            )
-                        finally:
-                            os.close(workspace_fd)
-                        if retain_failed_workspace:
-                            recovery = _preserve_recovery_directory_at(
+                            enabled=True,
+                        ):
+                            workspace_fd = _open_directory_at(
                                 internal_fd,
                                 name,
                                 expected=identity,
-                                internal_fd=internal_fd,
                             )
-                            logger.error(
-                                "Retained failed skill edit workspace as %s",
-                                recovery,
-                            )
+                            try:
+                                retain_failed_workspace = (
+                                    _identity_at(
+                                        workspace_fd,
+                                        GIT_CHECKOUT_RECOVERY_MARKER,
+                                    )
+                                    is not None
+                                )
+                            finally:
+                                os.close(workspace_fd)
+                            if retain_failed_workspace:
+                                recovery = _preserve_recovery_directory_at(
+                                    internal_fd,
+                                    name,
+                                    expected=identity,
+                                    internal_fd=internal_fd,
+                                )
+                                logger.error(
+                                    "Retained failed skill edit workspace as %s",
+                                    recovery,
+                                )
                     except Exception as recovery_error:  # noqa: BLE001
                         # The marker makes startup recovery preserve this old
                         # checkout name too. Never purge after uncertain rescue.
