@@ -3618,6 +3618,49 @@ def test_store_reaps_only_unlocked_git_checkout_workspaces(tmp_path):
     assert not active.exists()
 
 
+def test_store_preserves_malformed_git_checkout_and_reaps_other_orphans(tmp_path):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    malformed = store._internal_root / f"{store_module.GIT_CHECKOUT_PREFIX}malformed"
+    malformed.mkdir()
+    (malformed / store_module.GIT_CHECKOUT_LOCK).mkdir()
+    orphan = store._internal_root / f"{store_module.GIT_CHECKOUT_PREFIX}orphan"
+    orphan.mkdir()
+    (orphan / "partial.pack").write_bytes(b"partial checkout")
+
+    reopened = SkillStore(root)
+
+    assert reopened.local_root == store.local_root
+    assert malformed.is_dir(), "malformed private recovery state was not preserved"
+    assert not orphan.exists(), "one malformed checkout blocked later recovery work"
+
+
+def test_store_preserves_git_checkout_when_orphan_purge_fails(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    store = SkillStore(root)
+    blocked_name = f"{store_module.GIT_CHECKOUT_PREFIX}blocked"
+    blocked = store._internal_root / blocked_name
+    blocked.mkdir()
+    (blocked / "partial.pack").write_bytes(b"preserve this checkout")
+    orphan = store._internal_root / f"{store_module.GIT_CHECKOUT_PREFIX}orphan"
+    orphan.mkdir()
+    (orphan / "partial.pack").write_bytes(b"reap this checkout")
+    real_purge = store_module._purge_internal_directory_at
+
+    def fail_one_purge(internal_fd, name, *, expected):
+        if name == blocked_name:
+            raise OSError(errno.EIO, "simulated orphan purge failure")
+        return real_purge(internal_fd, name, expected=expected)
+
+    monkeypatch.setattr(store_module, "_purge_internal_directory_at", fail_one_purge)
+
+    reopened = SkillStore(root)
+
+    assert reopened.local_root == store.local_root
+    assert blocked.is_dir(), "failed private cleanup discarded recovery state"
+    assert not orphan.exists(), "one failed purge blocked later recovery work"
+
+
 def test_reaper_reads_recovery_marker_only_after_acquiring_owner_lock(
     tmp_path, monkeypatch
 ):

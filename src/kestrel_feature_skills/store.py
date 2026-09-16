@@ -1704,49 +1704,46 @@ class SkillStore:
                                 name,
                                 expected=identity,
                             )
-                        except (OSError, SkillPathError):
-                            # The candidate disappeared or changed after the
-                            # bounded scan. Preserve its replacement and let a
-                            # later startup reconcile the stable name.
-                            continue
-                        try:
-                            owner_lock = self._lock_git_checkout_workspace(workspace_fd)
-                            if owner_lock is None:
-                                continue
-                            # The owner may publish its recovery marker while
-                            # holding the flock. Read it only after acquiring
-                            # that same lock, never from a pre-lock snapshot.
-                            recovery_marked = (
-                                _identity_at(
-                                    workspace_fd,
-                                    GIT_CHECKOUT_RECOVERY_MARKER,
-                                )
-                                is not None
-                            )
-                        finally:
-                            os.close(workspace_fd)
-                        if recovery_marked:
                             try:
+                                owner_lock = self._lock_git_checkout_workspace(
+                                    workspace_fd
+                                )
+                                if owner_lock is None:
+                                    continue
+                                # The owner may publish its recovery marker while
+                                # holding the flock. Read it only after acquiring
+                                # that same lock, never from a pre-lock snapshot.
+                                recovery_marked = (
+                                    _identity_at(
+                                        workspace_fd,
+                                        GIT_CHECKOUT_RECOVERY_MARKER,
+                                    )
+                                    is not None
+                                )
+                            finally:
+                                os.close(workspace_fd)
+                            if recovery_marked:
                                 _preserve_recovery_directory_at(
                                     internal_fd,
                                     name,
                                     expected=identity,
                                     internal_fd=internal_fd,
                                 )
-                            except (OSError, SkillPathError):
-                                # A failed edit owns recoverable user data. Never
-                                # convert a transient retirement error into purge.
-                                continue
-                        else:
-                            _purge_internal_directory_at(
-                                internal_fd,
-                                name,
-                                expected=identity,
-                            )
-                    finally:
-                        if owner_lock is not None:
-                            fcntl.flock(owner_lock, fcntl.LOCK_UN)
-                            os.close(owner_lock)
+                            else:
+                                _purge_internal_directory_at(
+                                    internal_fd,
+                                    name,
+                                    expected=identity,
+                                )
+                        finally:
+                            if owner_lock is not None:
+                                fcntl.flock(owner_lock, fcntl.LOCK_UN)
+                                os.close(owner_lock)
+                    except (OSError, SkillError):
+                        # Private crash recovery is best effort. Preserve any
+                        # malformed or temporarily unremovable checkout and
+                        # continue reaping other candidates on a later startup.
+                        continue
         finally:
             os.close(internal_fd)
 
