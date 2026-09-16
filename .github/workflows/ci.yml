@@ -53,7 +53,7 @@ jobs:
         run: |
           sdist=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
           for file in package.json package-lock.json playwright.config.cjs; do
-            tar -tzf "$sdist" | rg -q "/$file$"
+            tar -tzf "$sdist" | sed 's|^[^/]*/||' | grep -F -x "$file" >/dev/null
           done
       - name: Verify installed entry point and package data
         run: |
