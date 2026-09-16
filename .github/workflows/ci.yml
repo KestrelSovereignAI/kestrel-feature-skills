@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact tag or commit to test before publishing
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: kestrel_feature_skills
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kestrel_feature_skills"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      KESTREL_TEST_POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:5432/kestrel_feature_skills
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --extra test
+      - run: uv run pytest -q
+      - run: uv build
+      - name: Verify source distribution carries the browser harness
+        run: |
+          sdist=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
+          for file in package.json package-lock.json playwright.config.cjs; do
+            tar -tzf "$sdist" | sed 's|^[^/]*/||' | grep -F -x "$file" >/dev/null
+          done
+      - name: Verify installed entry point and package data
+        run: |
+          uv venv --python "${{ matrix.python }}" .wheel-venv
+          uv pip install --python .wheel-venv/bin/python dist/kestrel_feature_skills-*.whl
+          .wheel-venv/bin/python - <<'PY'
+          import importlib.metadata as md
+          from pathlib import Path
+          from kestrel_feature_skills import ProceduralSkillsFeature
+
+          entries = {
+              entry.name: entry
+              for entry in md.entry_points(group="kestrel_sovereign.features")
+          }
+          assert entries["ProceduralSkillsFeature"].load() is ProceduralSkillsFeature
+          static = Path(md.distribution("kestrel-feature-skills").locate_file(
+              "kestrel_feature_skills/static"
+          ))
+          assert (static / "skills.js").is_file()
+          assert (static / "skills.css").is_file()
+          PY
+
+  frontend-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: uv sync --extra test
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Exercise contributed console on an isolated live host
+        run: tests/e2e/run-live-suite.sh skills
+      - name: Exercise the core-only console on an isolated live host
+        run: tests/e2e/run-live-suite.sh core-only
+      - name: Upload browser and server diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-contract-diagnostics
+          path: |
+            .e2e-artifacts/
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
